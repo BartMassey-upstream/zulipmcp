@@ -155,6 +155,7 @@ Topics containing `/nobots` or `/nb` are hidden from the bot entirely. Messages 
 | Variable | Description |
 |---|---|
 | `ZULIP_RC_PATH` | Absolute path to `.zuliprc` for direct MCP server use. Listener mode sets this for spawned sessions from `--zuliprc`; it does not read ambient `ZULIP_RC_PATH` as its own default. |
+| `ZULIPMCP_TIMEZONE` | IANA timezone used to display message timestamps, such as `Europe/London` or `Asia/Tokyo`. Defaults to `America/Los_Angeles`. |
 | `ZULIP_MAX_MESSAGE_LENGTH` | Char limit above which send tools return an error instead of letting Zulip silently truncate. Defaults to `10000` (Zulip's default); set for realms with a custom cap. |
 | `TRIGGER_MESSAGE_ID` | Message ID that triggered the session (e.g. the @mention). Sets the listen anchor so the agent doesn't miss messages after the trigger. |
 | `SESSION_USER_EMAIL` | Email of the human who triggered the session. Stored on `SessionState` for hooks. |

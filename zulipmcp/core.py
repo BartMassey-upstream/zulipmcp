@@ -6,14 +6,28 @@ import json
 import urllib.parse
 from pathlib import Path
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Optional
 
 import diskcache
 import requests
 import zulip
 
-TIMEZONE = ZoneInfo("America/Los_Angeles")
+_DEFAULT_TIMEZONE = "America/Los_Angeles"
+
+
+def _load_timezone() -> ZoneInfo:
+    """Load the configured IANA timezone."""
+    name = os.environ.get("ZULIPMCP_TIMEZONE", _DEFAULT_TIMEZONE)
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(
+            f"Invalid ZULIPMCP_TIMEZONE {name!r}; use an IANA timezone name"
+        ) from exc
+
+
+TIMEZONE = _load_timezone()
 
 _client: Optional[zulip.Client] = None
 _cache = diskcache.Cache(os.environ.get("ZULIPMCP_CACHE_DIR",
@@ -412,7 +426,7 @@ def _format_timestamp(timestamp: int, prev_timestamp: Optional[int] = None) -> s
     - Always shows date on the first message
     - Shows date only when it changes from the previous message
     - Shows time only when there's a 5+ minute gap from the previous message
-    - Uses PT timezone
+    - Uses the configured timezone
     """
     dt = datetime.fromtimestamp(timestamp, tz=TIMEZONE)
     show_date = True
@@ -425,9 +439,9 @@ def _format_timestamp(timestamp: int, prev_timestamp: Optional[int] = None) -> s
         show_time = gap_minutes >= 5 or show_date
 
     if show_date and show_time:
-        return dt.strftime("%Y-%m-%d %H:%M:%S PT")
+        return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
     elif show_time:
-        return dt.strftime("%H:%M:%S PT")
+        return dt.strftime("%H:%M:%S %Z")
     else:
         return ""
 
@@ -439,8 +453,8 @@ def _time_attr(msg: dict, prev_timestamp: Optional[int]) -> str:
         start = datetime.fromtimestamp(timestamp, tz=TIMEZONE)
         end = datetime.fromtimestamp(msg["time_range_end"], tz=TIMEZONE)
         if start.date() != end.date():
-            return f'time="{start.strftime("%Y-%m-%d %H:%M:%S")}-{end.strftime("%Y-%m-%d %H:%M:%S")} PT"'
-        return f'time="{start.strftime("%Y-%m-%d %H:%M:%S")}-{end.strftime("%H:%M:%S")} PT"'
+            return f'time="{start.strftime("%Y-%m-%d %H:%M:%S %Z")}-{end.strftime("%Y-%m-%d %H:%M:%S %Z")}"'
+        return f'time="{start.strftime("%Y-%m-%d %H:%M:%S %Z")}-{end.strftime("%H:%M:%S %Z")}"'
     ts_str = _format_timestamp(timestamp, prev_timestamp)
     if ts_str:
         return f'time="{ts_str}"'
@@ -1169,7 +1183,7 @@ def verify_message(message_id: int) -> str:
     sender_email = msg.get("sender_email", "Unknown")
     sender_id = msg.get("sender_id", "Unknown")
     timestamp = msg.get("timestamp", 0)
-    ts_str = datetime.fromtimestamp(timestamp, tz=TIMEZONE).strftime("%Y-%m-%d %H:%M:%S PT") if timestamp else "Unknown"
+    ts_str = datetime.fromtimestamp(timestamp, tz=TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z") if timestamp else "Unknown"
     stream = msg.get("display_recipient", "Unknown") if msg.get("type") == "stream" else "DM"
     topic = msg.get("subject", "Unknown") if msg.get("type") == "stream" else "N/A"
 
