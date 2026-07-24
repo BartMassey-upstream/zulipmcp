@@ -1,0 +1,44 @@
+name: zulip-platform
+label: Zulip
+kind: platform
+version: 0.1.0
+description: Native Zulip gateway adapter for Hermes Agent, powered by zulipmcp.
+author: WindBorne Systems
+requires_env:
+  - name: ZULIP_RC_PATH
+    description: "Absolute path to the generic Zulip bot's zuliprc file"
+    prompt: "Zulip bot zuliprc path"
+    password: false
+optional_env:
+  - name: ZULIP_ALLOWED_USERS
+    description: "Comma-separated Zulip user IDs or email addresses allowed to talk to Hermes"
+    prompt: "Allowed Zulip users"
+    password: false
+  - name: ZULIP_ALLOW_ALL_USERS
+    description: "Explicitly allow every Zulip user (not recommended)"
+    prompt: "Allow all Zulip users? (true/false)"
+    password: false
+  - name: ZULIP_ALLOWED_STREAMS
+    description: "Optional comma-separated stream-name allowlist"
+    prompt: "Allowed Zulip streams"
+    password: false
+  - name: ZULIP_REQUIRE_MENTION
+    description: "Require a mention to activate a new stream topic (default true)"
+    prompt: "Require mention? (true/false)"
+    password: false
+  - name: ZULIP_LISTEN_REACTION
+    description: "Emoji on Hermes's latest response while waiting for the next message (default ear; empty disables)"
+    prompt: "Listening reaction"
+    password: false
+  - name: ZULIP_STOPPED_REACTION
+    description: "Emoji confirming that a topic was deactivated (default zzz; empty disables)"
+    prompt: "Stopped reaction"
+    password: false
+  - name: ZULIP_DISMISS_REACTION
+    description: "Reaction that interrupts and deactivates a topic until the next mention (default stop_sign)"
+    prompt: "Dismiss reaction"
+    password: false
+  - name: ZULIP_INITIAL_HISTORY_MESSAGES
+    description: "Topic messages included when a mention first activates a session (default 20)"
+    prompt: "Initial topic history count"
+    password: false

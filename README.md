@@ -44,6 +44,7 @@ Run AI agents in Zulip as @mentionable bots — or wire into any [MCP](https://m
 |---|---|
 | `uv run python -m zulipmcp.mcp` | MCP server for Claude Code, Codex, and other MCP clients |
 | `uv run python -m zulipmcp.mcp --transport sse` | MCP server over SSE (for remote/web clients) |
+| `uv run python -m zulipmcp.launch_agent` | Launch one MCP-backed coding session without a listener |
 | `uv run python -m zulipmcp.listener` | Listener: watches for @mentions, spawns agent sessions |
 
 ## Library Usage
@@ -66,6 +67,56 @@ zulipmcp.configure(
     on_session_end=lambda session: print(f"Session ended in #{session.stream}"),
 )
 ```
+
+## Hermes Gateway
+
+Hermes uses the native [`hermes_plugin/zulip`](hermes_plugin/zulip) gateway
+adapter instead of the subprocess listener. Each stream/topic maps to its own
+persistent Hermes session, while zulipmcp remains available as the explicit
+Zulip API tool layer.
+
+- Mention the bot once to activate a topic; follow-ups do not need a mention.
+- Each user message is a fresh Hermes turn with a fresh iteration budget.
+- Typing, normal response delivery, status reactions, approval reactions,
+  and `:stop_sign:` interruption are handled by the adapter.
+- Only same-topic history is added on first activation.
+- After a gateway restart, mention once to reactivate the topic; Hermes resumes
+  the same stored session.
+
+See the [plugin README](hermes_plugin/zulip/README.md) for installation,
+configuration, access controls, and verification.
+
+## Direct launch (no listener)
+
+An existing coordinator can start one Claude Code or Codex session directly.
+The coding agent uses its configured `zulip` MCP server to initialize the
+target topic, reply there, and wait for follow-ups:
+
+```bash
+python -m zulipmcp.launch_agent \
+  --backend claude \
+  --agent-command /path/to/claude \
+  --stream engineering \
+  --topic "large coding task" \
+  --working-dir /path/to/project
+
+python -m zulipmcp.launch_agent \
+  --backend codex \
+  --agent-command /path/to/codex \
+  --stream engineering \
+  --topic "large coding task" \
+  --working-dir /path/to/project
+```
+
+The launcher does not watch Zulip or spawn on mentions. It starts exactly one
+foreground coding-agent process and reuses the bundled session instructions.
+Run it as a background process when the coordinator should continue working.
+By default the agent listens in renewable two-hour intervals and does not exit
+merely because an interval timed out.
+Use `--trigger-message-id` and `--session-user-email` when that metadata is
+available. Pass `--zuliprc` or `--mcp-config` only when the agent should not use
+its existing global MCP configuration. An explicit Claude MCP config is loaded
+strictly so a project-local server with the same name cannot shadow it.
 
 ## Listener
 
@@ -154,7 +205,7 @@ Topics containing `/nobots` or `/nb` are hidden from the bot entirely. Messages 
 
 | Variable | Description |
 |---|---|
-| `ZULIP_RC_PATH` | Absolute path to `.zuliprc` for direct MCP server use. Listener mode sets this for spawned sessions from `--zuliprc`; it does not read ambient `ZULIP_RC_PATH` as its own default. |
+| `ZULIP_RC_PATH` | Absolute path to `.zuliprc` for direct MCP server or Hermes gateway use. Listener mode sets this for spawned sessions from `--zuliprc`; it does not read ambient `ZULIP_RC_PATH` as its own default. |
 | `ZULIPMCP_TIMEZONE` | IANA timezone used to display message timestamps, such as `Europe/London` or `Asia/Tokyo`. Defaults to `America/Los_Angeles`. |
 | `ZULIP_MAX_MESSAGE_LENGTH` | Char limit above which send tools return an error instead of letting Zulip silently truncate. Defaults to `10000` (Zulip's default); set for realms with a custom cap. |
 | `TRIGGER_MESSAGE_ID` | Message ID that triggered the session (e.g. the @mention). Sets the listen anchor so the agent doesn't miss messages after the trigger. |

@@ -13,6 +13,7 @@
 - **`core.py`** — Zulip API wrappers. No MCP dependency. Returns Python objects.
 - **`mcp.py`** — MCP tool layer + `SessionState`. Thin wrappers over `core.py`. Hooks system lives here.
 - **`agent_backends.py`** — Claude/Codex/OpenCode command builders for the listener. No Zulip API dependency.
+- **`hermes_plugin/zulip/`** — Native Hermes gateway transport. It does not use MCP session state.
 
 Separation is load-bearing: `core.py` must stay MCP-agnostic so it works as a standalone library import.
 

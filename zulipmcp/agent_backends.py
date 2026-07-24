@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import MutableMapping
 from pathlib import Path
-from typing import Any, MutableMapping, Protocol
+from typing import Any, Protocol
 
 
 class LaunchConfig(Protocol):
@@ -40,11 +41,35 @@ _CODEX_TOP_LEVEL_ONLY_FLAGS_WITH_VALUE = {
 }
 
 
-def bootstrap_prompt(stream: str, topic: str) -> str:
+def bootstrap_prompt(
+    stream: str,
+    topic: str,
+    *,
+    listen_timeout_hours: float | None = None,
+) -> str:
     """Return the initial instruction given to a newly spawned agent."""
-    return (
+    prompt = (
         f"Call set_context({stream!r}, {topic!r}) to begin, "
         f"then handle the request and listen for follow-ups."
+    )
+    if listen_timeout_hours is not None:
+        prompt += (
+            f" Whenever yielding, call listen(timeout_hours={listen_timeout_hours:g})."
+            " A timeout alone is not a reason to exit: send a contextual check-in"
+            " and listen again. Continue until dismissed or explicitly told to end."
+        )
+    return prompt
+
+
+def _bootstrap_prompt_for_config(
+    cfg: LaunchConfig,
+    stream: str,
+    topic: str,
+) -> str:
+    return bootstrap_prompt(
+        stream,
+        topic,
+        listen_timeout_hours=getattr(cfg, "listen_timeout_hours", None),
     )
 
 
@@ -89,9 +114,11 @@ def _build_claude_cmd(cfg: LaunchConfig, stream: str, topic: str) -> list[str]:
     ]
     if cfg.mcp_config.exists():
         cmd += ["--mcp-config", str(cfg.mcp_config.resolve())]
+        if getattr(cfg, "strict_mcp_config", False):
+            cmd.append("--strict-mcp-config")
     if cfg.system_prompt.exists():
         cmd += ["--append-system-prompt", cfg.system_prompt.read_text()]
-    cmd += ["-p", bootstrap_prompt(stream, topic)]
+    cmd += ["-p", _bootstrap_prompt_for_config(cfg, stream, topic)]
     cmd += cfg.backend_flags
     return cmd
 
@@ -109,7 +136,7 @@ def _build_opencode_cmd(cfg: LaunchConfig, stream: str, topic: str) -> list[str]
     if cfg.opencode_agent:
         cmd += ["--agent", cfg.opencode_agent]
     cmd += cfg.backend_flags
-    cmd.append(bootstrap_prompt(stream, topic))
+    cmd.append(_bootstrap_prompt_for_config(cfg, stream, topic))
     return cmd
 
 
@@ -203,7 +230,7 @@ def _build_codex_cmd(
     if cfg.mcp_config.exists():
         cmd += _codex_mcp_config_args(cfg.mcp_config, env)
     cmd += codex_exec_flags
-    cmd.append(bootstrap_prompt(stream, topic))
+    cmd.append(_bootstrap_prompt_for_config(cfg, stream, topic))
     return cmd
 
 
