@@ -374,9 +374,10 @@ def test_listening_reaction_moves_from_bot_reply_on_next_user_message() -> None:
 
     asyncio.run(scenario())
 
-    expected = {"message_id": "1", "emoji_name": "ear"}
-    assert api.added_reactions == [expected]
-    assert api.removed_reactions == [expected]
+    assert api.added_reactions == [{"message_id": "1", "emoji_name": "ear"}]
+    assert api.removed_reactions == [
+        {"message_id": "1", "emoji_name": "ear", "reaction_type": "unicode_emoji"}
+    ]
     assert adapter._status_reactions == {}
 
 
@@ -493,9 +494,9 @@ def test_stop_reaction_interrupts_and_requires_a_new_mention() -> None:
 
     assert [event.text for event in adapter.handled] == ["start", "come back"]
     assert adapter.cancelled_sessions
-    assert {"message_id": "50", "emoji_name": "ear"} in api.removed_reactions
+    assert {"message_id": "50", "emoji_name": "ear", "reaction_type": "unicode_emoji"} in api.removed_reactions
     assert {"message_id": "50", "emoji_name": "zzz"} in api.added_reactions
-    assert {"message_id": "50", "emoji_name": "zzz"} in api.removed_reactions
+    assert {"message_id": "50", "emoji_name": "zzz", "reaction_type": "unicode_emoji"} in api.removed_reactions
 
 
 @pytest.mark.parametrize(

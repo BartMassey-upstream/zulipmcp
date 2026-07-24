@@ -262,6 +262,7 @@ class ZulipAdapter(BasePlatformAdapter):
         self._approval_messages: dict[str, str] = {}
         self._stream_ids_by_name: dict[str, int] = {}
         self._user_emails_by_id: dict[str, str] = {}
+        self._realm_emoji_names: set[str] = set()
         self._user_ids_by_email: dict[str, int] = {}
         self._bot_user_id: str | None = None
         self._bot_email = ""
@@ -301,6 +302,16 @@ class ZulipAdapter(BasePlatformAdapter):
                     email: int(user_id)
                     for user_id, email in self._user_emails_by_id.items()
                     if email
+                }
+
+            realm_emoji = await asyncio.to_thread(
+                self._api_client.get_realm_emoji
+            )
+            if realm_emoji.get("result") == "success":
+                self._realm_emoji_names = {
+                    info["name"]
+                    for info in realm_emoji.get("emoji", {}).values()
+                    if not info.get("deactivated", False)
                 }
 
             identity = f"{getattr(self._api_client, 'base_url', '')}:{self._bot_email}"
@@ -638,7 +649,13 @@ class ZulipAdapter(BasePlatformAdapter):
             if add
             else self._api_client.remove_reaction
         )
-        payload = {"message_id": message_id, "emoji_name": emoji_name}
+        payload: dict[str, Any] = {"message_id": message_id, "emoji_name": emoji_name}
+        if not add:
+            payload["reaction_type"] = (
+                "realm_emoji"
+                if emoji_name in self._realm_emoji_names
+                else "unicode_emoji"
+            )
         try:
             result = await self._api_call(method, payload)
             return result.get("result") == "success"
