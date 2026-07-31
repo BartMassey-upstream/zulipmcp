@@ -201,6 +201,10 @@ Users can dismiss a bot session by reacting with a configurable emoji (default: 
 
 Topics containing `/nobots` or `/nb` are hidden from the bot entirely. Messages starting with `/nobots` or `/nb` are also filtered out. This lets humans have private conversations the bot won't see.
 
+### Outgoing markdown normalization
+
+`normalize_zulip_markdown()` runs on every send/reply/edit before content hits the API, fixing two GFM habits Zulip's renderer mishandles: missing blank lines before tables, and bold combined with links (`[**a**](url)` renders as literal asterisks with an unclickable link; a bare URL touching `**` breaks the autolink). Fenced and indented code blocks are always left untouched; inline code spans are additionally preserved for the bold/link fix. The Hermes gateway sends via the raw client and is not normalized. Disable entirely with `ZULIPMCP_MARKDOWN_AUTOFIX=0`.
+
 ## Environment Variables
 
 | Variable | Description |
@@ -216,7 +220,7 @@ Topics containing `/nobots` or `/nb` are hidden from the bot entirely. Messages 
 | `BOT_ALLOWED_WRITE_STREAMS` | Stream send allowlist. Unset = writes allowed everywhere (backwards-compatible). Same formats as above. |
 | `ZULIPMCP_CACHE_DIR` | Override the disk cache directory (defaults to system temp dir). |
 | `ZULIPMCP_LOG_DIR` | Override the log directory (defaults to `/tmp/zulipmcp_logs`). |
-| `ZULIPMCP_MARKDOWN_AUTOFIX` | Set to `0` or `false` to disable all outgoing markdown normalization (blank-line-before-table injection and bold/link rewrites). Enabled by default. |
+| `ZULIPMCP_MARKDOWN_AUTOFIX` | Disables all outgoing markdown normalization (blank-line-before-table injection and bold/link rewrites) when set to `0` or `false`. Defaults to enabled. |
 
 ## License
 

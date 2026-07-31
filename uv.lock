@@ -2,10 +2,6 @@ version = 1
 revision = 3
 requires-python = ">=3.10"
 
-[options]
-exclude-newer = "2026-06-13T22:44:04.886467Z"
-exclude-newer-span = "P3D"
-
 [[package]]
 name = "aiofile"
 version = "3.9.0"
@@ -1712,7 +1708,7 @@ wheels = [
 
 [[package]]
 name = "zulipmcp"
-version = "0.1.0"
+version = "0.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "diskcache" },

@@ -183,9 +183,19 @@ def _length_error(content: str, prefix: str = "") -> Optional[str]:
     so the caller never learns its message was clipped. Counting the prefix
     (which the server prepends to the body) keeps the budget exact.
     """
+    raw = prefix + content
+    # Fast reject before normalizing: normalization only ever shrinks content
+    # by deleting '**' pairs, so this lower bound is safe — and it keeps
+    # pathological multi-hundred-KB inputs away from the regex-heavy
+    # normalizer (whose link scan is quadratic per line).
+    min_len = len(raw) - 2 * raw.count('**')
+    if min_len > zulip_core.MAX_MESSAGE_LENGTH:
+        over = min_len - zulip_core.MAX_MESSAGE_LENGTH
+        return (f"Error: {over}+ chars over Zulip's {zulip_core.MAX_MESSAGE_LENGTH}-char "
+                f"limit. Split into multiple messages, use a spoiler block, or upload_file().")
     # Measure the normalized form: normalization can grow content (blank-line
     # injection, URL bracketing), and the normalized form is what gets sent.
-    normalized = zulip_core.normalize_zulip_markdown(prefix + content)
+    normalized = zulip_core.normalize_zulip_markdown(raw)
     over = len(normalized) - zulip_core.MAX_MESSAGE_LENGTH
     if over <= 0:
         return None
@@ -675,6 +685,10 @@ def end_session(message: str = _DEFAULT_FAREWELL) -> str:
 
         prefix = _get_prefix()
         suffix = f" | {duration_str}"
+        # Normalize before budgeting — normalization can grow content, and
+        # core.send_message re-normalizing the already-normalized text is a
+        # no-op, so the trimmed length matches what actually gets sent.
+        message = zulip_core.normalize_zulip_markdown(message)
         # Teardown can't surface an error to the model, so trim an oversized
         # farewell to fit rather than letting Zulip silently clip it.
         budget = zulip_core.MAX_MESSAGE_LENGTH - len(prefix) - len(suffix)

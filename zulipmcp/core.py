@@ -46,8 +46,12 @@ except ValueError:
     MAX_MESSAGE_LENGTH = 10000
 
 _FENCE_RE = re.compile(r'^(`{3,}|~{3,})')
-_INLINE_CODE_RE = re.compile(r'`[^`]*`')
-_LINK_RE = re.compile(r'(?<!!)\[([^\]]*)\]\((<?[^)\s]+>?)\)')
+# Inline code spans with variable-length delimiters (`` `x` ``, ``` ``x`` ```),
+# mirroring Python-Markdown's backtick pairing.
+_INLINE_CODE_RE = re.compile(r'(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)')
+# Link URLs allow one level of balanced parens (GFM-style) so targets like
+# .../wiki/Foo_(bar) terminate at the real closing paren.
+_LINK_RE = re.compile(r'(?<!!)\[([^\]]*)\]\((<?(?:\([^()\s]*\)|[^()\s])+>?)\)')
 _URL_ABUTS_BOLD_RE = re.compile(r'(https?://[^\s<>\[\]()*]+)(?=\*\*)')
 
 
@@ -120,16 +124,18 @@ def normalize_zulip_markdown(content: str) -> str:
        blank line before table header rows; injects the missing one.
     2. Bold/link combos Zulip breaks on.  Bold inside link text
        (``[**a**](url)``) renders as literal escaped asterisks with an
-       unclickable link (zulip/zulip#36087) — whole-text bold moves outside
-       the link, partial bold is stripped.  A bare URL immediately followed
-       by ``**`` has the asterisks swallowed into the autolinked URL — the
-       URL is wrapped as ``[url](url)`` so the closing bracket terminates
-       the autolink.
+       unclickable link (zulip/zulip#36087, fix PR stalled upstream) —
+       whole-text bold moves outside the link, partial bold is stripped.
+       A bare URL immediately followed by ``**`` is wrapped as
+       ``[url](url)``: a trailing ``**`` otherwise gets swallowed into the
+       autolinked URL, and a URL *preceded* by ``**`` never autolinks at
+       all, so the rewrite also upgrades bold URLs to clickable links.
 
-    Both fixes skip fenced code blocks, indented code, and inline code
-    spans; the table fix also skips blockquotes.  Accepted edge case: a URL
-    whose path literally contains ``**`` is truncated at the asterisks
-    (literal ``*`` in URLs should be percent-encoded).
+    Both fixes skip fenced code blocks and indented code.  The bold/link
+    fix also skips inline code spans; the table fix also skips blockquotes.
+    Accepted edge case: a URL whose path literally contains ``**`` is
+    truncated at the asterisks (literal ``*`` in URLs should be
+    percent-encoded).
 
     Set ``ZULIPMCP_MARKDOWN_AUTOFIX=0`` (or ``false``) to disable all
     normalization and send content verbatim.

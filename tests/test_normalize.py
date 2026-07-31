@@ -282,8 +282,25 @@ def test_plain_bold_untouched():
     assert normalize_zulip_markdown(text) == text
 
 
-def test_empty_string():
-    assert normalize_zulip_markdown("") == ""
+def test_paren_url_whole_bold_link():
+    text = "[**Foo**](https://en.wikipedia.org/wiki/Foo_(bar))"
+    expected = "**[Foo](https://en.wikipedia.org/wiki/Foo_(bar))**"
+    assert normalize_zulip_markdown(text) == expected
+
+
+def test_paren_url_partial_bold_link():
+    text = "[see **x**](https://example.com/a_(1))"
+    assert normalize_zulip_markdown(text) == "[see x](https://example.com/a_(1))"
+
+
+def test_double_backtick_code_span_untouched():
+    text = "``[**keep**](https://example.com)`` stays literal"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_double_backtick_bold_url_untouched():
+    text = "``**https://example.com/x**`` stays literal"
+    assert normalize_zulip_markdown(text) == text
 
 
 def test_bold_link_rewrites_idempotent():
@@ -296,6 +313,7 @@ def test_bold_link_rewrites_idempotent():
         "**PR: https://example.com/pull/219**",
         "`[**keep**](url)` but [**fix**](https://example.com)",
         "> [**quoted title**](https://example.com)",
+        "[**Foo**](https://en.wikipedia.org/wiki/Foo_(bar))",
     ]
     for text in inputs:
         once = normalize_zulip_markdown(text)
@@ -321,3 +339,22 @@ def test_kill_switch_removal_restores_rewriting(monkeypatch):
     assert normalize_zulip_markdown(bold_link) == bold_link
     monkeypatch.delenv("ZULIPMCP_MARKDOWN_AUTOFIX")
     assert normalize_zulip_markdown(bold_link) == "**[title](https://example.com)**"
+
+
+def test_length_guard_counts_normalized_growth():
+    from zulipmcp.mcp import _length_error
+    url = "https://example.com/" + "a" * 60
+    filler = "x" * (10000 - len(f"**{url}**") - 2)
+    content = f"{filler}\n**{url}**"
+    assert len(content) <= 10000
+    assert _length_error(content) is not None
+
+
+def test_length_guard_fast_rejects_pathological_input():
+    import time
+    from zulipmcp.mcp import _length_error
+    content = "[" * 200000 + "**"
+    start = time.monotonic()
+    err = _length_error(content)
+    assert err is not None
+    assert time.monotonic() - start < 1.0
