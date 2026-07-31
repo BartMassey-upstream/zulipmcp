@@ -1,4 +1,4 @@
-"""Tests for normalize_zulip_markdown — blank line injection before tables."""
+"""Tests for normalize_zulip_markdown — table blank lines and bold/link rewrites."""
 from zulipmcp.core import normalize_zulip_markdown
 
 
@@ -155,3 +155,169 @@ def test_real_world_llm_output():
         "| Bob | Pending | 87.0 |"
     )
     assert normalize_zulip_markdown(text) == expected
+
+
+# ============================================================================
+# Bold/link rewrites — [**text**](url) and bare-URL** breakage
+# ============================================================================
+
+def test_whole_bold_link_text_moves_outside():
+    text = "[**Add skip_mean parameter**](https://example.com/task/123)"
+    expected = "**[Add skip_mean parameter](https://example.com/task/123)**"
+    assert normalize_zulip_markdown(text) == expected
+
+
+def test_inline_code_inside_bold_link_text_still_fixed():
+    text = "[**Add `skip_mean` parameter**](https://example.com/task/9)"
+    expected = "**[Add `skip_mean` parameter](https://example.com/task/9)**"
+    assert normalize_zulip_markdown(text) == expected
+
+
+def test_partial_bold_stripped_from_link_text():
+    text = "[fix the **bold** bug](https://example.com)"
+    assert normalize_zulip_markdown(text) == "[fix the bold bug](https://example.com)"
+
+
+def test_multiple_bold_spans_stripped_from_link_text():
+    text = "[**a** and **b**](https://example.com)"
+    assert normalize_zulip_markdown(text) == "[a and b](https://example.com)"
+
+
+def test_bold_around_link_untouched():
+    text = "**[already good](https://example.com)**"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_plain_link_untouched():
+    text = "[plain link](https://example.com)"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_bold_and_link_as_separate_elements_untouched():
+    text = "**important** see [the docs](https://example.com)"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_image_with_bold_alt_untouched():
+    text = "![**chart**](https://example.com/plot.png)"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_bold_bare_url_bracketed():
+    text = "**https://example.com/pull/219**"
+    expected = "**[https://example.com/pull/219](https://example.com/pull/219)**"
+    assert normalize_zulip_markdown(text) == expected
+
+
+def test_bold_label_with_bare_url_bracketed():
+    text = "**PR: https://example.com/pull/219**"
+    expected = "**PR: [https://example.com/pull/219](https://example.com/pull/219)**"
+    assert normalize_zulip_markdown(text) == expected
+
+
+def test_bare_url_without_bold_untouched():
+    text = "See https://example.com/pull/219 for details"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_url_inside_existing_link_untouched():
+    text = "**bold** [title](https://example.com/pull/219)"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_bold_link_inside_inline_code_untouched():
+    text = "`[**keep**](https://example.com)`"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_bold_url_inside_inline_code_untouched():
+    text = "`**https://example.com/pull/1**`"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_bold_link_inside_backtick_fence_untouched():
+    text = "```\n[**keep**](https://example.com)\n**https://example.com/pull/1**\n```"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_bold_link_inside_tilde_fence_untouched():
+    text = "~~~\n[**keep**](https://example.com)\n**https://example.com/pull/1**\n~~~"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_bold_link_inside_indented_code_untouched():
+    text = "paragraph\n\n    [**keep**](https://example.com)\n\t**https://example.com/pull/1**"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_bold_link_fixed_after_fence_closes():
+    text = "```\n[**keep**](https://example.com)\n```\n[**fix**](https://example.com)"
+    expected = "```\n[**keep**](https://example.com)\n```\n**[fix](https://example.com)**"
+    assert normalize_zulip_markdown(text) == expected
+
+
+def test_mixed_code_and_link_on_one_line():
+    text = "`[**keep**](url)` but [**fix**](https://example.com)"
+    expected = "`[**keep**](url)` but **[fix](https://example.com)**"
+    assert normalize_zulip_markdown(text) == expected
+
+
+def test_blockquote_line_still_fixed():
+    text = "> [**quoted title**](https://example.com)"
+    assert normalize_zulip_markdown(text) == "> **[quoted title](https://example.com)**"
+
+
+def test_native_mention_and_stream_syntax_untouched():
+    text = "@**Full Name** and #**stream>topic** stay as they are"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_silent_mention_with_link_untouched():
+    text = "@_**Someone|170** [said](https://example.com/near/1):"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_plain_bold_untouched():
+    text = "**Status:** all systems nominal"
+    assert normalize_zulip_markdown(text) == text
+
+
+def test_empty_string():
+    assert normalize_zulip_markdown("") == ""
+
+
+def test_bold_link_rewrites_idempotent():
+    inputs = [
+        "[**Add skip_mean parameter**](https://example.com/task/123)",
+        "[**Add `skip_mean` parameter**](https://example.com/task/9)",
+        "[fix the **bold** bug](https://example.com)",
+        "[**a** and **b**](https://example.com)",
+        "**https://example.com/pull/219**",
+        "**PR: https://example.com/pull/219**",
+        "`[**keep**](url)` but [**fix**](https://example.com)",
+        "> [**quoted title**](https://example.com)",
+    ]
+    for text in inputs:
+        once = normalize_zulip_markdown(text)
+        assert normalize_zulip_markdown(once) == once
+
+
+# ============================================================================
+# ZULIPMCP_MARKDOWN_AUTOFIX kill switch
+# ============================================================================
+
+def test_kill_switch_disables_all_normalization(monkeypatch):
+    table = "Some text\n| h1 | h2 |\n| --- | --- |"
+    bold_link = "[**title**](https://example.com)"
+    for value in ("0", "false", "FALSE"):
+        monkeypatch.setenv("ZULIPMCP_MARKDOWN_AUTOFIX", value)
+        assert normalize_zulip_markdown(table) == table
+        assert normalize_zulip_markdown(bold_link) == bold_link
+
+
+def test_kill_switch_removal_restores_rewriting(monkeypatch):
+    bold_link = "[**title**](https://example.com)"
+    monkeypatch.setenv("ZULIPMCP_MARKDOWN_AUTOFIX", "0")
+    assert normalize_zulip_markdown(bold_link) == bold_link
+    monkeypatch.delenv("ZULIPMCP_MARKDOWN_AUTOFIX")
+    assert normalize_zulip_markdown(bold_link) == "**[title](https://example.com)**"
