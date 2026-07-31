@@ -7,7 +7,7 @@ import urllib.parse
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from typing import Optional
+from typing import Callable, Optional
 
 import diskcache
 import requests
@@ -46,6 +46,19 @@ except ValueError:
     MAX_MESSAGE_LENGTH = 10000
 
 _FENCE_RE = re.compile(r'^(`{3,}|~{3,})')
+_INLINE_CODE_RE = re.compile(r'`[^`]*`')
+_LINK_RE = re.compile(r'(?<!!)\[([^\]]*)\]\((<?[^)\s]+>?)\)')
+_URL_ABUTS_BOLD_RE = re.compile(r'(https?://[^\s<>\[\]()*]+)(?=\*\*)')
+
+
+def _autofix_enabled() -> bool:
+    """Whether outgoing markdown normalization is enabled.
+
+    Controlled by ``ZULIPMCP_MARKDOWN_AUTOFIX``: set to ``0`` or ``false``
+    (case-insensitive) to disable all normalization.  Read at call time so
+    it can be toggled without a restart.
+    """
+    return os.environ.get('ZULIPMCP_MARKDOWN_AUTOFIX', '').lower() not in ('0', 'false')
 
 
 def _is_table_separator(line: str) -> bool:
@@ -57,14 +70,73 @@ def _is_table_separator(line: str) -> bool:
     return bool(inner) and set(inner) <= set('|:- ')
 
 
-def normalize_zulip_markdown(content: str) -> str:
-    """Ensure blank lines before markdown tables.
+def _restyle_bold_in_link(m: 're.Match[str]') -> str:
+    """Rewrite bold inside a markdown link's text so Zulip renders it.
 
-    Zulip's Python-Markdown parser requires a blank line before table header
-    rows, but LLMs trained on GFM frequently omit them.  Injects the missing
-    blank line while skipping fenced code blocks, indented code, and
-    blockquotes.
+    Whole-text bold moves outside the link (``[**a**](url)`` becomes
+    ``**[a](url)**``); partial bold is stripped from the text.
     """
+    text, url = m.group(1), m.group(2)
+    if '**' not in text:
+        return m.group(0)
+    if text.startswith('**') and text.endswith('**') and text.count('**') == 2:
+        return f'**[{text[2:-2]}]({url})**'
+    return f'[{text.replace("**", "")}]({url})'
+
+
+def _sub_outside_code(pattern: 're.Pattern[str]',
+                      repl: Callable[['re.Match[str]'], str], line: str) -> str:
+    """Apply ``pattern.sub(repl, line)``, leaving matches inside inline code alone.
+
+    A match is exempt only when wholly enclosed in an inline code span; a
+    match that merely *contains* a code span is still rewritten.
+    """
+    code_spans = [span.span() for span in _INLINE_CODE_RE.finditer(line)]
+
+    def guarded(m: 're.Match[str]') -> str:
+        if any(s <= m.start() and m.end() <= e for s, e in code_spans):
+            return m.group(0)
+        return repl(m)
+
+    return pattern.sub(guarded, line)
+
+
+def _fix_bold_links(line: str) -> str:
+    """Rewrite bold/link combinations that Zulip's renderer breaks on."""
+    if '**' not in line:
+        return line
+    line = _sub_outside_code(_LINK_RE, _restyle_bold_in_link, line)
+    line = _sub_outside_code(_URL_ABUTS_BOLD_RE,
+                             lambda m: f'[{m.group(1)}]({m.group(1)})', line)
+    return line
+
+
+def normalize_zulip_markdown(content: str) -> str:
+    """Normalize outgoing markdown for Zulip's renderer.
+
+    Two deterministic fixes for patterns LLMs trained on GFM emit constantly:
+
+    1. Blank lines before tables.  Zulip's Python-Markdown parser requires a
+       blank line before table header rows; injects the missing one.
+    2. Bold/link combos Zulip breaks on.  Bold inside link text
+       (``[**a**](url)``) renders as literal escaped asterisks with an
+       unclickable link (zulip/zulip#36087) — whole-text bold moves outside
+       the link, partial bold is stripped.  A bare URL immediately followed
+       by ``**`` has the asterisks swallowed into the autolinked URL — the
+       URL is wrapped as ``[url](url)`` so the closing bracket terminates
+       the autolink.
+
+    Both fixes skip fenced code blocks, indented code, and inline code
+    spans; the table fix also skips blockquotes.  Accepted edge case: a URL
+    whose path literally contains ``**`` is truncated at the asterisks
+    (literal ``*`` in URLs should be percent-encoded).
+
+    Set ``ZULIPMCP_MARKDOWN_AUTOFIX=0`` (or ``false``) to disable all
+    normalization and send content verbatim.
+    """
+    if not _autofix_enabled():
+        return content
+
     lines = content.split('\n')
     result: list[str] = []
     in_fence = False
@@ -102,6 +174,9 @@ def normalize_zulip_markdown(content: str) -> str:
             and _is_table_separator(lines[i + 1])
         ):
             result.append('')
+
+        if not line.startswith('    ') and not line.startswith('\t'):
+            line = _fix_bold_links(line)
 
         result.append(line)
 
