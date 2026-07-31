@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zulipmcp"
-version = "0.1.2"
+version = "0.1.1"
 description = "Run AI agents in Zulip as @mentionable bots — or wire into any MCP client"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
