@@ -216,6 +216,7 @@ Topics containing `/nobots` or `/nb` are hidden from the bot entirely. Messages 
 | `BOT_ALLOWED_WRITE_STREAMS` | Stream send allowlist. Unset = writes allowed everywhere (backwards-compatible). Same formats as above. |
 | `ZULIPMCP_CACHE_DIR` | Override the disk cache directory (defaults to system temp dir). |
 | `ZULIPMCP_LOG_DIR` | Override the log directory (defaults to `/tmp/zulipmcp_logs`). |
+| `ZULIPMCP_MARKDOWN_AUTOFIX` | Set to `0` or `false` to disable all outgoing markdown normalization (blank-line-before-table injection and bold/link rewrites). Enabled by default. |
 
 ## License
 
