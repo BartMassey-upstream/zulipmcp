@@ -183,7 +183,10 @@ def _length_error(content: str, prefix: str = "") -> Optional[str]:
     so the caller never learns its message was clipped. Counting the prefix
     (which the server prepends to the body) keeps the budget exact.
     """
-    over = len(prefix) + len(content) - zulip_core.MAX_MESSAGE_LENGTH
+    # Measure the normalized form: normalization can grow content (blank-line
+    # injection, URL bracketing), and the normalized form is what gets sent.
+    normalized = zulip_core.normalize_zulip_markdown(prefix + content)
+    over = len(normalized) - zulip_core.MAX_MESSAGE_LENGTH
     if over <= 0:
         return None
     return (f"Error: {over} chars over Zulip's {zulip_core.MAX_MESSAGE_LENGTH}-char "
