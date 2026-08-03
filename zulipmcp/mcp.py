@@ -151,9 +151,14 @@ def configure(**kwargs):
             Default: {"stop_sign"}. Pass a set to override/extend.
         interrupt_file: str | Path
             File path polled during listen() between long-poll iterations.
-            If the file exists, its content is read, the file is deleted,
-            and listen() returns the content. Enables external processes
-            to interrupt a blocking listen() call via the filesystem.
+            If the file exists, its content is read (decoded as UTF-8 with
+            invalid bytes replaced), the file is deleted, and listen()
+            returns the content. Enables external processes to interrupt
+            a blocking listen() call via the filesystem. Writer contract:
+            publish by creating the file fresh or atomically renaming onto
+            the path — do not hold the existing file open to append, and do
+            not use the sibling name "<name>.claimed", which the consumer
+            reserves while reading.
     """
     for key, value in kwargs.items():
         if key not in _hooks:
@@ -163,6 +168,42 @@ def configure(**kwargs):
         if key == "interrupt_file":
             value = Path(value) if value else None
         _hooks[key] = value
+
+
+def _consume_interrupt_file(path: Path) -> Optional[str]:
+    """Atomically claim and consume the listen() interrupt file.
+
+    Returns the file content, or None if no file was present (the common
+    case, silent) or the consume failed (logged at warning and treated as
+    "nothing to consume" so one bad poll cannot break the listen loop).
+
+    Claim-then-read: the file is atomically renamed to "<name>.claimed"
+    before being read, so a writer replacing the live path between our read
+    and delete can never have its content deleted unread — a writer that
+    opens by path after the claim starts a fresh file. A crash between
+    claim and delete strands the claim file, which the next claim
+    overwrites: delivery is at most once by design (the crashed process
+    had no listener to deliver to anyway). Decoding uses errors="replace"
+    because a strict decode raises *before* the delete, leaving an
+    invalid-bytes file in place to fail every subsequent poll.
+    """
+    try:
+        claim_path = path.with_name(path.name + ".claimed")
+        path.replace(claim_path)
+        content = claim_path.read_text(encoding="utf-8", errors="replace")
+        try:
+            claim_path.unlink()
+        except OSError:
+            # Content is already in hand — deliver it rather than let a
+            # cleanup failure mask it. The stale claim file is overwritten
+            # by the next claim.
+            _logger.warning("could not remove claim file for %s", path, exc_info=True)
+        return content
+    except FileNotFoundError:
+        return None
+    except Exception:
+        _logger.warning("interrupt file consume failed for %s", path, exc_info=True)
+        return None
 
 
 def _get_prefix() -> str:
@@ -571,15 +612,10 @@ async def listen(timeout_hours: float, ctx: Context) -> str:
 
             # Check for external interrupt signal (file-based IPC).
             if _interrupt_path:
-                try:
-                    _interrupt_content = _interrupt_path.read_text()
-                    _interrupt_path.unlink(missing_ok=True)
+                _interrupt_content = _consume_interrupt_file(_interrupt_path)
+                if _interrupt_content is not None:
                     _logger.info("listen() interrupted by %s", _interrupt_path)
                     return _interrupt_content
-                except FileNotFoundError:
-                    pass
-                except Exception:
-                    _logger.debug("listen() interrupt file check failed", exc_info=True)
 
             # MCP keepalive
             elapsed = int(time.time() - start)
