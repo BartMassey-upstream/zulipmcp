@@ -3,20 +3,31 @@ import re
 import time
 import tempfile
 import json
+import logging
 import urllib.parse
+from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 import diskcache
 import requests
 import zulip
 
-from .configuration import APIError, JSONValue, ZulipAPIError, redact_secrets, sanitize_text
+from .configuration import (
+    APIError,
+    CONFIGURATION_FETCH_EVENT_TYPES,
+    ConfigurationQueueSnapshot,
+    JSONValue,
+    ZulipAPIError,
+    redact_secrets,
+    sanitize_text,
+)
 
 _DEFAULT_TIMEZONE = "America/Los_Angeles"
+_logger = logging.getLogger(__name__)
 _response_status: ContextVar[int | None] = ContextVar("response_status", default=None)
 
 
@@ -505,6 +516,43 @@ def get_server_settings() -> dict[str, JSONValue]:
 
 def get_current_user() -> dict[str, JSONValue]:
     return configuration_request("/users/me")
+
+
+@contextmanager
+def configuration_queue_snapshot() -> Iterator[ConfigurationQueueSnapshot]:
+    response = configuration_request(
+        "/register",
+        method="POST",
+        request={
+            "event_types": [],
+            "fetch_event_types": list(CONFIGURATION_FETCH_EVENT_TYPES),
+        },
+    )
+    queue_id = response.get("queue_id")
+    if not isinstance(queue_id, str) or not queue_id:
+        raise ZulipAPIError(APIError(
+            message="Zulip register response did not include a valid queue_id",
+            code="INVALID_RESPONSE",
+        ))
+
+    snapshot = ConfigurationQueueSnapshot(data={})
+    try:
+        snapshot.data = {
+            key: value for key, value in response.items() if key != "queue_id"
+        }
+        yield snapshot
+    finally:
+        try:
+            configuration_request(
+                "/events",
+                method="DELETE",
+                request={"queue_id": queue_id},
+            )
+        except ZulipAPIError as exc:
+            if exc.error.code != "BAD_EVENT_QUEUE_ID":
+                warning = f"Failed to delete configuration event queue: {exc.error.message}"
+                snapshot.warnings.append(warning)
+                _logger.warning("%s", warning)
 
 
 def get_user_email(full_name: str) -> Optional[str]:

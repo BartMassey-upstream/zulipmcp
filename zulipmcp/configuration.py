@@ -237,6 +237,19 @@ CURRENT_USER_FIELDS = (
     "is_bot", "is_active", "bot_type", "bot_owner_id",
 )
 
+CONFIGURATION_FETCH_EVENT_TYPES = (
+    "realm",
+    "realm_user_settings_defaults",
+    "default_streams",
+    "default_stream_groups",
+)
+
+
+@dataclass
+class ConfigurationQueueSnapshot:
+    data: dict[str, JSONValue]
+    warnings: list[str] = field(default_factory=list)
+
 
 def read_section(
     reader: Callable[[], dict[str, JSONValue]],
