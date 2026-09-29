@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterable, TypeAlias
+from typing import Callable, Iterable, TypeAlias
 
 
 JSONValue: TypeAlias = (
@@ -37,6 +37,18 @@ _INVITE_URL_RE = re.compile(
 )
 _URL_CREDENTIAL_RE = re.compile(r"(https?://)[^\s/@]+:[^\s/@]+@", re.I)
 _QUERY_SECRET_RE = re.compile(r"([?&])([^?&=\s]+)=([^&#\s<>\"']*)")
+_FORBIDDEN_MESSAGE_RE = re.compile(
+    r"\b(?:must be|only) (?:an? )?(?:organization )?(?:administrator|owner)s?\b"
+    r"|\b(?:insufficient permission|not authorized|permission denied)\b"
+    r"|\bdo(?:es)? not have permission\b",
+    re.I,
+)
+_FORBIDDEN_CODES = frozenset({
+    "FORBIDDEN", "INSUFFICIENT_PERMISSION", "INVALID_API_KEY",
+    "PERMISSION_DENIED", "REALM_DEACTIVATED", "UNAUTHORIZED",
+    "USER_DEACTIVATED",
+})
+_UNSUPPORTED_CODES = frozenset({"UNSUPPORTED_FEATURE", "UNSUPPORTED_OPERATION"})
 
 
 def _secret_key(key: str) -> bool:
@@ -130,7 +142,9 @@ def redact_secrets(value: JSONValue) -> JSONValue:
             return {
                 key: (
                     REDACTED
-                    if _secret_key(key) and child is not None
+                    if _secret_key(key)
+                    and child is not None
+                    and not isinstance(child, bool)
                     else redact(child, _text_key(key))
                 )
                 for key, child in item.items()
@@ -216,3 +230,39 @@ class SectionResult:
         })
         assert isinstance(result, dict)
         return result
+
+
+CURRENT_USER_FIELDS = (
+    "user_id", "full_name", "email", "role", "is_owner", "is_admin", "is_guest",
+    "is_bot", "is_active", "bot_type", "bot_owner_id",
+)
+
+
+def read_section(
+    reader: Callable[[], dict[str, JSONValue]],
+    fields: tuple[str, ...] | None = None,
+) -> SectionResult:
+    try:
+        data = reader()
+    except ZulipAPIError as exc:
+        error = exc.error
+        if (
+            error.http_status in {401, 403}
+            or error.code in _FORBIDDEN_CODES
+            or _FORBIDDEN_MESSAGE_RE.search(error.message)
+        ):
+            status = SectionStatus.FORBIDDEN
+        elif error.code in _UNSUPPORTED_CODES:
+            status = SectionStatus.UNSUPPORTED
+        else:
+            status = SectionStatus.ERROR
+        return SectionResult(status=status, error=error)
+    absent_fields = []
+    if fields is not None:
+        absent_fields = [name for name in fields if name not in data]
+        data = {name: data[name] for name in fields if name in data}
+    return SectionResult(
+        status=SectionStatus.OK if data else SectionStatus.EMPTY,
+        data=data,
+        absent_fields=absent_fields,
+    )

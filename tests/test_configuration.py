@@ -85,6 +85,12 @@ def test_redact_secrets_preserves_null_secret_fields() -> None:
     assert redact_secrets({"api_key": None}) == {"api_key": None}
 
 
+def test_redact_secrets_preserves_password_capability_boolean() -> None:
+    payload = {"authentication_methods": {"password": True, "ldap": False}}
+
+    assert redact_secrets(payload) == payload
+
+
 def test_redact_secrets_preserves_non_secret_fields() -> None:
     payload = {
         "token_count": 42,

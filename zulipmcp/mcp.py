@@ -25,6 +25,7 @@ from typing import Optional
 from dataclasses import dataclass
 
 from fastmcp import FastMCP
+from fastmcp.tools.tool import ToolResult
 
 # ============================================================================
 # Logging setup — file-based for debugging MCP connection issues
@@ -47,6 +48,7 @@ _logger.info(f"zulipmcp MCP server starting, pid={os.getpid()}, log_file={_log_f
 from fastmcp.server.context import Context
 
 from . import core as zulip_core
+from .configuration import CURRENT_USER_FIELDS, SectionResult, read_section, sanitize_text
 
 mcp = FastMCP("Zulip Messaging")
 
@@ -770,6 +772,31 @@ def _format_stream_field(key: str, value: object) -> str:
         except (OSError, OverflowError, ValueError):
             pass
     return f"{key}={value}"
+
+
+def configuration_tool_result(label: str, section: SectionResult) -> ToolResult:
+    structured = section.to_dict()
+    text = f"{label}: {structured['status']}."
+    error = structured["error"]
+    if isinstance(error, dict):
+        text += f" {error['message']}"
+    return ToolResult(content=sanitize_text(text), structured_content=structured)
+
+
+@mcp.tool()
+def get_server_settings() -> ToolResult:
+    """Read server capabilities and all non-secret server settings as typed JSON."""
+    return configuration_tool_result(
+        "Server settings", read_section(zulip_core.get_server_settings),
+    )
+
+
+@mcp.tool()
+def get_current_user() -> ToolResult:
+    """Read the authenticated audit principal's ID, role, and authority flags."""
+    return configuration_tool_result(
+        "Current user", read_section(zulip_core.get_current_user, CURRENT_USER_FIELDS),
+    )
 
 
 @mcp.tool()

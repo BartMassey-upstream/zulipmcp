@@ -4,6 +4,7 @@ import time
 import tempfile
 import json
 import urllib.parse
+from contextvars import ContextVar
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -13,7 +14,22 @@ import diskcache
 import requests
 import zulip
 
+from .configuration import APIError, JSONValue, ZulipAPIError, redact_secrets, sanitize_text
+
 _DEFAULT_TIMEZONE = "America/Los_Angeles"
+_response_status: ContextVar[int | None] = ContextVar("response_status", default=None)
+
+
+def _capture_response_status(response: requests.Response, *args: object, **kwargs: object) -> None:
+    _response_status.set(response.status_code)
+
+
+def _enable_response_status_tracking(client: zulip.Client) -> None:
+    client.ensure_session()
+    assert client.session is not None
+    hooks = client.session.hooks.setdefault("response", [])
+    if _capture_response_status not in hooks:
+        hooks.append(_capture_response_status)
 
 
 def _load_timezone() -> ZoneInfo:
@@ -436,6 +452,59 @@ def get_client() -> zulip.Client:
         email = _client.email or "unknown"
         print(f"[zulipmcp] Zulip client initialized as: {email} (from {config_path})", file=sys.stderr)
     return _client
+
+
+def configuration_request(
+    url: str, method: str = "GET", request: dict[str, JSONValue] | None = None,
+) -> dict[str, JSONValue]:
+    client = None
+    status_token = _response_status.set(None)
+    try:
+        client = get_client()
+        if isinstance(client, zulip.Client):
+            _enable_response_status_tracking(client)
+        response = client.call_endpoint(url=url, method=method, request=request)
+        response_status = _response_status.get()
+    except (requests.RequestException, OSError, zulip.UnrecoverableNetworkError) as exc:
+        key = getattr(client, "api_key", None)
+        secrets = [key] if isinstance(key, str) else []
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if not isinstance(status, int):
+            status = _response_status.get()
+        raise ZulipAPIError(APIError(
+            message=sanitize_text(str(exc), secrets),
+            code="TRANSPORT_ERROR",
+            http_status=status if isinstance(status, int) else None,
+        )) from None
+    finally:
+        _response_status.reset(status_token)
+    if not isinstance(response, dict):
+        raise ZulipAPIError(APIError(
+            message="Zulip API returned a non-object response",
+            code="INVALID_RESPONSE",
+        ))
+    if response.get("result") != "success":
+        error = APIError.from_response(response)
+        key = getattr(client, "api_key", None)
+        secrets = [key] if isinstance(key, str) else []
+        raise ZulipAPIError(APIError(
+            message=sanitize_text(error.message, secrets),
+            code=error.code,
+            http_status=error.http_status or response_status,
+        ))
+    data = redact_secrets({
+        key: value for key, value in response.items() if key not in {"result", "msg"}
+    })
+    assert isinstance(data, dict)
+    return data
+
+
+def get_server_settings() -> dict[str, JSONValue]:
+    return configuration_request("/server_settings")
+
+
+def get_current_user() -> dict[str, JSONValue]:
+    return configuration_request("/users/me")
 
 
 def get_user_email(full_name: str) -> Optional[str]:
