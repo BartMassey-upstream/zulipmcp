@@ -244,6 +244,16 @@ CONFIGURATION_FETCH_EVENT_TYPES = (
     "default_stream_groups",
 )
 
+USER_AUDIT_FIELDS = (
+    "user_id", "full_name", "email", "role", "is_owner", "is_admin",
+    "is_guest", "is_bot", "is_active", "bot_type", "bot_owner_id",
+)
+BOT_AUDIT_FIELDS = USER_AUDIT_FIELDS + (
+    "default_sending_stream",
+    "default_events_register_stream",
+    "default_all_public_streams",
+)
+
 
 @dataclass
 class ConfigurationQueueSnapshot:
@@ -254,6 +264,7 @@ class ConfigurationQueueSnapshot:
 def read_section(
     reader: Callable[[], dict[str, JSONValue]],
     fields: tuple[str, ...] | None = None,
+    collection_field: str | None = None,
 ) -> SectionResult:
     try:
         data = reader()
@@ -274,8 +285,73 @@ def read_section(
     if fields is not None:
         absent_fields = [name for name in fields if name not in data]
         data = {name: data[name] for name in fields if name in data}
+    status = SectionStatus.EMPTY if not data else SectionStatus.OK
+    warnings: list[str] = []
+    if collection_field is not None:
+        if collection_field not in data:
+            status = SectionStatus.PARTIAL
+            absent_fields.append(collection_field)
+            warnings.append(f"Upstream response omitted {collection_field}")
+        elif data[collection_field] is None:
+            status = SectionStatus.PARTIAL
+            warnings.append(f"Upstream response returned null for {collection_field}")
+        elif not data[collection_field]:
+            status = SectionStatus.EMPTY
     return SectionResult(
-        status=SectionStatus.OK if data else SectionStatus.EMPTY,
+        status=status,
         data=data,
         absent_fields=absent_fields,
+        warnings=warnings,
     )
+
+
+def project_user_inventory(
+    response: dict[str, JSONValue],
+    include_sensitive_user_fields: bool = False,
+    include_deactivated: bool = False,
+) -> dict[str, JSONValue]:
+    members = response.get("members")
+    if not isinstance(members, list):
+        return response
+    projected: list[JSONValue] = []
+    for member in members:
+        if (
+            isinstance(member, dict)
+            and member.get("is_active") is False
+            and not include_deactivated
+        ):
+            continue
+        if not isinstance(member, dict):
+            projected.append(member)
+        elif include_sensitive_user_fields:
+            projected.append(redact_secrets(member))
+        else:
+            projected.append({
+                field: member[field] for field in USER_AUDIT_FIELDS if field in member
+            })
+    return {**response, "members": projected}
+
+
+def project_bot_inventory(
+    response: dict[str, JSONValue], include_deactivated: bool = False,
+) -> dict[str, JSONValue]:
+    members = response.get("members")
+    if "members" not in response:
+        return response
+    if members is None:
+        return {
+            key: value for key, value in response.items() if key != "members"
+        } | {"bots": None}
+    if not isinstance(members, list):
+        return response
+    bots: list[JSONValue] = []
+    for member in members:
+        if (
+            isinstance(member, dict)
+            and member.get("is_bot") is True
+            and (include_deactivated or member.get("is_active") is not False)
+        ):
+            bots.append({field: member[field] for field in BOT_AUDIT_FIELDS if field in member})
+    return {
+        key: value for key, value in response.items() if key != "members"
+    } | {"bots": bots}

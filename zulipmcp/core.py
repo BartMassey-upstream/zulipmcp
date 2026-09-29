@@ -518,6 +518,56 @@ def get_current_user() -> dict[str, JSONValue]:
     return configuration_request("/users/me")
 
 
+def get_streams_configuration(
+    include_all: bool = True,
+    include_default: bool = True,
+    include_web_public: bool | None = None,
+    exclude_archived: bool = False,
+) -> dict[str, JSONValue]:
+    request: dict[str, JSONValue] = {
+        "include_all": include_all,
+        "include_default": include_default,
+        "exclude_archived": exclude_archived,
+    }
+    if include_web_public is not None:
+        request["include_web_public"] = include_web_public
+    return configuration_request("/streams", request=request)
+
+
+def get_users_configuration() -> dict[str, JSONValue]:
+    return configuration_request(
+        "/users",
+        request={"include_custom_profile_fields": True},
+    )
+
+
+def get_user_groups_configuration() -> dict[str, JSONValue]:
+    return configuration_request(
+        "/user_groups",
+        request={"include_deactivated_groups": True},
+    )
+
+
+def get_profile_fields_configuration() -> dict[str, JSONValue]:
+    return configuration_request("/realm/profile_fields")
+
+
+def get_domains_configuration() -> dict[str, JSONValue]:
+    return configuration_request("/realm/domains")
+
+
+def get_linkifiers_configuration() -> dict[str, JSONValue]:
+    return configuration_request("/realm/linkifiers")
+
+
+def get_emoji_configuration() -> dict[str, JSONValue]:
+    return configuration_request("/realm/emoji")
+
+
+def get_invitations_configuration() -> dict[str, JSONValue]:
+    return configuration_request("/invites")
+
+
 @contextmanager
 def configuration_queue_snapshot() -> Iterator[ConfigurationQueueSnapshot]:
     response = configuration_request(

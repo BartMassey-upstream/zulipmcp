@@ -21,7 +21,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from dataclasses import dataclass
 
 from fastmcp import FastMCP
@@ -48,7 +48,15 @@ _logger.info(f"zulipmcp MCP server starting, pid={os.getpid()}, log_file={_log_f
 from fastmcp.server.context import Context
 
 from . import core as zulip_core
-from .configuration import CURRENT_USER_FIELDS, SectionResult, read_section, sanitize_text
+from .configuration import (
+    CURRENT_USER_FIELDS,
+    JSONValue,
+    SectionResult,
+    project_bot_inventory,
+    project_user_inventory,
+    read_section,
+    sanitize_text,
+)
 
 mcp = FastMCP("Zulip Messaging")
 
@@ -800,32 +808,136 @@ def get_current_user() -> ToolResult:
 
 
 @mcp.tool()
-def list_streams(fields: list[str] | None = None) -> str:
-    """List all available Zulip streams/channels (public and private).
+def list_streams(
+    include_all: bool = True,
+    include_default: bool = True,
+    include_web_public: bool | None = None,
+    exclude_archived: bool = False,
+    fields: list[str] | None = None,
+) -> ToolResult:
+    """Audit available Zulip channels as typed data.
 
     Args:
-        fields: Optional list of field names from the Zulip ``GET /streams``
-            response to include per stream, e.g.
-            ``["date_created", "subscriber_count"]``. Missing keys render as
-            ``None``. ``date_created`` is formatted as ISO UTC. Nested
-            dict/list values render as compact JSON, truncated at 80 chars.
-            Default (``None``) returns the compact one-line-per-stream format.
+        include_all: Include all channels the principal can audit.
+        include_default: Request each channel's default status.
+        include_web_public: Include web-public channels according to Zulip's API.
+        exclude_archived: Exclude archived channels when true.
+        fields: Return only these upstream fields per channel. Missing fields
+            remain absent rather than being rendered as null.
     """
-    streams = zulip_core.list_streams(include_private=True)
-    if not streams:
-        return "No streams found."
-    lines = []
-    for s in streams:
-        visibility = "[private]" if s.get("invite_only", False) else "[public]"
-        line = f"- {visibility} #{s['name']}"
-        if s.get("description"):
-            line += f": {s['description']}"
-        if fields:
-            line += " | " + " ".join(
-                _format_stream_field(f, s.get(f)) for f in fields
-            )
-        lines.append(line)
-    return f"Found {len(streams)} streams:\n\n" + "\n".join(lines)
+    def read_streams() -> dict[str, JSONValue]:
+        data = zulip_core.get_streams_configuration(
+            include_all=include_all,
+            include_default=include_default,
+            include_web_public=include_web_public,
+            exclude_archived=exclude_archived,
+        )
+        streams = data.get("streams")
+        if fields is not None and isinstance(streams, list):
+            data = {
+                **data,
+                "streams": [
+                    {field: stream[field] for field in fields if field in stream}
+                    if isinstance(stream, dict) else stream
+                    for stream in streams
+                ],
+            }
+        return data
+
+    return configuration_tool_result(
+        "Channels", read_section(read_streams, collection_field="streams"),
+    )
+
+
+def _configuration_collection_result(
+    label: str,
+    reader: Callable[[], dict[str, JSONValue]],
+    collection_field: str,
+) -> ToolResult:
+    return configuration_tool_result(
+        label,
+        read_section(reader, collection_field=collection_field),
+    )
+
+
+@mcp.tool()
+def get_users(
+    include_deactivated: bool = False,
+    include_sensitive_user_fields: bool = False,
+) -> ToolResult:
+    """Audit users without private profile fields unless explicitly requested."""
+    return _configuration_collection_result(
+        "Users",
+        lambda: project_user_inventory(
+            zulip_core.get_users_configuration(),
+            include_sensitive_user_fields,
+            include_deactivated,
+        ),
+        "members",
+    )
+
+
+@mcp.tool()
+def get_bots(include_deactivated: bool = False) -> ToolResult:
+    """Audit bot metadata without requesting or returning bot API keys."""
+    return _configuration_collection_result(
+        "Bots",
+        lambda: project_bot_inventory(
+            zulip_core.get_users_configuration(),
+            include_deactivated,
+        ),
+        "bots",
+    )
+
+
+@mcp.tool()
+def get_user_groups() -> ToolResult:
+    """Audit active and deactivated user groups, nesting, and permissions."""
+    return _configuration_collection_result(
+        "User groups", zulip_core.get_user_groups_configuration, "user_groups",
+    )
+
+
+@mcp.tool()
+def get_custom_profile_fields() -> ToolResult:
+    """Audit custom profile-field definitions as typed data."""
+    return _configuration_collection_result(
+        "Custom profile fields",
+        zulip_core.get_profile_fields_configuration,
+        "custom_fields",
+    )
+
+
+@mcp.tool()
+def get_allowed_domains() -> ToolResult:
+    """Audit allowed email domains as typed data."""
+    return _configuration_collection_result(
+        "Allowed domains", zulip_core.get_domains_configuration, "domains",
+    )
+
+
+@mcp.tool()
+def get_linkifiers() -> ToolResult:
+    """Audit organization linkifiers as typed data."""
+    return _configuration_collection_result(
+        "Linkifiers", zulip_core.get_linkifiers_configuration, "linkifiers",
+    )
+
+
+@mcp.tool()
+def get_custom_emoji() -> ToolResult:
+    """Audit custom emoji metadata as typed data."""
+    return _configuration_collection_result(
+        "Custom emoji", zulip_core.get_emoji_configuration, "emoji",
+    )
+
+
+@mcp.tool()
+def get_invitations() -> ToolResult:
+    """Audit pending invitations when the authenticated principal is allowed."""
+    return _configuration_collection_result(
+        "Invitations", zulip_core.get_invitations_configuration, "invites",
+    )
 
 
 @mcp.tool()
