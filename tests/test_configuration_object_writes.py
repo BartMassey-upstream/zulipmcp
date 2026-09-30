@@ -11,10 +11,11 @@ REALM_URL = "https://realm.example.test"
 
 
 @pytest.fixture
-def client(monkeypatch: pytest.MonkeyPatch) -> Mock:
+def client(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> Mock:
     client = Mock(api_key="private-key")
     monkeypatch.setattr(core, "get_client", lambda: client)
-    monkeypatch.setenv("ZULIPMCP_ENABLE_ADMIN_WRITES", "true")
+    core.set_admin_writes_enabled(True)
+    request.addfinalizer(lambda: core.set_admin_writes_enabled(False))
     return client
 
 

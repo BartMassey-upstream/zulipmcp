@@ -1071,13 +1071,39 @@ def get_organization_configuration(
     return aggregate
 
 
+_admin_writes_enabled = False
+
+
 def admin_writes_enabled() -> bool:
-    return os.environ.get("ZULIPMCP_ENABLE_ADMIN_WRITES", "").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
+    """Return whether this server process currently permits admin writes."""
+    return _admin_writes_enabled
+
+
+def set_admin_writes_enabled(enabled: bool) -> None:
+    """Set process-local admin write authorization."""
+    global _admin_writes_enabled
+    _admin_writes_enabled = enabled
+
+
+def administrative_mutation_request(
+    url: str,
+    method: str,
+    request: dict[str, JSONValue] | None = None,
+) -> dict[str, JSONValue]:
+    if not admin_writes_enabled():
+        raise ZulipAPIError(APIError(
+            message=(
+                "Administrative writes are disabled; call "
+                "enable_administrative_writes and confirm the request"
+            ),
+            code="ADMIN_WRITES_DISABLED",
+        ))
+    return configuration_request(url, method=method, request=request)
 
 
 def _mutation_status(error: ZulipAPIError) -> MutationStatus:
+    if error.error.code == "ADMIN_WRITES_DISABLED":
+        return MutationStatus.DISABLED
     section = _failed_section(error)
     if section.status == SectionStatus.FORBIDDEN:
         return MutationStatus.FORBIDDEN
@@ -1368,16 +1394,6 @@ def update_organization_configuration(
     dry_run: bool = False,
 ) -> MutationResult:
     endpoint = "/realm"
-    if not admin_writes_enabled():
-        return MutationResult(
-            status=MutationStatus.DISABLED,
-            endpoint=endpoint,
-            dry_run=dry_run,
-            error=APIError(
-                message="Administrative writes are disabled; set ZULIPMCP_ENABLE_ADMIN_WRITES=true",
-                code="ADMIN_WRITES_DISABLED",
-            ),
-        )
     expected = expected or {}
     requested_fields = set(changes) | set(expected)
     invalid = requested_fields - REALM_WRITE_FIELDS
@@ -1554,7 +1570,9 @@ def update_organization_configuration(
         )
 
     try:
-        response = configuration_request(endpoint, method="PATCH", request=request)
+        response = administrative_mutation_request(
+            endpoint, method="PATCH", request=request,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(endpoint, dry_run, exc)
         result.current = current
@@ -1623,16 +1641,6 @@ def update_default_user_settings(
     dry_run: bool = False,
 ) -> MutationResult:
     endpoint = "/realm/user_settings_defaults"
-    if not admin_writes_enabled():
-        return MutationResult(
-            status=MutationStatus.DISABLED,
-            endpoint=endpoint,
-            dry_run=dry_run,
-            error=APIError(
-                message="Administrative writes are disabled; set ZULIPMCP_ENABLE_ADMIN_WRITES=true",
-                code="ADMIN_WRITES_DISABLED",
-            ),
-        )
     expected = expected or {}
     requested_fields = set(changes) | set(expected)
     invalid = requested_fields - DEFAULT_USER_WRITE_FIELDS
@@ -1698,7 +1706,9 @@ def update_default_user_settings(
             warnings=warnings + ["All requested fields already had the desired values"],
         )
     try:
-        response = configuration_request(endpoint, method="PATCH", request=request)
+        response = administrative_mutation_request(
+            endpoint, method="PATCH", request=request,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(endpoint, dry_run, exc)
         result.current = current
@@ -1757,16 +1767,6 @@ def update_default_user_settings(
 def _admin_destination(
     endpoint: str, realm_url: str, dry_run: bool,
 ) -> tuple[dict[str, JSONValue] | None, dict[str, JSONValue] | None, MutationResult | None]:
-    if not admin_writes_enabled():
-        return None, None, MutationResult(
-            status=MutationStatus.DISABLED,
-            endpoint=endpoint,
-            dry_run=dry_run,
-            error=APIError(
-                message="Administrative writes are disabled; set ZULIPMCP_ENABLE_ADMIN_WRITES=true",
-                code="ADMIN_WRITES_DISABLED",
-            ),
-        )
     try:
         settings = get_server_settings()
     except ZulipAPIError as exc:
@@ -2089,7 +2089,9 @@ def create_channel(
             resolved_mappings=mappings,
         )
     try:
-        response = configuration_request(endpoint, method="POST", request=request)
+        response = administrative_mutation_request(
+            endpoint, method="POST", request=request,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(endpoint, dry_run, exc)
         result.desired = desired
@@ -2357,7 +2359,9 @@ def update_channel_configuration(
             warnings=["Channel already had the desired configuration"],
         )
     try:
-        response = configuration_request(resolved_endpoint, method="PATCH", request=request)
+        response = administrative_mutation_request(
+            resolved_endpoint, method="PATCH", request=request,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(resolved_endpoint, dry_run, exc)
         result.current = current
@@ -2506,7 +2510,9 @@ def subscribe_users_to_channel(
             warnings=["All selected users were already subscribed"],
         )
     try:
-        response = configuration_request(endpoint, method="POST", request=request)
+        response = administrative_mutation_request(
+            endpoint, method="POST", request=request,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(endpoint, dry_run, exc)
         result.desired = {"channel": channel, "users": users}
@@ -2765,7 +2771,9 @@ def create_user_group(
             resolved_mappings=mappings,
         )
     try:
-        response = configuration_request(endpoint, method="POST", request=request)
+        response = administrative_mutation_request(
+            endpoint, method="POST", request=request,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(endpoint, dry_run, exc)
         result.desired = desired
@@ -2960,7 +2968,9 @@ def update_user_group(
             warnings=["User group already had the desired configuration"],
         )
     try:
-        response = configuration_request(resolved_endpoint, method="PATCH", request=request)
+        response = administrative_mutation_request(
+            resolved_endpoint, method="PATCH", request=request,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(resolved_endpoint, dry_run, exc)
         result.current = current
@@ -3167,7 +3177,9 @@ def set_user_group_members(
             warnings=["User group already had the desired direct membership"],
         )
     try:
-        response = configuration_request(resolved_endpoint, method="POST", request=request)
+        response = administrative_mutation_request(
+            resolved_endpoint, method="POST", request=request,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(resolved_endpoint, dry_run, exc)
         result.current = current
@@ -3392,7 +3404,9 @@ def create_custom_profile_field(
             resolved_mappings=mappings,
         )
     try:
-        response = configuration_request(endpoint, method="POST", request=desired)
+        response = administrative_mutation_request(
+            endpoint, method="POST", request=desired,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(endpoint, dry_run, exc)
         result.desired = desired
@@ -3581,7 +3595,9 @@ def update_custom_profile_field(
             warnings=["Profile field already had the desired configuration"],
         )
     try:
-        response = configuration_request(resolved_endpoint, method="PATCH", request=request)
+        response = administrative_mutation_request(
+            resolved_endpoint, method="PATCH", request=request,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(resolved_endpoint, dry_run, exc)
         result.current = current
@@ -3736,7 +3752,9 @@ def add_allowed_domain(
             resolved_mappings=mappings,
         )
     try:
-        response = configuration_request(endpoint, method="POST", request=desired)
+        response = administrative_mutation_request(
+            endpoint, method="POST", request=desired,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(endpoint, dry_run, exc)
         result.desired = desired
@@ -3857,7 +3875,9 @@ def update_allowed_domain(
             warnings=["Allowed domain already had the desired configuration"],
         )
     try:
-        response = configuration_request(resolved_endpoint, method="PATCH", request=request)
+        response = administrative_mutation_request(
+            resolved_endpoint, method="PATCH", request=request,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(resolved_endpoint, dry_run, exc)
         result.current = current
@@ -4016,7 +4036,9 @@ def create_linkifier(
             resolved_mappings=mappings,
         )
     try:
-        response = configuration_request(endpoint, method="POST", request=desired)
+        response = administrative_mutation_request(
+            endpoint, method="POST", request=desired,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(endpoint, dry_run, exc)
         result.desired = desired
@@ -4210,7 +4232,9 @@ def update_linkifier(
             warnings=["Linkifier already had the desired configuration"],
         )
     try:
-        response = configuration_request(resolved_endpoint, method="PATCH", request=request)
+        response = administrative_mutation_request(
+            resolved_endpoint, method="PATCH", request=request,
+        )
     except ZulipAPIError as exc:
         result = _mutation_failure(resolved_endpoint, dry_run, exc)
         result.current = current

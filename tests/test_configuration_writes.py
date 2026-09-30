@@ -1,7 +1,13 @@
+import asyncio
 import importlib
-from unittest.mock import Mock, call
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
+from fastmcp.server.elicitation import (
+    AcceptedElicitation,
+    CancelledElicitation,
+    DeclinedElicitation,
+)
 from fastmcp.tools.tool import ToolResult
 
 from zulipmcp import core
@@ -10,15 +16,19 @@ from zulipmcp.configuration import REDACTED
 mcp_module = importlib.import_module("zulipmcp.mcp")
 
 
+@pytest.fixture(autouse=True)
+def reset_write_authorization() -> None:
+    core.set_admin_writes_enabled(False)
+    yield
+    core.set_admin_writes_enabled(False)
+
+
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> Mock:
     client = Mock(api_key="private-key")
     monkeypatch.setattr(core, "get_client", lambda: client)
+    core.set_admin_writes_enabled(True)
     return client
-
-
-def enable_writes(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ZULIPMCP_ENABLE_ADMIN_WRITES", "true")
 
 
 def principal(*, owner: bool = True, admin: bool = True) -> dict[str, object]:
@@ -55,25 +65,110 @@ def deleted() -> dict[str, object]:
     return {"result": "success", "msg": ""}
 
 
-def test_writes_are_disabled_by_default(
-    client: Mock, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("ZULIPMCP_ENABLE_ADMIN_WRITES", raising=False)
+def test_writes_are_disabled_until_confirmed(client: Mock) -> None:
+    core.set_admin_writes_enabled(False)
+    client.call_endpoint.side_effect = [
+        principal(), realm_snapshot(description="old"), deleted(),
+    ]
 
     result = mcp_module.update_organization_configuration(
-        {"description": "new"}, dry_run=True,
+        {"description": "new"}, expected={"description": "old"},
     )
 
     assert isinstance(result, ToolResult)
     assert result.structured_content["status"] == "disabled"
     assert result.structured_content["error"]["code"] == "ADMIN_WRITES_DISABLED"
-    client.call_endpoint.assert_not_called()
+    assert all(
+        item.kwargs["method"] != "PATCH"
+        for item in client.call_endpoint.call_args_list
+    )
+
+
+def test_confirmation_enables_writes() -> None:
+    ctx = Mock()
+    ctx.elicit = AsyncMock(return_value=AcceptedElicitation(data=True))
+
+    result = asyncio.run(mcp_module.enable_administrative_writes(ctx))
+
+    assert result.structured_content == {"status": "enabled", "enabled": True}
+    ctx.elicit.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("response", "status"),
+    [
+        (AcceptedElicitation(data=False), "accept"),
+        (DeclinedElicitation(), "decline"),
+        (CancelledElicitation(), "cancel"),
+    ],
+)
+def test_unconfirmed_enable_request_fails_closed(response: object, status: str) -> None:
+    ctx = Mock()
+    ctx.elicit = AsyncMock(return_value=response)
+
+    result = asyncio.run(mcp_module.enable_administrative_writes(ctx))
+
+    assert result.structured_content == {"status": status, "enabled": False}
+
+
+def test_unavailable_confirmation_fails_closed() -> None:
+    ctx = Mock()
+    ctx.elicit = AsyncMock(side_effect=RuntimeError("not supported"))
+
+    result = asyncio.run(mcp_module.enable_administrative_writes(ctx))
+
+    assert result.structured_content == {"status": "unsupported", "enabled": False}
+
+
+def test_disable_administrative_writes() -> None:
+    core.set_admin_writes_enabled(True)
+
+    result = mcp_module.disable_administrative_writes()
+
+    assert result.structured_content == {"status": "disabled", "enabled": False}
+
+
+def test_disabled_writes_allow_dry_run(client: Mock) -> None:
+    core.set_admin_writes_enabled(False)
+    client.call_endpoint.side_effect = [
+        principal(), realm_snapshot(description="old"), deleted(),
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        {"description": "new"},
+        expected={"description": "old"},
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "dry_run"
+    assert result["request"] == {"description": "new"}
+    assert all(
+        item.kwargs["method"] != "PATCH"
+        for item in client.call_endpoint.call_args_list
+    )
+
+
+def test_disabled_writes_allow_no_op(client: Mock) -> None:
+    core.set_admin_writes_enabled(False)
+    client.call_endpoint.side_effect = [
+        principal(), realm_snapshot(description="current"), deleted(),
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        {"description": "current"}, expected={"description": "current"},
+    ).structured_content
+
+    assert result["status"] == "ok"
+    assert result["request"] == {}
+    assert all(
+        item.kwargs["method"] != "PATCH"
+        for item in client.call_endpoint.call_args_list
+    )
 
 
 def test_realm_dry_run_reads_current_and_resolves_optimistic_group_update(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     current_group = {"direct_members": [], "direct_subgroups": [4]}
     desired_group = {"direct_members": [], "direct_subgroups": ["students"]}
     client.call_endpoint.side_effect = [
@@ -128,7 +223,6 @@ def test_realm_dry_run_reads_current_and_resolves_optimistic_group_update(
 def test_expected_value_conflict_makes_no_patch(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     client.call_endpoint.side_effect = [
         principal(), realm_snapshot(description="changed elsewhere"), deleted(),
     ]
@@ -149,7 +243,6 @@ def test_expected_value_conflict_makes_no_patch(
 def test_unknown_and_unsupported_fields_are_rejected_locally(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     unknown = mcp_module.update_organization_configuration(
         changes={"not_a_realm_setting": True},
     ).structured_content
@@ -169,7 +262,6 @@ def test_unknown_and_unsupported_fields_are_rejected_locally(
 def test_owner_only_and_last_authentication_method_checks(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     client.call_endpoint.return_value = principal(owner=False, admin=True)
 
     owner_only = mcp_module.update_organization_configuration(
@@ -223,7 +315,6 @@ def test_owner_only_and_last_authentication_method_checks(
 def test_successful_realm_write_has_authoritative_readback(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     client.call_endpoint.side_effect = [
         principal(),
         realm_snapshot(description="old"),
@@ -251,7 +342,6 @@ def test_successful_realm_write_has_authoritative_readback(
 def test_ignored_parameters_are_partial_not_success(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     client.call_endpoint.side_effect = [
         principal(),
         realm_snapshot(description="old"),
@@ -277,7 +367,6 @@ def test_ignored_parameters_are_partial_not_success(
 def test_unlimited_values_normalize_for_request_and_readback(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     client.call_endpoint.side_effect = [
         principal(),
         realm_snapshot(message_retention_days=30),
@@ -300,7 +389,6 @@ def test_unlimited_values_normalize_for_request_and_readback(
 def test_semantic_channel_resolution_rejects_raw_ids(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     client.call_endpoint.side_effect = [
         principal(),
         realm_snapshot(signup_announcements_stream_id=12),
@@ -341,7 +429,6 @@ def test_semantic_channel_resolution_rejects_raw_ids(
 def test_channel_reference_clear_uses_minus_one_and_is_idempotent(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     client.call_endpoint.side_effect = [
         principal(),
         realm_snapshot(signup_announcements_stream_id=12),
@@ -379,7 +466,6 @@ def test_channel_reference_clear_uses_minus_one_and_is_idempotent(
 def test_anonymous_group_membership_order_is_canonicalized(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     client.call_endpoint.side_effect = [
         principal(),
         realm_snapshot(can_create_public_channel_group={
@@ -421,7 +507,6 @@ def test_anonymous_group_membership_order_is_canonicalized(
 def test_invalid_unlimited_value_returns_structured_error(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     client.call_endpoint.side_effect = [
         principal(), realm_snapshot(message_retention_days=30), deleted(),
     ]
@@ -438,7 +523,6 @@ def test_invalid_unlimited_value_returns_structured_error(
 def test_null_writes_are_rejected_instead_of_silently_dropped(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     realm_result = mcp_module.update_organization_configuration(
         changes={"description": None}, dry_run=True,
     ).structured_content
@@ -457,7 +541,6 @@ def test_null_writes_are_rejected_instead_of_silently_dropped(
 def test_default_settings_dry_run_and_successful_readback(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     client.call_endpoint.side_effect = [
         principal(),
         defaults_snapshot(enable_sounds=True),
@@ -496,7 +579,6 @@ def test_default_settings_dry_run_and_successful_readback(
 def test_write_results_redact_secret_shaped_values(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enable_writes(monkeypatch)
     client.call_endpoint.return_value = principal()
 
     result = mcp_module.update_organization_configuration(

@@ -46,8 +46,10 @@ allowed domains, linkifiers, emoji, invitations, and an aggregate
 organization snapshot. Structured results preserve nested values and
 distinguish empty, forbidden, unsupported, partial, and failed reads.
 
-Administrative writes are disabled by default. Enable them only for
-an MCP server intended to configure its authenticated realm:
+Administrative writes start disabled. To use a write tool, first call
+`enable_administrative_writes` and approve the confirmation presented
+by the MCP client. Authorization lasts until it is revoked with
+`disable_administrative_writes` or the server process restarts.
 
 ```json
 {
@@ -56,8 +58,7 @@ an MCP server intended to configure its authenticated realm:
       "command": "uv",
       "args": ["run", "python", "-m", "zulipmcp.mcp"],
       "env": {
-        "ZULIP_RC_PATH": "/absolute/path/to/realm.zuliprc",
-        "ZULIPMCP_ENABLE_ADMIN_WRITES": "true"
+        "ZULIP_RC_PATH": "/absolute/path/to/realm.zuliprc"
       }
     }
   }
@@ -77,6 +78,10 @@ state first, avoid duplicate creates by semantic name, and read back
 successful mutations. Allowed-domain changes require an organization
 owner. No deletion, unsubscription, or blind realm-clone tool is
 provided.
+
+Dry runs remain available while writes are disabled: they can read
+current state, validate inputs, and show proposed requests without
+issuing a mutation.
 
 Use this workflow for configuration changes:
 
@@ -270,7 +275,6 @@ Topics containing `/nobots` or `/nb` are hidden from the bot entirely. Messages 
 | `ZULIPMCP_CACHE_DIR` | Override the disk cache directory (defaults to system temp dir). |
 | `ZULIPMCP_LOG_DIR` | Override the log directory (defaults to `/tmp/zulipmcp_logs`). |
 | `ZULIPMCP_MARKDOWN_AUTOFIX` | Disables all outgoing markdown normalization (blank-line-before-table injection and bold/link rewrites) when set to `0` or `false`. Defaults to enabled. |
-| `ZULIPMCP_ENABLE_ADMIN_WRITES` | Enables guarded administrative configuration tools when set to `1`, `true`, or `yes`. Defaults to disabled; read-only audit tools remain available. |
 
 ## License
 
