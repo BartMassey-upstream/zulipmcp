@@ -21,7 +21,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from dataclasses import dataclass
 
 from fastmcp import FastMCP
@@ -51,6 +51,7 @@ from . import core as zulip_core
 from .configuration import (
     CURRENT_USER_FIELDS,
     JSONValue,
+    MutationResult,
     SectionResult,
     project_user_inventory,
     read_section,
@@ -954,6 +955,44 @@ def get_organization_configuration(
     return ToolResult(
         content=text + ".",
         structured_content=snapshot,
+    )
+
+
+def mutation_tool_result(label: str, mutation: MutationResult) -> ToolResult:
+    structured = mutation.to_dict()
+    text = f"{label}: {structured['status']}."
+    error = structured["error"]
+    if isinstance(error, dict):
+        text += f" {error['message']}"
+    return ToolResult(
+        content=sanitize_text(text),
+        structured_content=structured,
+    )
+
+
+@mcp.tool()
+def update_organization_configuration(
+    changes: dict[str, Any],
+    expected: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Update allowlisted organization settings with checks and readback."""
+    return mutation_tool_result(
+        "Organization update",
+        zulip_core.update_organization_configuration(changes, expected, dry_run),
+    )
+
+
+@mcp.tool()
+def update_default_user_settings(
+    changes: dict[str, Any],
+    expected: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Update defaults for future users with checks and readback."""
+    return mutation_tool_result(
+        "Default user settings update",
+        zulip_core.update_default_user_settings(changes, expected, dry_run),
     )
 
 

@@ -1,0 +1,513 @@
+import importlib
+from unittest.mock import Mock, call
+
+import pytest
+from fastmcp.tools.tool import ToolResult
+
+from zulipmcp import core
+from zulipmcp.configuration import REDACTED
+
+mcp_module = importlib.import_module("zulipmcp.mcp")
+
+
+@pytest.fixture
+def client(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    client = Mock(api_key="private-key")
+    monkeypatch.setattr(core, "get_client", lambda: client)
+    return client
+
+
+def enable_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZULIPMCP_ENABLE_ADMIN_WRITES", "true")
+
+
+def principal(*, owner: bool = True, admin: bool = True) -> dict[str, object]:
+    return {
+        "result": "success",
+        "msg": "",
+        "user_id": 1,
+        "is_owner": owner,
+        "is_admin": admin,
+        "is_bot": False,
+        "is_active": True,
+    }
+
+
+def realm_snapshot(**values: object) -> dict[str, object]:
+    return {
+        "result": "success",
+        "msg": "",
+        "queue_id": "queue-1",
+        **{f"realm_{key}": value for key, value in values.items()},
+    }
+
+
+def defaults_snapshot(**values: object) -> dict[str, object]:
+    return {
+        "result": "success",
+        "msg": "",
+        "queue_id": "queue-1",
+        "realm_user_settings_defaults": values,
+    }
+
+
+def deleted() -> dict[str, object]:
+    return {"result": "success", "msg": ""}
+
+
+def test_writes_are_disabled_by_default(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ZULIPMCP_ENABLE_ADMIN_WRITES", raising=False)
+
+    result = mcp_module.update_organization_configuration(
+        {"description": "new"}, dry_run=True,
+    )
+
+    assert isinstance(result, ToolResult)
+    assert result.structured_content["status"] == "disabled"
+    assert result.structured_content["error"]["code"] == "ADMIN_WRITES_DISABLED"
+    client.call_endpoint.assert_not_called()
+
+
+def test_realm_dry_run_reads_current_and_resolves_optimistic_group_update(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    current_group = {"direct_members": [], "direct_subgroups": [4]}
+    desired_group = {"direct_members": [], "direct_subgroups": ["students"]}
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(description="old", can_create_public_channel_group=current_group),
+        deleted(),
+        {
+            "result": "success",
+            "msg": "",
+            "user_groups": [{"id": 5, "name": "students"}],
+        },
+        {"result": "success", "msg": "", "members": []},
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={
+            "description": "new",
+            "can_create_public_channel_group": desired_group,
+        },
+        expected={"description": "old"},
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "dry_run"
+    assert result["current"] == {
+        "description": "old",
+        "can_create_public_channel_group": current_group,
+    }
+    assert result["request"] == {
+        "description": "new",
+        "can_create_public_channel_group": {
+            "new": {"direct_members": [], "direct_subgroups": [5]},
+            "old": current_group,
+        },
+    }
+    assert result["changed_fields"] == [
+        "can_create_public_channel_group", "description",
+    ]
+    assert result["resolved_mappings"] == {
+        "can_create_public_channel_group": {
+            "desired": {
+                "semantic": desired_group,
+                "resolved": {"direct_members": [], "direct_subgroups": [5]},
+            },
+        },
+    }
+    assert [item.kwargs["method"] for item in client.call_endpoint.call_args_list] == [
+        "GET", "POST", "DELETE", "GET", "GET",
+    ]
+
+
+def test_expected_value_conflict_makes_no_patch(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    client.call_endpoint.side_effect = [
+        principal(), realm_snapshot(description="changed elsewhere"), deleted(),
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={"description": "desired"},
+        expected={"description": "stale"},
+    ).structured_content
+
+    assert result["status"] == "conflict"
+    assert result["error"]["code"] == "EXPECTED_VALUE_MISMATCH"
+    assert all(
+        item.kwargs["method"] != "PATCH"
+        for item in client.call_endpoint.call_args_list
+    )
+
+
+def test_unknown_and_unsupported_fields_are_rejected_locally(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    unknown = mcp_module.update_organization_configuration(
+        changes={"not_a_realm_setting": True},
+    ).structured_content
+    assert unknown["status"] == "error"
+    assert unknown["error"]["code"] == "INVALID_FIELD"
+    client.call_endpoint.assert_not_called()
+
+    client.call_endpoint.side_effect = [principal(), realm_snapshot(), deleted()]
+    unsupported = mcp_module.update_organization_configuration(
+        changes={"media_preview_size": 100},
+    ).structured_content
+    assert unsupported["status"] == "error"
+    assert unsupported["error"]["code"] == "UNSUPPORTED_FIELD"
+    assert unsupported["unsupported_fields"] == ["media_preview_size"]
+
+
+def test_owner_only_and_last_authentication_method_checks(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    client.call_endpoint.return_value = principal(owner=False, admin=True)
+
+    owner_only = mcp_module.update_organization_configuration(
+        changes={"invite_required": True},
+    ).structured_content
+
+    assert owner_only["status"] == "forbidden"
+    assert owner_only["error"]["code"] == "OWNER_REQUIRED"
+
+    client.reset_mock()
+    client.call_endpoint.return_value = principal()
+    lockout = mcp_module.update_organization_configuration(
+        changes={"authentication_methods": {"Email": False, "LDAP": False}},
+    ).structured_content
+
+    assert lockout["status"] == "error"
+    assert lockout["error"]["code"] == "LAST_AUTHENTICATION_METHOD"
+    client.call_endpoint.assert_called_once()
+
+    client.reset_mock()
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(authentication_methods={"Email": True, "LDAP": True}),
+        deleted(),
+    ]
+    fake_fallback = mcp_module.update_organization_configuration(
+        changes={
+            "authentication_methods": {
+                "Email": False,
+                "LDAP": False,
+                "NotARealMethod": True,
+            },
+        },
+        dry_run=True,
+    ).structured_content
+
+    assert fake_fallback["status"] == "error"
+    assert fake_fallback["error"]["code"] == "LAST_AUTHENTICATION_METHOD"
+
+    for field in ("can_create_groups", "can_manage_all_groups"):
+        client.reset_mock()
+        client.call_endpoint.side_effect = None
+        client.call_endpoint.return_value = principal(owner=False, admin=True)
+        denied = mcp_module.update_organization_configuration(
+            changes={field: "staff"}, dry_run=True,
+        ).structured_content
+        assert denied["status"] == "forbidden"
+        assert denied["error"]["code"] == "OWNER_REQUIRED"
+
+
+def test_successful_realm_write_has_authoritative_readback(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(description="old"),
+        deleted(),
+        {"result": "success", "msg": ""},
+        realm_snapshot(description="new"),
+        deleted(),
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={"description": "new"},
+        expected={"description": "old"},
+    ).structured_content
+
+    assert result["status"] == "ok"
+    assert result["readback"] == {"description": "new"}
+    assert result["response"] == {}
+    assert client.call_endpoint.call_args_list[3] == call(
+        url="/realm",
+        method="PATCH",
+        request={"description": "new"},
+    )
+
+
+def test_ignored_parameters_are_partial_not_success(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(description="old"),
+        deleted(),
+        {
+            "result": "success",
+            "msg": "",
+            "ignored_parameters_unsupported": ["description"],
+        },
+        realm_snapshot(description="old"),
+        deleted(),
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={"description": "new"},
+    ).structured_content
+
+    assert result["status"] == "partial"
+    assert result["unsupported_fields"] == ["description"]
+    assert result["readback"] == {"description": "old"}
+
+
+def test_unlimited_values_normalize_for_request_and_readback(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(message_retention_days=30),
+        deleted(),
+        {"result": "success", "msg": ""},
+        realm_snapshot(message_retention_days=-1),
+        deleted(),
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={"message_retention_days": "unlimited"},
+        expected={"message_retention_days": 30},
+    ).structured_content
+
+    assert result["status"] == "ok"
+    assert result["request"] == {"message_retention_days": "unlimited"}
+    assert result["readback"] == {"message_retention_days": -1}
+
+
+def test_semantic_channel_resolution_rejects_raw_ids(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(signup_announcements_stream_id=12),
+        deleted(),
+        {
+            "result": "success",
+            "msg": "",
+            "streams": [{"stream_id": 13, "name": "announcements"}],
+        },
+    ]
+
+    resolved = mcp_module.update_organization_configuration(
+        changes={"signup_announcements_stream_id": "announcements"},
+        dry_run=True,
+    ).structured_content
+
+    assert resolved["status"] == "dry_run"
+    assert resolved["request"] == {"signup_announcements_stream_id": 13}
+    assert resolved["resolved_mappings"] == {
+        "signup_announcements_stream_id": {
+            "desired": {"semantic": "announcements", "resolved": 13},
+        },
+    }
+
+    client.reset_mock()
+    client.call_endpoint.side_effect = [
+        principal(), realm_snapshot(signup_announcements_stream_id=12), deleted(),
+        {"result": "success", "msg": "", "streams": []},
+    ]
+    rejected = mcp_module.update_organization_configuration(
+        changes={"signup_announcements_stream_id": 13},
+        dry_run=True,
+    ).structured_content
+    assert rejected["status"] == "error"
+    assert rejected["error"]["code"] == "SEMANTIC_RESOLUTION_ERROR"
+
+
+def test_channel_reference_clear_uses_minus_one_and_is_idempotent(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(signup_announcements_stream_id=12),
+        deleted(),
+        {"result": "success", "msg": "", "streams": []},
+    ]
+    clear = mcp_module.update_organization_configuration(
+        changes={"signup_announcements_stream_id": None},
+        dry_run=True,
+    ).structured_content
+    assert clear["status"] == "dry_run"
+    assert clear["request"] == {"signup_announcements_stream_id": -1}
+    assert clear["resolved_mappings"]["signup_announcements_stream_id"]["desired"] == {
+        "semantic": None,
+        "resolved": -1,
+    }
+
+    client.reset_mock()
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(signup_announcements_stream_id=-1),
+        deleted(),
+        {"result": "success", "msg": "", "streams": []},
+    ]
+    no_op = mcp_module.update_organization_configuration(
+        changes={"signup_announcements_stream_id": None},
+        expected={"signup_announcements_stream_id": None},
+        dry_run=True,
+    ).structured_content
+    assert no_op["status"] == "dry_run"
+    assert no_op["request"] == {}
+    assert no_op["changed_fields"] == []
+
+
+def test_anonymous_group_membership_order_is_canonicalized(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(can_create_public_channel_group={
+            "direct_members": [8, 7],
+            "direct_subgroups": [5, 4],
+        }),
+        deleted(),
+        {
+            "result": "success",
+            "msg": "",
+            "user_groups": [
+                {"id": 4, "name": "alpha"},
+                {"id": 5, "name": "beta"},
+            ],
+        },
+        {
+            "result": "success",
+            "msg": "",
+            "members": [
+                {"user_id": 7, "email": "a@example.test"},
+                {"user_id": 8, "email": "b@example.test"},
+            ],
+        },
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={"can_create_public_channel_group": {
+            "direct_members": ["a@example.test", "b@example.test"],
+            "direct_subgroups": ["alpha", "beta"],
+        }},
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "dry_run"
+    assert result["request"] == {}
+    assert result["changed_fields"] == []
+
+
+def test_invalid_unlimited_value_returns_structured_error(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    client.call_endpoint.side_effect = [
+        principal(), realm_snapshot(message_retention_days=30), deleted(),
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={"message_retention_days": {"invalid": True}},
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "SEMANTIC_RESOLUTION_ERROR"
+
+
+def test_null_writes_are_rejected_instead_of_silently_dropped(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    realm_result = mcp_module.update_organization_configuration(
+        changes={"description": None}, dry_run=True,
+    ).structured_content
+    assert realm_result["status"] == "error"
+    assert realm_result["error"]["code"] == "NULL_WRITE_UNSUPPORTED"
+
+    client.reset_mock()
+    default_result = mcp_module.update_default_user_settings(
+        changes={"enable_sounds": None}, dry_run=True,
+    ).structured_content
+    assert default_result["status"] == "error"
+    assert default_result["error"]["code"] == "NULL_WRITE_UNSUPPORTED"
+    client.call_endpoint.assert_not_called()
+
+
+def test_default_settings_dry_run_and_successful_readback(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    client.call_endpoint.side_effect = [
+        principal(),
+        defaults_snapshot(enable_sounds=True),
+        deleted(),
+    ]
+    dry_run = mcp_module.update_default_user_settings(
+        changes={"enable_sounds": False},
+        expected={"enable_sounds": True},
+        dry_run=True,
+    ).structured_content
+    assert dry_run["status"] == "dry_run"
+    assert dry_run["request"] == {"enable_sounds": False}
+
+    client.reset_mock()
+    client.call_endpoint.side_effect = [
+        principal(),
+        defaults_snapshot(enable_sounds=True),
+        deleted(),
+        {"result": "success", "msg": ""},
+        defaults_snapshot(enable_sounds=False),
+        deleted(),
+    ]
+    applied = mcp_module.update_default_user_settings(
+        changes={"enable_sounds": False},
+        expected={"enable_sounds": True},
+    ).structured_content
+    assert applied["status"] == "ok"
+    assert applied["readback"] == {"enable_sounds": False}
+    assert client.call_endpoint.call_args_list[3] == call(
+        url="/realm/user_settings_defaults",
+        method="PATCH",
+        request={"enable_sounds": False},
+    )
+
+
+def test_write_results_redact_secret_shaped_values(
+    client: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enable_writes(monkeypatch)
+    client.call_endpoint.return_value = principal()
+
+    result = mcp_module.update_organization_configuration(
+        changes={"authentication_methods": {
+            "Email": True,
+            "api_key": "never-return-this",
+        }},
+        dry_run=True,
+    )
+
+    assert "never-return-this" not in str(result)
+    assert result.structured_content["desired"]["authentication_methods"]["api_key"] == (
+        REDACTED
+    )

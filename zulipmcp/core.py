@@ -18,12 +18,20 @@ import zulip
 
 from .configuration import (
     APIError,
+    CHANNEL_REFERENCE_REALM_FIELDS,
     CONFIGURATION_FETCH_EVENT_TYPES,
     ConfigurationQueueSnapshot,
     CURRENT_USER_FIELDS,
     JSONValue,
+    DEFAULT_USER_WRITE_FIELDS,
+    GROUP_SETTING_REALM_FIELDS,
+    MutationResult,
+    MutationStatus,
     ORGANIZATION_SECTIONS,
+    OWNER_ONLY_REALM_FIELDS,
     QUEUE_SECTIONS,
+    REALM_WRITE_FIELDS,
+    UNLIMITED_REALM_FIELDS,
     SectionResult,
     SectionStatus,
     ZulipAPIError,
@@ -1046,6 +1054,688 @@ def get_organization_configuration(
             if field_name in server.data:
                 aggregate[field_name] = server.data[field_name]
     return aggregate
+
+
+def admin_writes_enabled() -> bool:
+    return os.environ.get("ZULIPMCP_ENABLE_ADMIN_WRITES", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _mutation_status(error: ZulipAPIError) -> MutationStatus:
+    section = _failed_section(error)
+    if section.status == SectionStatus.FORBIDDEN:
+        return MutationStatus.FORBIDDEN
+    if section.status == SectionStatus.UNSUPPORTED:
+        return MutationStatus.UNSUPPORTED
+    return MutationStatus.ERROR
+
+
+def _mutation_failure(
+    endpoint: str, dry_run: bool, error: ZulipAPIError,
+) -> MutationResult:
+    return MutationResult(
+        status=_mutation_status(error),
+        endpoint=endpoint,
+        dry_run=dry_run,
+        error=error.error,
+    )
+
+
+def _write_principal(
+    endpoint: str, dry_run: bool,
+) -> tuple[dict[str, JSONValue] | None, MutationResult | None]:
+    try:
+        principal = get_current_user()
+    except ZulipAPIError as exc:
+        return None, _mutation_failure(endpoint, dry_run, exc)
+    if principal.get("is_owner") is not True and principal.get("is_admin") is not True:
+        return None, MutationResult(
+            status=MutationStatus.FORBIDDEN,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            error=APIError(
+                message="Administrative configuration writes require an owner or administrator",
+                code="INSUFFICIENT_PERMISSION",
+            ),
+        )
+    return principal, None
+
+
+def _read_write_state(
+    fields: set[str], defaults: bool,
+) -> tuple[dict[str, JSONValue], list[str]]:
+    with configuration_queue_snapshot() as snapshot:
+        if defaults:
+            raw = snapshot.data.get("realm_user_settings_defaults")
+            current = dict(raw) if isinstance(raw, dict) else {}
+        else:
+            current = {
+                field: snapshot.data[f"realm_{field}"]
+                for field in fields
+                if f"realm_{field}" in snapshot.data
+            }
+    return current, snapshot.warnings
+
+
+def _invalid_fields_result(
+    endpoint: str,
+    dry_run: bool,
+    fields: set[str],
+    code: str = "INVALID_FIELD",
+) -> MutationResult:
+    names = ", ".join(sorted(fields))
+    return MutationResult(
+        status=MutationStatus.ERROR,
+        endpoint=endpoint,
+        dry_run=dry_run,
+        error=APIError(message=f"Unsupported configuration fields: {names}", code=code),
+    )
+
+
+def _conflict_result(
+    endpoint: str,
+    dry_run: bool,
+    current: dict[str, JSONValue],
+    desired: dict[str, JSONValue],
+    mismatches: list[str],
+    warnings: list[str],
+) -> MutationResult:
+    return MutationResult(
+        status=MutationStatus.CONFLICT,
+        endpoint=endpoint,
+        dry_run=dry_run,
+        current=current,
+        desired=desired,
+        warnings=warnings,
+        error=APIError(
+            message=f"Expected current values did not match: {', '.join(mismatches)}",
+            code="EXPECTED_VALUE_MISMATCH",
+        ),
+    )
+
+
+def _named_id(
+    value: JSONValue,
+    named_ids: dict[str, int],
+    kind: str,
+) -> int:
+    if not isinstance(value, str):
+        raise ValueError(f"{kind} references must use semantic names, not numeric IDs")
+    if value in named_ids:
+        return named_ids[value]
+    matches = {
+        item_id for name, item_id in named_ids.items()
+        if name.casefold() == value.casefold()
+    }
+    if len(matches) == 1:
+        return matches.pop()
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous {kind} name: {value}")
+    raise ValueError(f"Unknown {kind} name: {value}")
+
+
+def _resolve_group_setting(
+    value: JSONValue,
+    group_ids: dict[str, int],
+    user_ids: dict[str, int],
+) -> JSONValue:
+    if isinstance(value, str):
+        return _named_id(value, group_ids, "group")
+    if not isinstance(value, dict):
+        raise ValueError(
+            "Group settings must use a group name or semantic direct_members/direct_subgroups"
+        )
+    extra = set(value) - {"direct_members", "direct_subgroups"}
+    if extra:
+        raise ValueError(f"Unknown anonymous group fields: {', '.join(sorted(extra))}")
+    members = value.get("direct_members", [])
+    subgroups = value.get("direct_subgroups", [])
+    if not isinstance(members, list) or not isinstance(subgroups, list):
+        raise ValueError("direct_members and direct_subgroups must be lists of names")
+    return {
+        "direct_members": [
+            _named_id(member, user_ids, "user") for member in members
+        ],
+        "direct_subgroups": [
+            _named_id(group, group_ids, "group") for group in subgroups
+        ],
+    }
+
+
+def _semantic_name_maps() -> tuple[dict[str, int], dict[str, int]]:
+    groups_response = get_user_groups_configuration()
+    users_response = get_users_configuration()
+    groups = groups_response.get("user_groups")
+    users = users_response.get("members")
+    if not isinstance(groups, list) or not isinstance(users, list):
+        raise ValueError("User and group inventories are required for semantic resolution")
+    group_ids = {
+        group["name"]: group["id"]
+        for group in groups
+        if isinstance(group, dict)
+        and isinstance(group.get("name"), str)
+        and isinstance(group.get("id"), int)
+        and not isinstance(group.get("id"), bool)
+    }
+    user_ids: dict[str, int] = {}
+    duplicate_names: set[str] = set()
+    for user in users:
+        if (
+            not isinstance(user, dict)
+            or not isinstance(user.get("user_id"), int)
+            or isinstance(user.get("user_id"), bool)
+        ):
+            continue
+        user_id = user["user_id"]
+        email = user.get("email")
+        if isinstance(email, str):
+            user_ids[email] = user_id
+        name = user.get("full_name")
+        if isinstance(name, str):
+            if name in user_ids and user_ids[name] != user_id:
+                duplicate_names.add(name)
+            else:
+                user_ids[name] = user_id
+    for name in duplicate_names:
+        user_ids.pop(name, None)
+    return group_ids, user_ids
+
+
+def _channel_name_map() -> dict[str, int]:
+    response = get_streams_configuration()
+    streams = response.get("streams")
+    if not isinstance(streams, list):
+        raise ValueError("Channel inventory is required for semantic resolution")
+    return {
+        stream["name"]: stream["stream_id"]
+        for stream in streams
+        if isinstance(stream, dict)
+        and isinstance(stream.get("name"), str)
+        and isinstance(stream.get("stream_id"), int)
+        and not isinstance(stream.get("stream_id"), bool)
+    }
+
+
+def _canonical_realm_value(field: str, value: JSONValue) -> JSONValue:
+    if field in UNLIMITED_REALM_FIELDS:
+        if value is None or value == -1 or value in ("forever", "unlimited"):
+            return "unlimited"
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{field} must be an integer or 'unlimited'")
+    if field in CHANNEL_REFERENCE_REALM_FIELDS and value in (None, -1):
+        return -1
+    if field in GROUP_SETTING_REALM_FIELDS and isinstance(value, dict):
+        members = value.get("direct_members")
+        subgroups = value.get("direct_subgroups")
+        if isinstance(members, list) and isinstance(subgroups, list):
+            return {
+                "direct_members": sorted(members, key=repr),
+                "direct_subgroups": sorted(subgroups, key=repr),
+            }
+    return value
+
+
+def _resolve_realm_values(
+    changes: dict[str, JSONValue],
+    expected: dict[str, JSONValue],
+) -> tuple[
+    dict[str, JSONValue],
+    dict[str, JSONValue],
+    dict[str, JSONValue],
+]:
+    resolved_changes = dict(changes)
+    resolved_expected = dict(expected)
+    mappings: dict[str, JSONValue] = {}
+    group_fields = (set(changes) | set(expected)) & GROUP_SETTING_REALM_FIELDS
+    if group_fields:
+        group_ids, user_ids = _semantic_name_maps()
+        for field in sorted(group_fields):
+            field_mapping: dict[str, JSONValue] = {}
+            if field in changes:
+                resolved = _resolve_group_setting(changes[field], group_ids, user_ids)
+                resolved_changes[field] = resolved
+                field_mapping["desired"] = {
+                    "semantic": changes[field],
+                    "resolved": resolved,
+                }
+            if field in expected:
+                resolved = _resolve_group_setting(expected[field], group_ids, user_ids)
+                resolved_expected[field] = resolved
+                field_mapping["expected"] = {
+                    "semantic": expected[field],
+                    "resolved": resolved,
+                }
+            mappings[field] = field_mapping
+
+    channel_fields = (set(changes) | set(expected)) & CHANNEL_REFERENCE_REALM_FIELDS
+    if channel_fields:
+        channel_ids = _channel_name_map()
+        for field in sorted(channel_fields):
+            field_mapping = {}
+            if field in changes:
+                value = changes[field]
+                resolved = -1 if value is None else _named_id(value, channel_ids, "channel")
+                resolved_changes[field] = resolved
+                field_mapping["desired"] = {
+                    "semantic": value,
+                    "resolved": resolved,
+                }
+            if field in expected:
+                value = expected[field]
+                resolved = -1 if value is None else _named_id(value, channel_ids, "channel")
+                resolved_expected[field] = resolved
+                field_mapping["expected"] = {
+                    "semantic": value,
+                    "resolved": resolved,
+                }
+            mappings[field] = field_mapping
+
+    for field, value in changes.items():
+        if value is None and field not in (
+            UNLIMITED_REALM_FIELDS | CHANNEL_REFERENCE_REALM_FIELDS
+        ):
+            raise ValueError(f"Null is not a supported write value for {field}")
+        resolved_changes[field] = _canonical_realm_value(
+            field, resolved_changes[field]
+        )
+    for field, value in expected.items():
+        resolved_expected[field] = _canonical_realm_value(
+            field, resolved_expected[field]
+        )
+    return resolved_changes, resolved_expected, mappings
+
+
+def update_organization_configuration(
+    changes: dict[str, JSONValue],
+    expected: dict[str, JSONValue] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/realm"
+    if not admin_writes_enabled():
+        return MutationResult(
+            status=MutationStatus.DISABLED,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            error=APIError(
+                message="Administrative writes are disabled; set ZULIPMCP_ENABLE_ADMIN_WRITES=true",
+                code="ADMIN_WRITES_DISABLED",
+            ),
+        )
+    expected = expected or {}
+    requested_fields = set(changes) | set(expected)
+    invalid = requested_fields - REALM_WRITE_FIELDS
+    if invalid:
+        return _invalid_fields_result(endpoint, dry_run, invalid)
+    if not changes:
+        return _invalid_fields_result(endpoint, dry_run, {"<no changes>"}, "EMPTY_CHANGES")
+    null_fields = sorted(
+        field for field, value in changes.items()
+        if value is None
+        and field not in (UNLIMITED_REALM_FIELDS | CHANNEL_REFERENCE_REALM_FIELDS)
+    )
+    if null_fields:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired=changes,
+            error=APIError(
+                message=f"Null is not a supported write value for: {', '.join(null_fields)}",
+                code="NULL_WRITE_UNSUPPORTED",
+            ),
+        )
+
+    principal, failure = _write_principal(endpoint, dry_run)
+    if failure is not None:
+        return failure
+    assert principal is not None
+    owner_only = set(changes) & OWNER_ONLY_REALM_FIELDS
+    if owner_only and principal.get("is_owner") is not True:
+        return MutationResult(
+            status=MutationStatus.FORBIDDEN,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired=changes,
+            error=APIError(
+                message=f"Owner authority is required for: {', '.join(sorted(owner_only))}",
+                code="OWNER_REQUIRED",
+            ),
+        )
+    authentication = changes.get("authentication_methods")
+    if authentication is not None:
+        if (
+            not isinstance(authentication, dict)
+            or not authentication
+            or any(not isinstance(value, bool) for value in authentication.values())
+            or not any(authentication.values())
+        ):
+            return MutationResult(
+                status=MutationStatus.ERROR,
+                endpoint=endpoint,
+                dry_run=dry_run,
+                desired=changes,
+                error=APIError(
+                    message="authentication_methods must enable at least one boolean method",
+                    code="LAST_AUTHENTICATION_METHOD",
+                ),
+            )
+
+    try:
+        current, warnings = _read_write_state(requested_fields, defaults=False)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    absent = requested_fields - set(current)
+    if absent:
+        result = _invalid_fields_result(endpoint, dry_run, absent, "UNSUPPORTED_FIELD")
+        result.current = current
+        result.desired = changes
+        result.unsupported_fields = sorted(absent)
+        result.warnings = warnings
+        return result
+    if isinstance(authentication, dict):
+        current_authentication = current.get("authentication_methods")
+        if not isinstance(current_authentication, dict):
+            return MutationResult(
+                status=MutationStatus.UNSUPPORTED,
+                endpoint=endpoint,
+                dry_run=dry_run,
+                current=current,
+                desired=changes,
+                unsupported_fields=["authentication_methods"],
+                warnings=warnings,
+                error=APIError(
+                    message="Current authentication methods were not available for lockout validation",
+                    code="AUTHENTICATION_METHODS_UNAVAILABLE",
+                ),
+            )
+        unknown_methods = set(authentication) - set(current_authentication)
+        usable_methods = [
+            method for method, enabled in authentication.items()
+            if enabled is True and method in current_authentication
+        ]
+        if unknown_methods or not usable_methods:
+            return MutationResult(
+                status=MutationStatus.ERROR,
+                endpoint=endpoint,
+                dry_run=dry_run,
+                current=current,
+                desired=changes,
+                warnings=warnings,
+                error=APIError(
+                    message=(
+                        "Authentication update must leave a currently supported method enabled"
+                    ),
+                    code="LAST_AUTHENTICATION_METHOD",
+                ),
+            )
+    try:
+        resolved_changes, resolved_expected, mappings = _resolve_realm_values(
+            changes, expected,
+        )
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, dry_run, exc)
+        result.current = current
+        result.desired = changes
+        result.warnings = warnings
+        return result
+    except ValueError as exc:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            current=current,
+            desired=changes,
+            warnings=warnings,
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    mismatches = sorted(
+        field for field, value in resolved_expected.items()
+        if _canonical_realm_value(field, current[field]) != value
+    )
+    if mismatches:
+        result = _conflict_result(
+            endpoint, dry_run, current, changes, mismatches, warnings,
+        )
+        result.resolved_mappings = mappings
+        return result
+
+    changed = sorted(
+        field for field, value in resolved_changes.items()
+        if _canonical_realm_value(field, current[field]) != value
+    )
+    request = {
+        field: (
+            {"new": resolved_changes[field], "old": current[field]}
+            if field in GROUP_SETTING_REALM_FIELDS
+            else resolved_changes[field]
+        )
+        for field in changed
+    }
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=endpoint,
+            dry_run=True,
+            current=current,
+            desired=changes,
+            request=request,
+            changed_fields=changed,
+            resolved_mappings=mappings,
+            warnings=warnings,
+        )
+    if not changed:
+        return MutationResult(
+            status=MutationStatus.OK,
+            endpoint=endpoint,
+            dry_run=False,
+            current=current,
+            desired=changes,
+            request={},
+            readback=current,
+            resolved_mappings=mappings,
+            warnings=warnings + ["All requested fields already had the desired values"],
+        )
+
+    try:
+        response = configuration_request(endpoint, method="PATCH", request=request)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, dry_run, exc)
+        result.current = current
+        result.desired = changes
+        result.request = request
+        result.changed_fields = changed
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    ignored = response.get("ignored_parameters_unsupported")
+    unsupported = [value for value in ignored if isinstance(value, str)] if isinstance(ignored, list) else []
+    try:
+        readback, readback_warnings = _read_write_state(set(changes), defaults=False)
+    except ZulipAPIError as exc:
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=endpoint,
+            dry_run=False,
+            current=current,
+            desired=changes,
+            request=request,
+            response=response,
+            changed_fields=changed,
+            resolved_mappings=mappings,
+            unsupported_fields=unsupported,
+            warnings=warnings,
+            error=exc.error,
+        )
+    warnings.extend(readback_warnings)
+    mismatched_readback = [
+        field for field, value in resolved_changes.items()
+        if field not in unsupported
+        and (
+            field not in readback
+            or _canonical_realm_value(field, readback[field]) != value
+        )
+    ]
+    if mismatched_readback:
+        warnings.append(
+            f"Readback did not match requested values: {', '.join(mismatched_readback)}"
+        )
+    status = (
+        MutationStatus.PARTIAL
+        if unsupported or mismatched_readback
+        else MutationStatus.OK
+    )
+    return MutationResult(
+        status=status,
+        endpoint=endpoint,
+        dry_run=False,
+        current=current,
+        desired=changes,
+        request=request,
+        response=response,
+        readback=readback,
+        changed_fields=changed,
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=warnings,
+    )
+
+
+def update_default_user_settings(
+    changes: dict[str, JSONValue],
+    expected: dict[str, JSONValue] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/realm/user_settings_defaults"
+    if not admin_writes_enabled():
+        return MutationResult(
+            status=MutationStatus.DISABLED,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            error=APIError(
+                message="Administrative writes are disabled; set ZULIPMCP_ENABLE_ADMIN_WRITES=true",
+                code="ADMIN_WRITES_DISABLED",
+            ),
+        )
+    expected = expected or {}
+    requested_fields = set(changes) | set(expected)
+    invalid = requested_fields - DEFAULT_USER_WRITE_FIELDS
+    if invalid:
+        return _invalid_fields_result(endpoint, dry_run, invalid)
+    if not changes:
+        return _invalid_fields_result(endpoint, dry_run, {"<no changes>"}, "EMPTY_CHANGES")
+    null_fields = sorted(field for field, value in changes.items() if value is None)
+    if null_fields:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired=changes,
+            error=APIError(
+                message=f"Null is not a supported write value for: {', '.join(null_fields)}",
+                code="NULL_WRITE_UNSUPPORTED",
+            ),
+        )
+    _, failure = _write_principal(endpoint, dry_run)
+    if failure is not None:
+        return failure
+    try:
+        current, warnings = _read_write_state(requested_fields, defaults=True)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    absent = requested_fields - set(current)
+    if absent:
+        result = _invalid_fields_result(endpoint, dry_run, absent, "UNSUPPORTED_FIELD")
+        result.current = current
+        result.desired = changes
+        result.unsupported_fields = sorted(absent)
+        result.warnings = warnings
+        return result
+    mismatches = sorted(
+        field for field, value in expected.items() if current.get(field) != value
+    )
+    if mismatches:
+        return _conflict_result(
+            endpoint, dry_run, current, changes, mismatches, warnings,
+        )
+    changed = sorted(field for field, value in changes.items() if current[field] != value)
+    request = {field: changes[field] for field in changed}
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=endpoint,
+            dry_run=True,
+            current=current,
+            desired=changes,
+            request=request,
+            changed_fields=changed,
+            warnings=warnings,
+        )
+    if not changed:
+        return MutationResult(
+            status=MutationStatus.OK,
+            endpoint=endpoint,
+            dry_run=False,
+            current=current,
+            desired=changes,
+            readback=current,
+            warnings=warnings + ["All requested fields already had the desired values"],
+        )
+    try:
+        response = configuration_request(endpoint, method="PATCH", request=request)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, dry_run, exc)
+        result.current = current
+        result.desired = changes
+        result.request = request
+        result.changed_fields = changed
+        result.warnings = warnings
+        return result
+    ignored = response.get("ignored_parameters_unsupported")
+    unsupported = [value for value in ignored if isinstance(value, str)] if isinstance(ignored, list) else []
+    try:
+        readback, readback_warnings = _read_write_state(set(changes), defaults=True)
+    except ZulipAPIError as exc:
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=endpoint,
+            dry_run=False,
+            current=current,
+            desired=changes,
+            request=request,
+            response=response,
+            changed_fields=changed,
+            unsupported_fields=unsupported,
+            warnings=warnings,
+            error=exc.error,
+        )
+    warnings.extend(readback_warnings)
+    mismatched_readback = [
+        field for field, value in changes.items()
+        if field not in unsupported
+        and (field not in readback or readback[field] != value)
+    ]
+    if mismatched_readback:
+        warnings.append(
+            f"Readback did not match requested values: {', '.join(mismatched_readback)}"
+        )
+    return MutationResult(
+        status=(
+            MutationStatus.PARTIAL
+            if unsupported or mismatched_readback
+            else MutationStatus.OK
+        ),
+        endpoint=endpoint,
+        dry_run=False,
+        current=current,
+        desired=changes,
+        request=request,
+        response=response,
+        readback=readback,
+        changed_fields=changed,
+        unsupported_fields=unsupported,
+        warnings=warnings,
+    )
 
 
 def get_user_email(full_name: str) -> Optional[str]:

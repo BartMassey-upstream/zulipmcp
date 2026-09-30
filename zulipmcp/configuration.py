@@ -167,6 +167,17 @@ class SectionStatus(str, Enum):
     ERROR = "error"
 
 
+class MutationStatus(str, Enum):
+    DISABLED = "disabled"
+    DRY_RUN = "dry_run"
+    CONFLICT = "conflict"
+    OK = "ok"
+    PARTIAL = "partial"
+    FORBIDDEN = "forbidden"
+    UNSUPPORTED = "unsupported"
+    ERROR = "error"
+
+
 @dataclass(frozen=True)
 class APIError:
     message: str
@@ -232,6 +243,45 @@ class SectionResult:
         return result
 
 
+@dataclass
+class MutationResult:
+    status: MutationStatus
+    endpoint: str
+    dry_run: bool
+    current: dict[str, JSONValue] = field(default_factory=dict)
+    desired: dict[str, JSONValue] = field(default_factory=dict)
+    request: dict[str, JSONValue] = field(default_factory=dict)
+    response: dict[str, JSONValue] | None = None
+    readback: dict[str, JSONValue] | None = None
+    changed_fields: list[str] = field(default_factory=list)
+    resolved_mappings: dict[str, JSONValue] = field(default_factory=dict)
+    unsupported_fields: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    error: APIError | None = None
+
+    def __post_init__(self) -> None:
+        self.status = MutationStatus(self.status)
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        result = redact_secrets({
+            "status": self.status.value,
+            "endpoint": self.endpoint,
+            "dry_run": self.dry_run,
+            "current": self.current,
+            "desired": self.desired,
+            "request": self.request,
+            "response": self.response,
+            "readback": self.readback,
+            "changed_fields": self.changed_fields,
+            "resolved_mappings": self.resolved_mappings,
+            "unsupported_fields": self.unsupported_fields,
+            "warnings": self.warnings,
+            "error": self.error.to_dict() if self.error is not None else None,
+        })
+        assert isinstance(result, dict)
+        return result
+
+
 CURRENT_USER_FIELDS = (
     "user_id", "full_name", "email", "role", "is_owner", "is_admin", "is_guest",
     "is_bot", "is_active", "bot_type", "bot_owner_id",
@@ -270,6 +320,101 @@ ORGANIZATION_SECTIONS = (
     "bots",
     "invitations",
 )
+
+REALM_WRITE_FIELDS = frozenset({
+    "allow_message_editing", "authentication_methods",
+    "avatar_changes_disabled", "can_access_all_users_group",
+    "can_add_custom_emoji_group", "can_add_subscribers_group",
+    "can_create_bots_group", "can_create_groups",
+    "can_create_private_channel_group", "can_create_public_channel_group",
+    "can_create_web_public_channel_group", "can_create_write_only_bots_group",
+    "can_delete_any_message_group", "can_delete_own_message_group",
+    "can_invite_users_group", "can_manage_all_groups",
+    "can_manage_billing_group", "can_mention_many_users_group",
+    "can_move_messages_between_channels_group",
+    "can_move_messages_between_topics_group", "can_resolve_topics_group",
+    "can_set_delete_message_policy_group", "can_set_topics_policy_group",
+    "can_summarize_topics_group", "create_multiuse_invite_group",
+    "default_avatar_source", "default_code_block_language", "default_language",
+    "description", "digest_emails_enabled", "digest_weekday",
+    "direct_message_initiator_group", "direct_message_permission_group",
+    "disallow_disposable_email_addresses", "email_changes_disabled",
+    "emails_restricted_to_domains", "enable_guest_user_dm_warning",
+    "enable_guest_user_indicator", "enable_read_receipts",
+    "enable_spectator_access", "gif_rating_policy", "inline_image_preview",
+    "inline_url_embed_preview", "invite_required", "jitsi_server_url",
+    "media_preview_size", "message_content_allowed_in_email_notifications",
+    "message_content_delete_limit_seconds", "message_content_edit_limit_seconds",
+    "message_edit_history_visibility_policy", "message_retention_days",
+    "moderation_request_channel_id", "move_messages_between_streams_limit_seconds",
+    "move_messages_within_stream_limit_seconds", "name", "name_changes_disabled",
+    "new_stream_announcements_stream_id", "org_type",
+    "require_e2ee_push_notifications", "require_unique_names",
+    "send_channel_events_messages", "send_welcome_emails",
+    "signup_announcements_stream_id", "string_id", "topics_policy",
+    "video_chat_provider", "waiting_period_threshold",
+    "want_advertise_in_communities_directory", "welcome_message_custom_text",
+    "workplace_users_group", "zulip_update_announcements_stream_id",
+})
+
+DEFAULT_USER_WRITE_FIELDS = frozenset({
+    "automatically_follow_topics_policy", "automatically_follow_topics_where_mentioned",
+    "automatically_unmute_topics_in_muted_streams_policy", "color_scheme",
+    "demote_inactive_streams", "desktop_icon_count_display",
+    "display_emoji_reaction_users", "email_address_visibility",
+    "email_notifications_batching_period_seconds", "emojiset",
+    "enable_desktop_notifications", "enable_digest_emails",
+    "enable_drafts_synchronization", "enable_followed_topic_audible_notifications",
+    "enable_followed_topic_desktop_notifications",
+    "enable_followed_topic_email_notifications",
+    "enable_followed_topic_push_notifications",
+    "enable_followed_topic_wildcard_mentions_notify",
+    "enable_offline_email_notifications", "enable_offline_push_notifications",
+    "enable_online_push_notifications", "enable_sounds",
+    "enable_stream_audible_notifications", "enable_stream_desktop_notifications",
+    "enable_stream_email_notifications", "enable_stream_push_notifications",
+    "enter_sends", "fluid_layout_width", "hide_ai_features", "high_contrast_mode",
+    "left_side_userlist", "message_content_in_email_notifications",
+    "notification_sound", "pm_content_in_desktop_notifications", "presence_enabled",
+    "realm_name_in_email_notifications_policy", "receives_typing_notifications",
+    "resolved_topic_notice_auto_read_policy", "send_private_typing_notifications",
+    "send_read_receipts", "send_stream_typing_notifications",
+    "starred_message_counts", "translate_emoticons", "twenty_four_hour_time",
+    "user_list_style", "web_animate_image_previews", "web_channel_default_view",
+    "web_escape_navigates_to_home_view", "web_font_size_px", "web_home_view",
+    "web_inbox_show_channel_folders", "web_left_sidebar_show_channel_folders",
+    "web_left_sidebar_unreads_count_summary", "web_line_height_percent",
+    "web_mark_read_on_scroll_policy", "web_navigate_to_sent_message",
+    "web_stream_unreads_count_display_policy", "web_suggest_update_timezone",
+    "wildcard_mentions_notify",
+})
+
+OWNER_ONLY_REALM_FIELDS = frozenset({
+    "authentication_methods", "disallow_disposable_email_addresses",
+    "emails_restricted_to_domains", "invite_required", "message_retention_days",
+    "waiting_period_threshold", "create_multiuse_invite_group", "can_create_groups",
+    "can_invite_users_group", "can_manage_all_groups", "can_manage_billing_group",
+    "string_id",
+})
+
+GROUP_SETTING_REALM_FIELDS = frozenset(
+    field for field in REALM_WRITE_FIELDS if field.endswith("_group")
+) | frozenset({"can_create_groups", "can_manage_all_groups"})
+
+CHANNEL_REFERENCE_REALM_FIELDS = frozenset({
+    "moderation_request_channel_id",
+    "new_stream_announcements_stream_id",
+    "signup_announcements_stream_id",
+    "zulip_update_announcements_stream_id",
+})
+
+UNLIMITED_REALM_FIELDS = frozenset({
+    "message_retention_days",
+    "message_content_delete_limit_seconds",
+    "message_content_edit_limit_seconds",
+    "move_messages_between_streams_limit_seconds",
+    "move_messages_within_stream_limit_seconds",
+})
 QUEUE_SECTIONS = frozenset({
     "profile",
     "authentication",
