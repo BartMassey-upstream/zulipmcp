@@ -104,6 +104,12 @@ folder membership, default-channel status, and realm settings that
 reference the channel. Default or referenced channels must be detached
 explicitly before archival.
 
+Channel membership tools support additive subscription, explicit
+unsubscription, and exact-state convergence. Exact convergence reads
+the complete subscriber list first, applies additions before removals,
+and protects an authenticated administrator from being removed from a
+private channel when that would compromise recovery.
+
 Dry runs remain available while writes are disabled: they can read
 current state, validate inputs, and show proposed requests without
 issuing a mutation.

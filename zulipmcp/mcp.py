@@ -1244,6 +1244,39 @@ def subscribe_users_to_channel(
 
 
 @mcp.tool()
+def unsubscribe_users_from_channel(
+    realm_url: str,
+    channel: str,
+    users: list[str],
+    dry_run: bool = False,
+) -> ToolResult:
+    """Unsubscribe explicitly named users from an existing named channel."""
+    return mutation_tool_result(
+        "Channel unsubscriptions",
+        zulip_core.unsubscribe_users_from_channel(
+            realm_url, channel, users, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
+def set_channel_members(
+    realm_url: str,
+    channel: str,
+    users: list[str],
+    expected_users: list[str] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Converge a channel's exact visible membership using semantic users."""
+    return mutation_tool_result(
+        "Exact channel membership",
+        zulip_core.set_channel_members(
+            realm_url, channel, users, expected_users, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
 def create_user_group(
     realm_url: str,
     name: str,

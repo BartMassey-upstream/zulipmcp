@@ -3669,6 +3669,298 @@ def subscribe_users_to_channel(
     )
 
 
+def _channel_membership_state(
+    realm_url: str,
+    channel: str,
+    users: list[str],
+    dry_run: bool,
+) -> tuple[
+    dict[str, JSONValue] | None,
+    dict[str, JSONValue] | None,
+    int | None,
+    list[int],
+    set[int],
+    dict[str, JSONValue],
+    MutationResult | None,
+]:
+    endpoint = "/users/me/subscriptions"
+    server, principal, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return None, None, None, [], set(), {}, failure
+    assert server is not None and principal is not None
+    if not isinstance(channel, str) or channel.isdigit():
+        return None, None, None, [], set(), {}, _semantic_error(
+            endpoint, dry_run, "Numeric channel IDs are not accepted",
+        )
+    try:
+        streams = _channel_inventory()
+        current_channel = _find_channel(streams, channel)
+        if current_channel is None:
+            raise ValueError(f"Unknown channel name: {channel}")
+        stream_id = current_channel.get("stream_id")
+        if not isinstance(stream_id, int) or isinstance(stream_id, bool):
+            raise ValueError("Target channel did not have a valid stream_id")
+        _, user_ids = _semantic_name_maps()
+        resolved_users = [_named_id(user, user_ids, "user") for user in users]
+        subscriber_response = get_channel_subscribers_configuration(stream_id)
+        subscribers = subscriber_response.get("subscribers")
+        if not isinstance(subscribers, list):
+            raise ValueError("Channel subscriber inventory was absent or null")
+    except ZulipAPIError as exc:
+        return None, None, None, [], set(), {}, _mutation_failure(
+            endpoint, dry_run, exc,
+        )
+    except ValueError as exc:
+        return None, None, None, [], set(), {}, _semantic_error(
+            endpoint, dry_run, str(exc),
+        )
+    current_ids = {
+        user_id for user_id in subscribers
+        if isinstance(user_id, int) and not isinstance(user_id, bool)
+    }
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "channel": {"semantic": channel, "resolved": stream_id},
+        "users": [
+            {"semantic": user, "resolved": user_id}
+            for user, user_id in zip(users, resolved_users)
+        ],
+    }
+    return (
+        current_channel, principal, stream_id, resolved_users,
+        current_ids, mappings, None,
+    )
+
+
+def unsubscribe_users_from_channel(
+    realm_url: str,
+    channel: str,
+    users: list[str],
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/users/me/subscriptions"
+    current_channel, principal, stream_id, resolved, current_ids, mappings, failure = (
+        _channel_membership_state(realm_url, channel, users, dry_run)
+    )
+    if failure is not None:
+        return failure
+    assert current_channel is not None and principal is not None and stream_id is not None
+    remove_ids = [user_id for user_id in resolved if user_id in current_ids]
+    remove_names = [
+        user for user, user_id in zip(users, resolved) if user_id in remove_ids
+    ]
+    principal_id = principal.get("user_id")
+    if (
+        current_channel.get("invite_only") is True
+        and isinstance(principal_id, int)
+        and principal_id in remove_ids
+    ):
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+            current={"subscriber_ids": sorted(current_ids)},
+            desired={"channel": channel, "remove_users": users},
+            resolved_mappings=mappings,
+            error=APIError(
+                message="Cannot remove the authenticated administrator from a private channel",
+                code="PRIVATE_CHANNEL_ADMIN_PROTECTED",
+            ),
+        )
+    request: dict[str, JSONValue] = {
+        "subscriptions": [current_channel.get("name")], "principals": remove_ids,
+    }
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, endpoint, dry_run=True,
+            current={"subscriber_ids": sorted(current_ids)},
+            desired={"channel": channel, "remove_users": users},
+            request=request if remove_ids else {}, changed_fields=remove_names,
+            resolved_mappings=mappings,
+        )
+    if not remove_ids:
+        return MutationResult(
+            MutationStatus.OK, endpoint, dry_run=False,
+            current={"subscriber_ids": sorted(current_ids)},
+            desired={"channel": channel, "remove_users": users},
+            readback={"subscriber_ids": sorted(current_ids)},
+            resolved_mappings=mappings,
+            warnings=["None of the selected users were subscribed"],
+        )
+    try:
+        response = administrative_mutation_request(endpoint, "DELETE", request)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, False, exc)
+        result.current = {"subscriber_ids": sorted(current_ids)}
+        result.desired = {"channel": channel, "remove_users": users}
+        result.request, result.resolved_mappings = request, mappings
+        return result
+    try:
+        readback = get_channel_subscribers_configuration(stream_id).get("subscribers")
+        if not isinstance(readback, list):
+            raise ValueError("Channel subscriber readback was absent or null")
+        readback_ids = {
+            user_id for user_id in readback
+            if isinstance(user_id, int) and not isinstance(user_id, bool)
+        }
+    except (ValueError, ZulipAPIError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=False,
+            current={"subscriber_ids": sorted(current_ids)},
+            desired={"channel": channel, "remove_users": users}, request=request,
+            response=response, changed_fields=remove_names,
+            resolved_mappings=mappings, error=error,
+        )
+    remaining = sorted(set(remove_ids) & readback_ids)
+    return MutationResult(
+        MutationStatus.PARTIAL if remaining else MutationStatus.OK,
+        endpoint, dry_run=False,
+        current={"subscriber_ids": sorted(current_ids)},
+        desired={"channel": channel, "remove_users": users}, request=request,
+        response=response, readback={"subscriber_ids": sorted(readback_ids)},
+        changed_fields=remove_names, resolved_mappings=mappings,
+        warnings=["Some selected users remained subscribed after readback"] if remaining else [],
+    )
+
+
+def set_channel_members(
+    realm_url: str,
+    channel: str,
+    users: list[str],
+    expected_users: list[str] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/users/me/subscriptions"
+    requested = list(dict.fromkeys(users + list(expected_users or [])))
+    current_channel, principal, stream_id, resolved_all, current_ids, mappings, failure = (
+        _channel_membership_state(realm_url, channel, requested, dry_run)
+    )
+    if failure is not None:
+        return failure
+    assert current_channel is not None and principal is not None and stream_id is not None
+    resolved_by_name = dict(zip(requested, resolved_all))
+    desired_ids = {resolved_by_name[user] for user in users}
+    expected_ids = (
+        {resolved_by_name[user] for user in expected_users}
+        if expected_users is not None else None
+    )
+    mappings["users"] = [
+        {"semantic": user, "resolved": resolved_by_name[user]} for user in users
+    ]
+    mappings["expected_users"] = [
+        {"semantic": user, "resolved": resolved_by_name[user]}
+        for user in (expected_users or [])
+    ]
+    current = {"subscriber_ids": sorted(current_ids)}
+    desired = {"channel": channel, "users": users}
+    if expected_ids is not None and expected_ids != current_ids:
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+            current=current, desired=desired, resolved_mappings=mappings,
+            error=APIError(
+                message="Current channel members did not match expected_users",
+                code="EXPECTED_VALUE_MISMATCH",
+            ),
+        )
+    add_ids = sorted(desired_ids - current_ids)
+    remove_ids = sorted(current_ids - desired_ids)
+    principal_id = principal.get("user_id")
+    if (
+        current_channel.get("invite_only") is True
+        and isinstance(principal_id, int)
+        and principal_id in current_ids
+        and principal_id in remove_ids
+    ):
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+            current=current, desired=desired, resolved_mappings=mappings,
+            error=APIError(
+                message="Cannot remove the authenticated administrator from a private channel",
+                code="PRIVATE_CHANNEL_ADMIN_PROTECTED",
+            ),
+        )
+    summary: dict[str, JSONValue] = {
+        "to_subscribe": add_ids, "to_unsubscribe": remove_ids,
+    }
+    if not add_ids and not remove_ids:
+        return MutationResult(
+            MutationStatus.OK, endpoint, dry_run=dry_run,
+            current=current, desired=desired, request=summary,
+            readback=current, resolved_mappings=mappings,
+            warnings=["Channel already had the exact requested membership"],
+        )
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, endpoint, dry_run=True,
+            current=current, desired=desired, request=summary,
+            changed_fields=["members"], resolved_mappings=mappings,
+        )
+    completed_additions: list[int] = []
+    completed_removals: list[int] = []
+    try:
+        if add_ids:
+            administrative_mutation_request(endpoint, "POST", {
+                "subscriptions": [{"name": current_channel.get("name")}],
+                "principals": add_ids,
+                "authorization_errors_fatal": True,
+            })
+            completed_additions = add_ids
+        if remove_ids:
+            administrative_mutation_request(endpoint, "DELETE", {
+                "subscriptions": [current_channel.get("name")],
+                "principals": remove_ids,
+            })
+            completed_removals = remove_ids
+    except ZulipAPIError as exc:
+        changed_any = bool(completed_additions or completed_removals)
+        return MutationResult(
+            MutationStatus.PARTIAL if changed_any else _mutation_status(exc),
+            endpoint, dry_run=False, current=current, desired=desired,
+            request=summary,
+            response={
+                "subscribed": completed_additions,
+                "unsubscribed": completed_removals,
+                "remaining_subscriptions": [
+                    user_id for user_id in add_ids if user_id not in completed_additions
+                ],
+                "remaining_unsubscriptions": [
+                    user_id for user_id in remove_ids if user_id not in completed_removals
+                ],
+            },
+            changed_fields=["members"], resolved_mappings=mappings,
+            error=exc.error,
+        )
+    try:
+        readback = get_channel_subscribers_configuration(stream_id).get("subscribers")
+        if not isinstance(readback, list):
+            raise ValueError("Channel subscriber readback was absent or null")
+        readback_ids = {
+            user_id for user_id in readback
+            if isinstance(user_id, int) and not isinstance(user_id, bool)
+        }
+    except (ValueError, ZulipAPIError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=False,
+            current=current, desired=desired, request=summary,
+            response={"subscribed": add_ids, "unsubscribed": remove_ids},
+            changed_fields=["members"], resolved_mappings=mappings,
+            error=error,
+        )
+    confirmed = readback_ids == desired_ids
+    return MutationResult(
+        MutationStatus.OK if confirmed else MutationStatus.PARTIAL,
+        endpoint, dry_run=False, current=current, desired=desired, request=summary,
+        response={"subscribed": add_ids, "unsubscribed": remove_ids},
+        readback={"subscriber_ids": sorted(readback_ids)},
+        changed_fields=["members"], resolved_mappings=mappings,
+        warnings=[] if confirmed else ["Membership readback did not match exact desired state"],
+    )
+
+
 def _group_inventory() -> list[dict[str, JSONValue]]:
     response = get_user_groups_configuration()
     groups = response.get("user_groups")
