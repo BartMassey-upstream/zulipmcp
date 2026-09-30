@@ -3,6 +3,7 @@ import re
 import time
 import tempfile
 import json
+import hashlib
 import logging
 import urllib.parse
 from contextlib import contextmanager
@@ -10,7 +11,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from typing import Callable, Iterator, Optional
+from typing import BinaryIO, Callable, Iterator, Optional
 
 import diskcache
 import requests
@@ -493,7 +494,10 @@ def get_client() -> zulip.Client:
 
 
 def configuration_request(
-    url: str, method: str = "GET", request: dict[str, JSONValue] | None = None,
+    url: str,
+    method: str = "GET",
+    request: dict[str, JSONValue] | None = None,
+    files: list[BinaryIO] | None = None,
 ) -> dict[str, JSONValue]:
     client = None
     status_token = _response_status.set(None)
@@ -501,7 +505,10 @@ def configuration_request(
         client = get_client()
         if isinstance(client, zulip.Client):
             _enable_response_status_tracking(client)
-        response = client.call_endpoint(url=url, method=method, request=request)
+        kwargs: dict[str, object] = {"url": url, "method": method, "request": request}
+        if files is not None:
+            kwargs["files"] = files
+        response = client.call_endpoint(**kwargs)
         response_status = _response_status.get()
     except (requests.RequestException, OSError, zulip.UnrecoverableNetworkError) as exc:
         key = getattr(client, "api_key", None)
@@ -722,7 +729,9 @@ def _queue_sections(
     results: dict[str, SectionResult] = {}
     partitioned = partition_realm_snapshot(snapshot)
     for name in requested & QUEUE_SECTIONS:
-        if name in partitioned:
+        if name == "branding":
+            results[name] = _branding_section(snapshot)
+        elif name in partitioned:
             data = partitioned[name]
             results[name] = SectionResult(
                 SectionStatus.OK if data else SectionStatus.EMPTY,
@@ -785,6 +794,51 @@ def _queue_sections(
                     data=present,
                 )
     return results
+
+
+_BRANDING_ASSETS = {
+    "icon": ("realm_icon_url", "realm_icon_source", "max_icon_file_size_mib"),
+    "logo_light": ("realm_logo_url", "realm_logo_source", "max_logo_file_size_mib"),
+    "logo_dark": (
+        "realm_night_logo_url",
+        "realm_night_logo_source",
+        "max_logo_file_size_mib",
+    ),
+}
+
+
+def _branding_section(snapshot: dict[str, JSONValue]) -> SectionResult:
+    data: dict[str, JSONValue] = {}
+    absent: list[str] = []
+    for asset, (url_field, source_field, size_field) in _BRANDING_ASSETS.items():
+        item: dict[str, JSONValue] = {"asset": asset}
+        for output, field in (
+            ("url", url_field),
+            ("source", source_field),
+            ("max_file_size_mib", size_field),
+        ):
+            if field in snapshot:
+                item[output] = snapshot[field]
+            elif output != "max_file_size_mib":
+                absent.append(field)
+        data[asset] = item
+    return SectionResult(
+        SectionStatus.PARTIAL if absent else SectionStatus.OK,
+        data=data,
+        absent_fields=absent,
+        warnings=[f"Register response omitted {field}" for field in absent],
+    )
+
+
+def get_organization_branding() -> SectionResult:
+    try:
+        snapshot = None
+        with configuration_queue_snapshot() as snapshot:
+            result = _branding_section(snapshot.data)
+        result.warnings.extend(snapshot.warnings)
+        return result
+    except ZulipAPIError as exc:
+        return _failed_section(exc)
 
 
 def _add_bot_subscriptions(
@@ -1089,6 +1143,7 @@ def administrative_mutation_request(
     url: str,
     method: str,
     request: dict[str, JSONValue] | None = None,
+    files: list[BinaryIO] | None = None,
 ) -> dict[str, JSONValue]:
     if not admin_writes_enabled():
         raise ZulipAPIError(APIError(
@@ -1098,7 +1153,7 @@ def administrative_mutation_request(
             ),
             code="ADMIN_WRITES_DISABLED",
         ))
-    return configuration_request(url, method=method, request=request)
+    return configuration_request(url, method=method, request=request, files=files)
 
 
 def _mutation_status(error: ZulipAPIError) -> MutationStatus:
@@ -1798,6 +1853,225 @@ def _admin_destination(
         )
     principal, failure = _write_principal(endpoint, dry_run)
     return settings, principal, failure
+
+
+def _branding_asset(asset: str) -> tuple[str, str, str]:
+    try:
+        return _BRANDING_ASSETS[asset]
+    except KeyError:
+        raise ValueError(
+            "asset must be one of: icon, logo_light, logo_dark"
+        ) from None
+
+
+def _detect_image(content: bytes) -> tuple[str, str]:
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", ".png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", ".jpg"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif", ".gif"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    raise ValueError("Branding file is not a supported PNG, JPEG, GIF, or WebP image")
+
+
+def _read_branding_file(
+    file_path: str, max_file_size_mib: JSONValue = None,
+) -> tuple[Path, bytes, str, str]:
+    path = Path(file_path)
+    if not path.is_absolute():
+        raise ValueError("file_path must be absolute")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("file_path must be an existing regular file, not a symlink")
+    content = path.read_bytes()
+    media_type, extension = _detect_image(content)
+    if (
+        isinstance(max_file_size_mib, (int, float))
+        and not isinstance(max_file_size_mib, bool)
+        and len(content) > max_file_size_mib * 1024 * 1024
+    ):
+        raise ValueError(
+            f"Branding file exceeds the advertised {max_file_size_mib} MiB limit"
+        )
+    return path, content, media_type, extension
+
+
+def download_organization_branding(
+    asset: str, output_directory: str | None = None,
+) -> SectionResult:
+    try:
+        _branding_asset(asset)
+    except ValueError as exc:
+        return SectionResult(
+            SectionStatus.ERROR,
+            error=APIError(message=str(exc), code="INVALID_ASSET"),
+        )
+    branding = get_organization_branding()
+    if branding.status not in {SectionStatus.OK, SectionStatus.PARTIAL}:
+        return branding
+    assert isinstance(branding.data, dict)
+    selected = branding.data.get(asset)
+    if not isinstance(selected, dict) or not isinstance(selected.get("url"), str):
+        return SectionResult(
+            SectionStatus.UNSUPPORTED,
+            error=APIError(
+                message=f"Server did not report a URL for {asset}",
+                code="BRANDING_URL_UNAVAILABLE",
+            ),
+        )
+    try:
+        content, _ = download_file(selected["url"])
+        media_type, extension = _detect_image(content)
+        if output_directory is None:
+            directory = Path(tempfile.mkdtemp(prefix="zulipmcp-branding-"))
+        else:
+            directory = Path(output_directory)
+            if not directory.is_absolute() or not directory.is_dir():
+                raise ValueError("output_directory must be an absolute existing directory")
+        descriptor, saved_name = tempfile.mkstemp(
+            prefix=f"{asset}-", suffix=extension, dir=directory,
+        )
+        try:
+            os.chmod(saved_name, 0o600)
+            with os.fdopen(descriptor, "wb") as output:
+                descriptor = -1
+                output.write(content)
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+            Path(saved_name).unlink(missing_ok=True)
+            raise
+    except (OSError, ValueError) as exc:
+        return SectionResult(
+            SectionStatus.ERROR,
+            error=APIError(message=str(exc), code="BRANDING_DOWNLOAD_FAILED"),
+        )
+    data: dict[str, JSONValue] = {
+        "asset": asset,
+        "path": str(Path(saved_name).resolve()),
+        "byte_count": len(content),
+        "media_type": media_type,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "url": selected["url"],
+    }
+    if "source" in selected:
+        data["source"] = selected["source"]
+    return SectionResult(SectionStatus.OK, data=data, warnings=branding.warnings)
+
+
+def upload_organization_branding(
+    realm_url: str,
+    asset: str,
+    file_path: str,
+    expected_source: str | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    try:
+        _branding_asset(asset)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, "/realm",
+            dry_run=dry_run,
+            error=APIError(message=str(exc), code="INVALID_ASSET"),
+        )
+    endpoint = "/realm/icon" if asset == "icon" else "/realm/logo"
+    _, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    branding = get_organization_branding()
+    if branding.status not in {SectionStatus.OK, SectionStatus.PARTIAL}:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=branding.error or APIError(
+                message="Could not read current branding", code="BRANDING_READ_FAILED",
+            ),
+        )
+    assert isinstance(branding.data, dict)
+    current_asset = branding.data.get(asset)
+    current = dict(current_asset) if isinstance(current_asset, dict) else {"asset": asset}
+    if expected_source is not None and current.get("source") != expected_source:
+        return MutationResult(
+            MutationStatus.CONFLICT,
+            endpoint,
+            dry_run=dry_run,
+            current=current,
+            desired={"source": expected_source},
+            error=APIError(
+                message="Current branding source does not match expected_source",
+                code="EXPECTED_VALUE_MISMATCH",
+            ),
+        )
+    maximum = current.get("max_file_size_mib")
+    try:
+        path, content, media_type, _ = _read_branding_file(file_path, maximum)
+    except (OSError, ValueError) as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run, current=current,
+            error=APIError(message=str(exc), code="INVALID_IMAGE_FILE"),
+        )
+    summary: dict[str, JSONValue] = {
+        "asset": asset,
+        "file_path": str(path),
+        "byte_count": len(content),
+        "media_type": media_type,
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+    request: dict[str, JSONValue] = {}
+    if asset != "icon":
+        request["night"] = asset == "logo_dark"
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN,
+            endpoint,
+            dry_run=True,
+            current=current,
+            desired=summary,
+            request={**request, "file": summary},
+            changed_fields=[asset],
+            warnings=["Zulip transforms branding images; repeated uploads may differ"],
+        )
+    try:
+        with path.open("rb") as upload:
+            response = administrative_mutation_request(
+                endpoint, "POST", request=request, files=[upload],
+            )
+    except (OSError, ZulipAPIError) as exc:
+        if isinstance(exc, ZulipAPIError):
+            result = _mutation_failure(endpoint, False, exc)
+        else:
+            result = MutationResult(
+                MutationStatus.ERROR, endpoint,
+                error=APIError(message=str(exc), code="FILE_READ_FAILED"),
+            )
+        result.current = current
+        result.desired = summary
+        result.request = {**request, "file": summary}
+        return result
+    readback_section = get_organization_branding()
+    readback_data = readback_section.data if isinstance(readback_section.data, dict) else {}
+    selected = readback_data.get(asset) if isinstance(readback_data, dict) else None
+    confirmed = (
+        isinstance(selected, dict)
+        and selected.get("source") == "U"
+        and isinstance(selected.get("url"), str)
+        and bool(selected["url"])
+    )
+    warnings = ["Zulip transforms branding images; repeated uploads may upload again"]
+    if not confirmed:
+        warnings.append("Upload succeeded but readback did not confirm uploaded branding")
+    return MutationResult(
+        MutationStatus.OK if confirmed else MutationStatus.PARTIAL,
+        endpoint,
+        dry_run=False,
+        current=current,
+        desired=summary,
+        request={**request, "file": summary},
+        response=response,
+        readback=selected if isinstance(selected, dict) else None,
+        changed_fields=[asset],
+        warnings=warnings + readback_section.warnings,
+    )
 
 
 def _channel_inventory() -> list[dict[str, JSONValue]]:
@@ -5242,10 +5516,25 @@ def download_file(path: str) -> tuple[bytes, str]:
     base = client.base_url.rstrip("/")
     if base.endswith("/api"):
         base = base[:-4]
-    if not path.startswith("/"):
-        path = "/" + path
+    if path.startswith(("https://", "http://")):
+        url = path
+        base_origin = urllib.parse.urlsplit(base)
+        url_origin = urllib.parse.urlsplit(url)
+        authenticated = (
+            base_origin.scheme == url_origin.scheme
+            and base_origin.netloc == url_origin.netloc
+        )
+    else:
+        if not path.startswith("/"):
+            path = "/" + path
+        url = base + path
+        authenticated = True
 
-    response = client.session.get(base + path, timeout=30)
+    response = (
+        client.session.get(url, timeout=30)
+        if authenticated
+        else requests.get(url, timeout=30)
+    )
     if response.status_code == 403:
         raise ValueError(f"Access denied (403). The bot may not have permission to access: {path}")
     elif response.status_code == 404:

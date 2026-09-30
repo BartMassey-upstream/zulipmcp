@@ -79,6 +79,15 @@ successful mutations. Allowed-domain changes require an organization
 owner. No deletion, unsubscription, or blind realm-clone tool is
 provided.
 
+Branding tools can audit, download, and upload the organization icon
+and light and dark logos. Downloads are written to new private local
+files, so an asset can be copied between realm-specific MCP servers
+without passing image bytes through the model. Uploads accept only
+recognized raster image content and enforce the server's advertised
+size limit. Zulip transforms uploaded branding and does not publish a
+source-file hash, so uploads are not content-idempotent; use
+`expected_source` to guard against stale state.
+
 Dry runs remain available while writes are disabled: they can read
 current state, validate inputs, and show proposed requests without
 issuing a mutation.

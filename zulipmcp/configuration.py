@@ -305,6 +305,7 @@ BOT_AUDIT_FIELDS = USER_AUDIT_FIELDS + (
 )
 ORGANIZATION_SECTIONS = (
     "profile",
+    "branding",
     "authentication",
     "access",
     "permissions",
@@ -480,6 +481,7 @@ LINKIFIER_REVERSE_FIELDS = frozenset({
 })
 QUEUE_SECTIONS = frozenset({
     "profile",
+    "branding",
     "authentication",
     "access",
     "permissions",
@@ -621,6 +623,14 @@ def partition_realm_snapshot(
         "default_stream_groups",
         "realm_default_streams",
         "realm_default_stream_groups",
+        "realm_icon_url",
+        "realm_icon_source",
+        "max_icon_file_size_mib",
+        "realm_logo_url",
+        "realm_logo_source",
+        "realm_night_logo_url",
+        "realm_night_logo_source",
+        "max_logo_file_size_mib",
     }
     for key, value in snapshot.items():
         if key in excluded:

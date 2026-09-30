@@ -958,6 +958,26 @@ def get_organization_configuration(
     )
 
 
+@mcp.tool()
+def get_organization_branding() -> ToolResult:
+    """Read icon, light-logo, and dark-logo metadata as typed data."""
+    return configuration_tool_result(
+        "Organization branding", zulip_core.get_organization_branding(),
+    )
+
+
+@mcp.tool()
+def download_organization_branding(
+    asset: str,
+    output_directory: str | None = None,
+) -> ToolResult:
+    """Download a branding asset to a new private local file."""
+    return configuration_tool_result(
+        "Organization branding download",
+        zulip_core.download_organization_branding(asset, output_directory),
+    )
+
+
 def mutation_tool_result(label: str, mutation: MutationResult) -> ToolResult:
     structured = mutation.to_dict()
     text = f"{label}: {structured['status']}."
@@ -1022,6 +1042,23 @@ def disable_administrative_writes() -> ToolResult:
     zulip_core.set_admin_writes_enabled(False)
     return _write_authorization_result(
         "disabled", "Administrative writes are disabled.",
+    )
+
+
+@mcp.tool()
+def upload_organization_branding(
+    realm_url: str,
+    asset: str,
+    file_path: str,
+    expected_source: str | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Upload branding; transformed content prevents hash-based idempotence."""
+    return mutation_tool_result(
+        "Organization branding upload",
+        zulip_core.upload_organization_branding(
+            realm_url, asset, file_path, expected_source, dry_run,
+        ),
     )
 
 
