@@ -1420,6 +1420,12 @@ def _canonical_realm_value(field: str, value: JSONValue) -> JSONValue:
     return value
 
 
+def _realm_request_value(field: str, value: JSONValue) -> JSONValue:
+    if field in UNLIMITED_REALM_FIELDS and value == "unlimited":
+        return json.dumps(value)
+    return value
+
+
 def _resolve_realm_values(
     changes: dict[str, JSONValue],
     expected: dict[str, JSONValue],
@@ -1642,7 +1648,7 @@ def update_organization_configuration(
         field: (
             {"new": resolved_changes[field], "old": current[field]}
             if field in GROUP_SETTING_REALM_FIELDS
-            else resolved_changes[field]
+            else _realm_request_value(field, resolved_changes[field])
         )
         for field in changed
     }

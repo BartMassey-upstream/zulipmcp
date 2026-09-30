@@ -1,4 +1,5 @@
 import importlib
+import json
 from unittest.mock import Mock, call
 
 import pytest
@@ -338,26 +339,88 @@ def test_ignored_parameters_are_partial_not_success(
     assert result["readback"] == {"description": "old"}
 
 
-def test_unlimited_values_normalize_for_request_and_readback(
-    client: Mock, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("field", sorted(core.UNLIMITED_REALM_FIELDS))
+def test_nullable_duration_dry_run_uses_json_encoded_unlimited(
+    client: Mock, field: str,
 ) -> None:
     client.call_endpoint.side_effect = [
         principal(),
-        realm_snapshot(message_retention_days=30),
-        deleted(),
-        {"result": "success", "msg": ""},
-        realm_snapshot(message_retention_days=-1),
+        realm_snapshot(**{field: 30}),
         deleted(),
     ]
 
     result = mcp_module.update_organization_configuration(
-        changes={"message_retention_days": "unlimited"},
-        expected={"message_retention_days": 30},
+        changes={field: None},
+        expected={field: 30},
+        dry_run=True,
     ).structured_content
 
+    assert result["status"] == "dry_run"
+    assert result["request"] == {field: '"unlimited"'}
+
+
+@pytest.mark.parametrize("field", sorted(core.UNLIMITED_REALM_FIELDS))
+def test_nullable_duration_changes_from_unlimited_to_finite(
+    client: Mock, field: str,
+) -> None:
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(**{field: None}),
+        deleted(),
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={field: 600},
+        expected={field: None},
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "dry_run"
+    assert result["request"] == {field: 600}
+
+
+def test_nullable_duration_live_request_matches_dry_run_encoding(
+    client: Mock,
+) -> None:
+    fields = sorted(core.UNLIMITED_REALM_FIELDS)
+    old = {field: 30 for field in fields}
+    new = {field: None for field in fields}
+    client.call_endpoint.side_effect = [
+        principal(), realm_snapshot(**old), deleted(),
+    ]
+    dry_run = mcp_module.update_organization_configuration(
+        changes=new,
+        expected=old,
+        dry_run=True,
+    ).structured_content
+
+    non_mutation_responses = iter([
+        principal(), realm_snapshot(**old), deleted(),
+        realm_snapshot(**new), deleted(),
+    ])
+    live_requests: list[dict[str, object]] = []
+
+    def call_endpoint(**kwargs: object) -> dict[str, object]:
+        if kwargs["method"] == "PATCH":
+            request = kwargs["request"]
+            assert isinstance(request, dict)
+            live_requests.append(request)
+            assert all(json.loads(request[field]) == "unlimited" for field in fields)
+            return deleted()
+        return next(non_mutation_responses)
+
+    client.call_endpoint.side_effect = call_endpoint
+    result = mcp_module.update_organization_configuration(
+        changes=new,
+        expected=old,
+    ).structured_content
+    expected_request = {field: '"unlimited"' for field in fields}
+
     assert result["status"] == "ok"
-    assert result["request"] == {"message_retention_days": "unlimited"}
-    assert result["readback"] == {"message_retention_days": -1}
+    assert result["request"] == expected_request
+    assert result["request"] == dry_run["request"]
+    assert live_requests == [expected_request]
+    assert result["readback"] == new
 
 
 def test_semantic_channel_resolution_rejects_raw_ids(
