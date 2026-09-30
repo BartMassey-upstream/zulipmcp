@@ -759,8 +759,15 @@ def _queue_sections(
                     )
         elif name == "default_channels":
             fields = ("default_streams", "default_stream_groups")
-            present = {field: snapshot[field] for field in fields if field in snapshot}
-            missing = [field for field in fields if field not in snapshot]
+            present: dict[str, JSONValue] = {}
+            missing = []
+            for field in fields:
+                if field in snapshot:
+                    present[field] = snapshot[field]
+                elif f"realm_{field}" in snapshot:
+                    present[field] = snapshot[f"realm_{field}"]
+                else:
+                    missing.append(field)
             null_fields = [field for field, value in present.items() if value is None]
             if missing or null_fields:
                 results[name] = SectionResult(

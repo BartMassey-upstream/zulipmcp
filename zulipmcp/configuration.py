@@ -619,6 +619,8 @@ def partition_realm_snapshot(
         "realm_user_settings_defaults",
         "default_streams",
         "default_stream_groups",
+        "realm_default_streams",
+        "realm_default_stream_groups",
     }
     for key, value in snapshot.items():
         if key in excluded:

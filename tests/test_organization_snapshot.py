@@ -298,6 +298,37 @@ def test_queue_bundles_distinguish_unsupported_null_and_empty(client: Mock) -> N
     }
 
 
+def test_default_channels_accept_realm_prefixed_register_fields(client: Mock) -> None:
+    client.call_endpoint.side_effect = [
+        server_response(),
+        principal_response(),
+        {
+            "result": "success",
+            "msg": "",
+            "queue_id": "queue-1",
+            "zulip_feature_level": 500,
+            "realm_default_streams": [12],
+            "realm_default_stream_groups": [],
+        },
+        {"result": "success", "msg": ""},
+    ]
+
+    result = mcp_module.get_organization_configuration(
+        sections=["profile", "default_channels"],
+    ).structured_content
+
+    assert result["section_status"] == {
+        "profile": "ok",
+        "default_channels": "ok",
+    }
+    assert "realm_default_streams" not in result["sections"]["profile"]["data"]
+    assert "realm_default_stream_groups" not in result["sections"]["profile"]["data"]
+    assert result["sections"]["default_channels"]["data"] == {
+        "default_streams": [12],
+        "default_stream_groups": [],
+    }
+
+
 def test_bot_subscription_failures_are_preserved_per_bot(client: Mock) -> None:
     client.call_endpoint.side_effect = [
         server_response(),
