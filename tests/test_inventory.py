@@ -19,29 +19,41 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Mock:
 
 
 def test_list_streams_returns_full_typed_channels(client: Mock) -> None:
-    client.call_endpoint.return_value = {
-        "result": "success",
-        "msg": "",
-        "streams": [
-            {
-                "stream_id": 12,
-                "name": "general",
-                "is_default": True,
-                "is_archived": False,
-                "message_retention_days": None,
-                "can_send_message_group": {
-                    "direct_members": [7],
-                    "direct_subgroups": [4],
+    client.call_endpoint.side_effect = [
+        {
+            "result": "success",
+            "msg": "",
+            "streams": [
+                {
+                    "stream_id": 12,
+                    "name": "general",
+                    "is_default": True,
+                    "is_archived": False,
+                    "message_retention_days": None,
+                    "can_send_message_group": {
+                        "direct_members": [7],
+                        "direct_subgroups": [4],
+                    },
                 },
-            },
-            {
-                "stream_id": 13,
-                "name": "archive",
-                "is_archived": True,
-                "message_retention_days": -1,
-            },
-        ],
-    }
+                {
+                    "stream_id": 13,
+                    "name": "archive",
+                    "is_archived": True,
+                    "message_retention_days": -1,
+                },
+            ],
+        },
+        {
+            "result": "success",
+            "msg": "",
+            "user_groups": [{"id": 4, "name": "staff"}],
+        },
+        {
+            "result": "success",
+            "msg": "",
+            "zulip_feature_level": 500,
+        },
+    ]
 
     result = mcp_module.list_streams()
 
@@ -57,27 +69,56 @@ def test_list_streams_returns_full_typed_channels(client: Mock) -> None:
             "direct_members": [7],
             "direct_subgroups": [4],
         },
+        "retention_semantics": "inherit_realm_policy",
+        "resolved_group_settings": {
+            "can_send_message_group": {
+                "raw": {"direct_members": [7], "direct_subgroups": [4]},
+                "direct_subgroup_names": ["staff"],
+            },
+        },
     }
     assert "is_default" not in result.structured_content["data"]["streams"][1]
-    client.call_endpoint.assert_called_once_with(
-        url="/streams",
-        method="GET",
-        request={
-            "include_all": True,
-            "include_default": True,
-            "exclude_archived": False,
-        },
+    assert result.structured_content["data"]["streams"][1]["retention_semantics"] == (
+        "retain_forever"
     )
+    assert result.structured_content["unsupported_fields"] == [
+        "streams[].default_push_notifications",
+    ]
+    assert client.call_endpoint.call_args_list == [
+        call(
+            url="/streams",
+            method="GET",
+            request={
+                "include_all": True,
+                "include_default": True,
+                "exclude_archived": False,
+            },
+        ),
+        call(
+            url="/user_groups",
+            method="GET",
+            request={"include_deactivated_groups": True},
+        ),
+        call(url="/server_settings", method="GET", request=None),
+    ]
 
 
 def test_list_streams_passes_options_and_omits_missing_selected_fields(
     client: Mock,
 ) -> None:
-    client.call_endpoint.return_value = {
-        "result": "success",
-        "msg": "",
-        "streams": [{"name": "public", "is_web_public": True}],
-    }
+    client.call_endpoint.side_effect = [
+        {
+            "result": "success",
+            "msg": "",
+            "streams": [{"name": "public", "is_web_public": True}],
+        },
+        {"result": "success", "msg": "", "user_groups": []},
+        {
+            "result": "success",
+            "msg": "",
+            "zulip_feature_level": 500,
+        },
+    ]
 
     result = mcp_module.list_streams(
         include_all=False,
@@ -90,16 +131,24 @@ def test_list_streams_passes_options_and_omits_missing_selected_fields(
     assert result.structured_content["data"]["streams"] == [
         {"name": "public", "is_web_public": True},
     ]
-    client.call_endpoint.assert_called_once_with(
-        url="/streams",
-        method="GET",
-        request={
-            "include_all": False,
-            "include_default": False,
-            "include_web_public": True,
-            "exclude_archived": True,
-        },
-    )
+    assert client.call_endpoint.call_args_list == [
+        call(
+            url="/streams",
+            method="GET",
+            request={
+                "include_all": False,
+                "include_default": False,
+                "include_web_public": True,
+                "exclude_archived": True,
+            },
+        ),
+        call(
+            url="/user_groups",
+            method="GET",
+            request={"include_deactivated_groups": True},
+        ),
+        call(url="/server_settings", method="GET", request=None),
+    ]
 
 
 def test_list_streams_distinguishes_empty_from_forbidden(client: Mock) -> None:
@@ -114,6 +163,30 @@ def test_list_streams_distinguishes_empty_from_forbidden(client: Mock) -> None:
     forbidden = mcp_module.list_streams().structured_content
     assert forbidden["status"] == "forbidden"
     assert forbidden["data"] is None
+
+
+def test_supported_channel_field_omission_is_partial(client: Mock) -> None:
+    client.call_endpoint.side_effect = [
+        {
+            "result": "success",
+            "msg": "",
+            "streams": [{"stream_id": 12, "name": "general"}],
+        },
+        {"result": "success", "msg": "", "user_groups": []},
+        {
+            "result": "success",
+            "msg": "",
+            "zulip_feature_level": 507,
+        },
+    ]
+
+    result = mcp_module.list_streams().structured_content
+
+    assert result["status"] == "partial"
+    assert result["absent_fields"] == [
+        "streams[].default_push_notifications",
+    ]
+    assert result["unsupported_fields"] == []
 
 
 @pytest.mark.parametrize(
@@ -320,25 +393,42 @@ def test_users_can_include_sensitive_fields_but_still_redact_secrets(client: Moc
 
 
 def test_bots_return_only_safe_audit_metadata(client: Mock) -> None:
-    client.call_endpoint.return_value = {
-        "result": "success",
-        "msg": "",
-        "members": [
-            {"user_id": 1, "full_name": "Human", "is_bot": False},
-            {
-                "user_id": 2,
-                "full_name": "Audit Bot",
-                "email": "bot@example.test",
-                "is_bot": True,
-                "is_active": True,
-                "bot_type": 1,
-                "bot_owner_id": 1,
-                "default_sending_stream": 12,
-                "api_key": "bot-private-key",
-                "services": [{"config_data": {"token": "private"}}],
-            },
-        ],
-    }
+    client.call_endpoint.side_effect = [
+        {
+            "result": "success",
+            "msg": "",
+            "user_id": 1,
+            "is_owner": True,
+            "is_admin": True,
+            "is_bot": False,
+            "is_active": True,
+        },
+        {
+            "result": "success",
+            "msg": "",
+            "members": [
+                {"user_id": 1, "full_name": "Human", "is_bot": False},
+                {
+                    "user_id": 2,
+                    "full_name": "Audit Bot",
+                    "email": "bot@example.test",
+                    "is_bot": True,
+                    "is_active": True,
+                    "bot_type": 1,
+                    "bot_owner_id": 1,
+                    "default_sending_stream": 12,
+                    "api_key": "bot-private-key",
+                    "services": [{"config_data": {"token": "private"}}],
+                },
+            ],
+        },
+        {
+            "result": "success",
+            "msg": "",
+            "streams": [{"stream_id": 12, "name": "general"}],
+        },
+        {"result": "success", "msg": "", "subscribers": [2]},
+    ]
 
     result = mcp_module.get_bots()
 
@@ -352,6 +442,9 @@ def test_bots_return_only_safe_audit_metadata(client: Mock) -> None:
             "bot_type": 1,
             "bot_owner_id": 1,
             "default_sending_stream": 12,
+            "subscription_status": "ok",
+            "channel_subscriptions": [{"stream_id": 12, "name": "general"}],
+            "subscription_errors": [],
         }],
     }
     assert "bot-private-key" not in str(result)

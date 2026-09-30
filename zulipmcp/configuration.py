@@ -253,6 +253,44 @@ BOT_AUDIT_FIELDS = USER_AUDIT_FIELDS + (
     "default_events_register_stream",
     "default_all_public_streams",
 )
+ORGANIZATION_SECTIONS = (
+    "profile",
+    "authentication",
+    "access",
+    "permissions",
+    "message_policies",
+    "new_user_defaults",
+    "default_channels",
+    "groups",
+    "profile_fields",
+    "domains",
+    "linkifiers",
+    "emoji",
+    "users",
+    "bots",
+    "invitations",
+)
+QUEUE_SECTIONS = frozenset({
+    "profile",
+    "authentication",
+    "access",
+    "permissions",
+    "message_policies",
+    "new_user_defaults",
+    "default_channels",
+})
+
+_MESSAGE_POLICY_TERMS = (
+    "retention", "message_content", "message_edit", "message_delet",
+    "message_move", "move_messages", "edit_history", "topic",
+    "read_receipt", "email_content", "wildcard_mention",
+    "default_code_block_language", "automatically_follow",
+)
+_ACCESS_TERMS = (
+    "invite", "domain", "registration", "account_creation", "web_public",
+    "waiting_period", "new_user_announcements", "enable_spectator_access",
+    "email_changes_disabled",
+)
 
 
 @dataclass
@@ -355,3 +393,108 @@ def project_bot_inventory(
     return {
         key: value for key, value in response.items() if key != "members"
     } | {"bots": bots}
+
+
+def partition_realm_snapshot(
+    snapshot: dict[str, JSONValue],
+) -> dict[str, dict[str, JSONValue]]:
+    partitioned = {
+        "profile": {},
+        "authentication": {},
+        "access": {},
+        "permissions": {},
+        "message_policies": {},
+    }
+    excluded = {
+        "last_event_id",
+        "event_queue_longpoll_timeout_seconds",
+        "realm_user_settings_defaults",
+        "default_streams",
+        "default_stream_groups",
+    }
+    for key, value in snapshot.items():
+        if key in excluded:
+            continue
+        normalized = key.removeprefix("realm_")
+        if (
+            normalized.startswith("can_")
+            or normalized.endswith("_group")
+            or key == "server_supported_permission_settings"
+            or "stream_policy" in normalized
+        ):
+            section = "permissions"
+        elif "authentication" in normalized or normalized.startswith("email_auth"):
+            section = "authentication"
+        elif any(term in normalized for term in _MESSAGE_POLICY_TERMS):
+            section = "message_policies"
+        elif any(term in normalized for term in _ACCESS_TERMS):
+            section = "access"
+        else:
+            section = "profile"
+        partitioned[section][key] = value
+
+    retention = partitioned["message_policies"].get("realm_message_retention_days")
+    if "realm_message_retention_days" in partitioned["message_policies"]:
+        if retention in (None, -1):
+            meaning = "retain_forever"
+        else:
+            meaning = "retain_for_days"
+        partitioned["message_policies"]["retention_semantics"] = meaning
+    return partitioned
+
+
+def resolve_permission_groups(
+    permissions: dict[str, JSONValue],
+    groups: dict[int, str],
+) -> dict[str, JSONValue]:
+    resolved: dict[str, JSONValue] = {}
+    for key, value in permissions.items():
+        if not (key.removeprefix("realm_").startswith("can_") or key.endswith("_group")):
+            continue
+        if isinstance(value, int) and not isinstance(value, bool):
+            resolved[key] = {
+                "raw": value,
+                "group_name": groups.get(value),
+            }
+        elif isinstance(value, dict):
+            subgroups = value.get("direct_subgroups")
+            names = []
+            if isinstance(subgroups, list):
+                names = [
+                    groups.get(group_id)
+                    for group_id in subgroups
+                    if isinstance(group_id, int) and not isinstance(group_id, bool)
+                ]
+            resolved[key] = {
+                "raw": value,
+                "direct_subgroup_names": names,
+            }
+    return resolved
+
+
+def annotate_channel_configuration(
+    response: dict[str, JSONValue], groups: dict[int, str],
+) -> dict[str, JSONValue]:
+    streams = response.get("streams")
+    if not isinstance(streams, list):
+        return response
+    annotated: list[JSONValue] = []
+    for stream in streams:
+        if not isinstance(stream, dict):
+            annotated.append(stream)
+            continue
+        channel = dict(stream)
+        if "message_retention_days" in channel:
+            retention = channel["message_retention_days"]
+            if retention is None:
+                meaning = "inherit_realm_policy"
+            elif retention == -1:
+                meaning = "retain_forever"
+            else:
+                meaning = "retain_for_days"
+            channel["retention_semantics"] = meaning
+        resolved = resolve_permission_groups(channel, groups)
+        if resolved:
+            channel["resolved_group_settings"] = resolved
+        annotated.append(channel)
+    return {**response, "streams": annotated}

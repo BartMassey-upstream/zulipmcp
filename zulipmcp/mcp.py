@@ -52,7 +52,6 @@ from .configuration import (
     CURRENT_USER_FIELDS,
     JSONValue,
     SectionResult,
-    project_bot_inventory,
     project_user_inventory,
     read_section,
     sanitize_text,
@@ -825,16 +824,17 @@ def list_streams(
         fields: Return only these upstream fields per channel. Missing fields
             remain absent rather than being rendered as null.
     """
-    def read_streams() -> dict[str, JSONValue]:
-        data = zulip_core.get_streams_configuration(
-            include_all=include_all,
-            include_default=include_default,
-            include_web_public=include_web_public,
-            exclude_archived=exclude_archived,
-        )
+    section = zulip_core.get_streams_audit(
+        include_all=include_all,
+        include_default=include_default,
+        include_web_public=include_web_public,
+        exclude_archived=exclude_archived,
+    )
+    data = section.data
+    if isinstance(data, dict):
         streams = data.get("streams")
         if fields is not None and isinstance(streams, list):
-            data = {
+            section.data = {
                 **data,
                 "streams": [
                     {field: stream[field] for field in fields if field in stream}
@@ -842,11 +842,7 @@ def list_streams(
                     for stream in streams
                 ],
             }
-        return data
-
-    return configuration_tool_result(
-        "Channels", read_section(read_streams, collection_field="streams"),
-    )
+    return configuration_tool_result("Channels", section)
 
 
 def _configuration_collection_result(
@@ -879,14 +875,9 @@ def get_users(
 
 @mcp.tool()
 def get_bots(include_deactivated: bool = False) -> ToolResult:
-    """Audit bot metadata without requesting or returning bot API keys."""
-    return _configuration_collection_result(
-        "Bots",
-        lambda: project_bot_inventory(
-            zulip_core.get_users_configuration(),
-            include_deactivated,
-        ),
-        "bots",
+    """Audit safe bot metadata and authoritative channel subscriptions."""
+    return configuration_tool_result(
+        "Bots", zulip_core.get_bots_audit(include_deactivated),
     )
 
 
@@ -937,6 +928,32 @@ def get_invitations() -> ToolResult:
     """Audit pending invitations when the authenticated principal is allowed."""
     return _configuration_collection_result(
         "Invitations", zulip_core.get_invitations_configuration, "invites",
+    )
+
+
+@mcp.tool()
+def get_organization_configuration(
+    sections: list[str] | None = None,
+    include_deactivated: bool = False,
+    include_sensitive_user_fields: bool = False,
+) -> ToolResult:
+    """Capture a typed, section-selectable organization configuration audit."""
+    snapshot = zulip_core.get_organization_configuration(
+        sections=sections,
+        include_deactivated=include_deactivated,
+        include_sensitive_user_fields=include_sensitive_user_fields,
+    )
+    statuses = snapshot["section_status"]
+    assert isinstance(statuses, dict)
+    failed = sum(
+        status not in {"ok", "empty"} for status in statuses.values()
+    )
+    text = f"Organization configuration: {len(statuses)} sections captured"
+    if failed:
+        text += f", {failed} incomplete"
+    return ToolResult(
+        content=text + ".",
+        structured_content=snapshot,
     )
 
 

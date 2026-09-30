@@ -8,7 +8,7 @@ import urllib.parse
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Callable, Iterator, Optional
 
@@ -20,9 +20,20 @@ from .configuration import (
     APIError,
     CONFIGURATION_FETCH_EVENT_TYPES,
     ConfigurationQueueSnapshot,
+    CURRENT_USER_FIELDS,
     JSONValue,
+    ORGANIZATION_SECTIONS,
+    QUEUE_SECTIONS,
+    SectionResult,
+    SectionStatus,
     ZulipAPIError,
+    annotate_channel_configuration,
+    partition_realm_snapshot,
+    project_bot_inventory,
+    project_user_inventory,
+    read_section,
     redact_secrets,
+    resolve_permission_groups,
     sanitize_text,
 )
 
@@ -568,6 +579,83 @@ def get_invitations_configuration() -> dict[str, JSONValue]:
     return configuration_request("/invites")
 
 
+def get_channel_subscribers_configuration(stream_id: int) -> dict[str, JSONValue]:
+    return configuration_request(f"/streams/{stream_id}/members")
+
+
+def get_streams_audit(
+    include_all: bool = True,
+    include_default: bool = True,
+    include_web_public: bool | None = None,
+    exclude_archived: bool = False,
+) -> SectionResult:
+    section = read_section(
+        lambda: get_streams_configuration(
+            include_all=include_all,
+            include_default=include_default,
+            include_web_public=include_web_public,
+            exclude_archived=exclude_archived,
+        ),
+        collection_field="streams",
+    )
+    if section.status not in {SectionStatus.OK, SectionStatus.PARTIAL}:
+        return section
+    if not isinstance(section.data, dict):
+        return section
+    streams = section.data.get("streams")
+    if not isinstance(streams, list) or not streams:
+        return section
+
+    group_names: dict[int, str] = {}
+    try:
+        group_data = get_user_groups_configuration()
+    except ZulipAPIError as exc:
+        section.status = SectionStatus.PARTIAL
+        section.warnings.append(exc.error.message)
+    else:
+        groups = group_data.get("user_groups")
+        if isinstance(groups, list):
+            group_names = {
+                group["id"]: group["name"]
+                for group in groups
+                if isinstance(group, dict)
+                and isinstance(group.get("id"), int)
+                and isinstance(group.get("name"), str)
+            }
+        else:
+            section.status = SectionStatus.PARTIAL
+            section.warnings.append("User groups were absent or null")
+    section.data = annotate_channel_configuration(section.data, group_names)
+
+    try:
+        server_settings = get_server_settings()
+    except ZulipAPIError as exc:
+        section.status = SectionStatus.PARTIAL
+        section.warnings.append(
+            f"Could not determine channel field capabilities: {exc.error.message}"
+        )
+    else:
+        feature_level = server_settings.get("zulip_feature_level")
+        if isinstance(feature_level, int) and not isinstance(feature_level, bool):
+            if feature_level < 507:
+                section.unsupported_fields.append(
+                    "streams[].default_push_notifications"
+                )
+            elif any(
+                isinstance(stream, dict)
+                and "default_push_notifications" not in stream
+                for stream in streams
+            ):
+                section.status = SectionStatus.PARTIAL
+                section.absent_fields.append(
+                    "streams[].default_push_notifications"
+                )
+        else:
+            section.status = SectionStatus.PARTIAL
+            section.warnings.append("Server did not report zulip_feature_level")
+    return section
+
+
 @contextmanager
 def configuration_queue_snapshot() -> Iterator[ConfigurationQueueSnapshot]:
     response = configuration_request(
@@ -603,6 +691,361 @@ def configuration_queue_snapshot() -> Iterator[ConfigurationQueueSnapshot]:
                 warning = f"Failed to delete configuration event queue: {exc.error.message}"
                 snapshot.warnings.append(warning)
                 _logger.warning("%s", warning)
+
+
+def _failed_section(error: ZulipAPIError) -> SectionResult:
+    def fail() -> dict[str, JSONValue]:
+        raise error
+
+    return read_section(fail)
+
+
+def _queue_sections(
+    snapshot: dict[str, JSONValue], requested: set[str],
+) -> dict[str, SectionResult]:
+    results: dict[str, SectionResult] = {}
+    partitioned = partition_realm_snapshot(snapshot)
+    for name in requested & QUEUE_SECTIONS:
+        if name in partitioned:
+            data = partitioned[name]
+            results[name] = SectionResult(
+                SectionStatus.OK if data else SectionStatus.EMPTY,
+                data=data,
+            )
+        elif name == "new_user_defaults":
+            field_name = "realm_user_settings_defaults"
+            if field_name not in snapshot:
+                feature_level = snapshot.get("zulip_feature_level")
+                if isinstance(feature_level, int) and feature_level < 95:
+                    results[name] = SectionResult(
+                        SectionStatus.UNSUPPORTED,
+                        unsupported_fields=[field_name],
+                    )
+                else:
+                    results[name] = SectionResult(
+                        SectionStatus.PARTIAL,
+                        data={},
+                        absent_fields=[field_name],
+                        warnings=[f"Register response omitted {field_name}"],
+                    )
+            else:
+                value = snapshot[field_name]
+                if value is None:
+                    results[name] = SectionResult(
+                        SectionStatus.PARTIAL,
+                        data=None,
+                        warnings=[f"Register response returned null for {field_name}"],
+                    )
+                else:
+                    results[name] = SectionResult(
+                        SectionStatus.EMPTY if not value else SectionStatus.OK,
+                        data=value,
+                    )
+        elif name == "default_channels":
+            fields = ("default_streams", "default_stream_groups")
+            present = {field: snapshot[field] for field in fields if field in snapshot}
+            missing = [field for field in fields if field not in snapshot]
+            null_fields = [field for field, value in present.items() if value is None]
+            if missing or null_fields:
+                results[name] = SectionResult(
+                    SectionStatus.PARTIAL,
+                    data=present,
+                    absent_fields=missing,
+                    warnings=[
+                        *(f"Register response omitted {field}" for field in missing),
+                        *(f"Register response returned null for {field}" for field in null_fields),
+                    ],
+                )
+            else:
+                results[name] = SectionResult(
+                    SectionStatus.OK if any(present.values()) else SectionStatus.EMPTY,
+                    data=present,
+                )
+    return results
+
+
+def _add_bot_subscriptions(
+    section: SectionResult, realm_wide_visibility: bool,
+) -> None:
+    if section.status not in {SectionStatus.OK, SectionStatus.PARTIAL}:
+        return
+    if not isinstance(section.data, dict):
+        return
+    bots = section.data.get("bots")
+    if not isinstance(bots, list) or not bots:
+        return
+
+    active_bots = []
+    for bot in bots:
+        if not isinstance(bot, dict):
+            continue
+        if bot.get("is_active") is False:
+            section.status = SectionStatus.PARTIAL
+            bot["subscription_status"] = "unsupported"
+            bot["channel_subscriptions"] = None
+            bot["subscription_errors"] = [{
+                "status": "unsupported",
+                "message": "Subscriber endpoints only report active users",
+                "code": "INACTIVE_USER_SUBSCRIPTIONS_UNAVAILABLE",
+                "http_status": None,
+            }]
+        else:
+            active_bots.append(bot)
+    if not active_bots:
+        return
+
+    try:
+        stream_response = get_streams_configuration()
+    except ZulipAPIError as exc:
+        failure = _failed_section(exc)
+        section.status = SectionStatus.PARTIAL
+        section.warnings.append(f"Could not audit bot subscriptions: {exc.error.message}")
+        for bot in active_bots:
+            bot["subscription_status"] = failure.status.value
+            bot["channel_subscriptions"] = []
+            bot["subscription_errors"] = [exc.error.to_dict()]
+        return
+
+    streams = stream_response.get("streams")
+    if not isinstance(streams, list):
+        section.status = SectionStatus.PARTIAL
+        section.warnings.append("Could not audit bot subscriptions: streams was absent or null")
+        for bot in active_bots:
+            bot["subscription_status"] = "error"
+            bot["channel_subscriptions"] = []
+            bot["subscription_errors"] = [{
+                "message": "Streams were absent or null",
+                "code": "INVALID_RESPONSE",
+                "http_status": None,
+            }]
+        return
+
+    bot_by_id = {
+        bot["user_id"]: bot
+        for bot in active_bots
+        if isinstance(bot, dict)
+        and isinstance(bot.get("user_id"), int)
+        and not isinstance(bot.get("user_id"), bool)
+    }
+    for bot in bot_by_id.values():
+        bot["subscription_status"] = "ok"
+        bot["channel_subscriptions"] = []
+        bot["subscription_errors"] = []
+
+    for stream in streams:
+        if not isinstance(stream, dict):
+            continue
+        stream_id = stream.get("stream_id")
+        stream_name = stream.get("name")
+        if not isinstance(stream_id, int) or isinstance(stream_id, bool):
+            section.status = SectionStatus.PARTIAL
+            section.warnings.append("Skipped channel without a valid stream_id")
+            continue
+        try:
+            subscriber_response = get_channel_subscribers_configuration(stream_id)
+        except ZulipAPIError as exc:
+            failure = _failed_section(exc)
+            section.status = SectionStatus.PARTIAL
+            error = {
+                "stream_id": stream_id,
+                "stream_name": stream_name if isinstance(stream_name, str) else None,
+                "status": failure.status.value,
+                **exc.error.to_dict(),
+            }
+            for bot in bot_by_id.values():
+                bot["subscription_status"] = "partial"
+                errors = bot["subscription_errors"]
+                assert isinstance(errors, list)
+                errors.append(error)
+            continue
+        subscribers = subscriber_response.get("subscribers")
+        if not isinstance(subscribers, list):
+            section.status = SectionStatus.PARTIAL
+            for bot in bot_by_id.values():
+                bot["subscription_status"] = "partial"
+                errors = bot["subscription_errors"]
+                assert isinstance(errors, list)
+                errors.append({
+                    "stream_id": stream_id,
+                    "stream_name": stream_name if isinstance(stream_name, str) else None,
+                    "message": "Subscribers were absent or null",
+                    "code": "INVALID_RESPONSE",
+                    "http_status": None,
+                })
+            continue
+        subscriber_ids = {
+            user_id for user_id in subscribers
+            if isinstance(user_id, int) and not isinstance(user_id, bool)
+        }
+        for user_id, bot in bot_by_id.items():
+            if user_id in subscriber_ids:
+                subscriptions = bot["channel_subscriptions"]
+                assert isinstance(subscriptions, list)
+                subscriptions.append({
+                    "stream_id": stream_id,
+                    "name": stream_name if isinstance(stream_name, str) else None,
+                })
+
+    if not realm_wide_visibility:
+        section.status = SectionStatus.PARTIAL
+        section.warnings.append(
+            "Bot subscriptions may omit private channels hidden from the audit principal"
+        )
+        for bot in active_bots:
+            if bot.get("subscription_status") == "ok":
+                bot["subscription_status"] = "partial"
+            errors = bot.get("subscription_errors")
+            if isinstance(errors, list):
+                errors.append({
+                    "status": "partial",
+                    "message": "Audit principal may not have realm-wide channel visibility",
+                    "code": "CHANNEL_VISIBILITY_INCOMPLETE",
+                    "http_status": None,
+                })
+
+
+def get_bots_audit(include_deactivated: bool = False) -> SectionResult:
+    principal = read_section(get_current_user, CURRENT_USER_FIELDS)
+    principal_data = principal.data
+    realm_wide_visibility = (
+        isinstance(principal_data, dict)
+        and (
+            principal_data.get("is_owner") is True
+            or principal_data.get("is_admin") is True
+        )
+    )
+    try:
+        users_response = get_users_configuration()
+    except ZulipAPIError as exc:
+        return _failed_section(exc)
+    result = read_section(
+        lambda: project_bot_inventory(users_response, include_deactivated),
+        collection_field="bots",
+    )
+    _add_bot_subscriptions(result, realm_wide_visibility)
+    if principal.error is not None:
+        result.status = SectionStatus.PARTIAL
+        result.warnings.append(
+            f"Could not establish channel visibility: {principal.error.message}"
+        )
+    return result
+
+
+def get_organization_configuration(
+    sections: list[str] | None = None,
+    include_deactivated: bool = False,
+    include_sensitive_user_fields: bool = False,
+) -> dict[str, JSONValue]:
+    requested_list = list(ORGANIZATION_SECTIONS) if sections is None else sections
+    unknown = sorted(set(requested_list) - set(ORGANIZATION_SECTIONS))
+    if unknown:
+        raise ValueError(f"Unknown organization configuration sections: {', '.join(unknown)}")
+    requested = set(requested_list)
+    results: dict[str, SectionResult] = {}
+    warnings: list[str] = []
+
+    server = read_section(get_server_settings)
+    principal = read_section(get_current_user, CURRENT_USER_FIELDS)
+
+    if requested & QUEUE_SECTIONS:
+        try:
+            queue_snapshot = None
+            with configuration_queue_snapshot() as queue_snapshot:
+                results.update(_queue_sections(queue_snapshot.data, requested))
+            warnings.extend(queue_snapshot.warnings)
+        except ZulipAPIError as exc:
+            for name in requested & QUEUE_SECTIONS:
+                results[name] = _failed_section(exc)
+
+    independent = {
+        "groups": (get_user_groups_configuration, "user_groups"),
+        "profile_fields": (get_profile_fields_configuration, "custom_fields"),
+        "domains": (get_domains_configuration, "domains"),
+        "linkifiers": (get_linkifiers_configuration, "linkifiers"),
+        "emoji": (get_emoji_configuration, "emoji"),
+        "invitations": (get_invitations_configuration, "invites"),
+    }
+    for name, (reader, collection_field) in independent.items():
+        if name in requested:
+            results[name] = read_section(reader, collection_field=collection_field)
+
+    if requested & {"users", "bots"}:
+        try:
+            users_response = get_users_configuration()
+        except ZulipAPIError as exc:
+            if "users" in requested:
+                results["users"] = _failed_section(exc)
+            if "bots" in requested:
+                results["bots"] = _failed_section(exc)
+        else:
+            if "users" in requested:
+                results["users"] = read_section(
+                    lambda: project_user_inventory(
+                        users_response,
+                        include_sensitive_user_fields,
+                        include_deactivated,
+                    ),
+                    collection_field="members",
+                )
+            if "bots" in requested:
+                results["bots"] = read_section(
+                    lambda: project_bot_inventory(users_response, include_deactivated),
+                    collection_field="bots",
+                )
+                principal_data = principal.data
+                realm_wide_visibility = (
+                    isinstance(principal_data, dict)
+                    and (
+                        principal_data.get("is_owner") is True
+                        or principal_data.get("is_admin") is True
+                    )
+                )
+                _add_bot_subscriptions(
+                    results["bots"], realm_wide_visibility,
+                )
+
+    if "permissions" in results and "groups" in results:
+        permissions = results["permissions"].data
+        group_data = results["groups"].data
+        if isinstance(permissions, dict) and isinstance(group_data, dict):
+            group_list = group_data.get("user_groups")
+            if isinstance(group_list, list):
+                group_names = {
+                    group["id"]: group["name"]
+                    for group in group_list
+                    if isinstance(group, dict)
+                    and isinstance(group.get("id"), int)
+                    and isinstance(group.get("name"), str)
+                }
+                permissions["resolved_group_settings"] = resolve_permission_groups(
+                    permissions, group_names,
+                )
+
+    ordered_results = {
+        name: results[name].to_dict() for name in requested_list if name in results
+    }
+    aggregate: dict[str, JSONValue] = {
+        "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "principal": principal.data,
+        "authority_status": {
+            "server_settings": server.status.value,
+            "principal": principal.status.value,
+        },
+        "authority": {
+            "server_settings": server.to_dict(),
+            "principal": principal.to_dict(),
+        },
+        "section_status": {
+            name: result["status"] for name, result in ordered_results.items()
+        },
+        "sections": ordered_results,
+        "warnings": warnings,
+    }
+    if isinstance(server.data, dict):
+        for field_name in ("zulip_version", "zulip_feature_level"):
+            if field_name in server.data:
+                aggregate[field_name] = server.data[field_name]
+    return aggregate
 
 
 def get_user_email(full_name: str) -> Optional[str]:
