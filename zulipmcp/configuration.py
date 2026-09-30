@@ -445,6 +445,7 @@ CHANNEL_UPDATE_FIELDS = frozenset({
     "privacy",
     "history_public_to_subscribers",
     "is_default_stream",
+    "is_archived",
     "message_retention_days",
     "topics_policy",
 }) | CHANNEL_GROUP_FIELDS

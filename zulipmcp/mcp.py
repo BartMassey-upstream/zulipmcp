@@ -1211,6 +1211,23 @@ def set_default_channel(
 
 
 @mcp.tool()
+def set_channel_archived(
+    realm_url: str,
+    channel: str,
+    archived: bool,
+    expected_archived: bool | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Archive or unarchive a channel without deleting its retained messages."""
+    return mutation_tool_result(
+        "Channel archive state",
+        zulip_core.set_channel_archived(
+            realm_url, channel, archived, expected_archived, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
 def subscribe_users_to_channel(
     realm_url: str,
     channel: str,

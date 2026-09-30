@@ -96,6 +96,14 @@ subscription changes fail closed unless the authenticated principal
 has complete channel visibility, and additions are applied before
 removals.
 
+Channel lifecycle tools expose archival truthfully as a reversible
+state change: `set_channel_archived` hides or restores a channel while
+retaining its messages. Before archival, the tool audits visible
+membership, topic and message-presence metadata, channel policy,
+folder membership, default-channel status, and realm settings that
+reference the channel. Default or referenced channels must be detached
+explicitly before archival.
+
 Dry runs remain available while writes are disabled: they can read
 current state, validate inputs, and show proposed requests without
 issuing a mutation.

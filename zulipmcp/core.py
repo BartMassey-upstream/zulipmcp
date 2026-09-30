@@ -2682,6 +2682,8 @@ def _find_channel(
     exact = [stream for stream in streams if stream.get("name") == name]
     if len(exact) == 1:
         return exact[0]
+    if len(exact) > 1:
+        raise ValueError(f"Ambiguous channel name: {name}")
     folded = [
         stream for stream in streams
         if isinstance(stream.get("name"), str)
@@ -2729,6 +2731,237 @@ def _channel_current(channel: dict[str, JSONValue], field: str) -> tuple[bool, J
     if field == "is_default_stream":
         return "is_default" in channel, channel.get("is_default")
     return field in channel, _channel_value(field, channel.get(field))
+
+
+def _channel_impact(
+    channel: dict[str, JSONValue],
+) -> tuple[dict[str, JSONValue], list[str]]:
+    stream_id = channel.get("stream_id")
+    if not isinstance(stream_id, int) or isinstance(stream_id, bool):
+        raise ValueError("Target channel did not have a valid stream_id")
+    warnings = [
+        "Archival retains all channel messages and hides them with the channel",
+        "Zulip does not expose an authoritative message count without reading messages",
+    ]
+    impact: dict[str, JSONValue] = {
+        "channel": {
+            key: channel[key]
+            for key in (
+                "name", "stream_id", "description", "is_archived", "is_default",
+                "invite_only", "is_web_public", "message_retention_days",
+                "topics_policy", "folder_id",
+                *sorted(CHANNEL_GROUP_FIELDS),
+            )
+            if key in channel
+        },
+        "privacy": _channel_privacy(channel),
+        "messages_retained": True,
+    }
+    if "first_message_id" in channel:
+        impact["message_history_present"] = channel.get("first_message_id") is not None
+    else:
+        warnings.append("Message presence unavailable: channel omitted first_message_id")
+    try:
+        subscribers = get_channel_subscribers_configuration(stream_id).get("subscribers")
+        if not isinstance(subscribers, list):
+            raise ValueError("Subscriber inventory was absent or null")
+        subscriber_ids = {
+            user_id for user_id in subscribers
+            if isinstance(user_id, int) and not isinstance(user_id, bool)
+        }
+        members = get_users_configuration().get("members")
+        if not isinstance(members, list):
+            raise ValueError("User inventory was absent or null")
+        identities = [
+            {
+                key: user[key]
+                for key in ("user_id", "email", "full_name")
+                if key in user
+            }
+            for user in members
+            if isinstance(user, dict) and user.get("user_id") in subscriber_ids
+        ]
+        impact["subscriber_count"] = len(subscriber_ids)
+        impact["visible_subscribers"] = identities
+    except (ValueError, ZulipAPIError) as exc:
+        message = exc.error.message if isinstance(exc, ZulipAPIError) else str(exc)
+        warnings.append(f"Subscriber impact unavailable: {message}")
+    try:
+        topics_response = configuration_request(f"/users/me/{stream_id}/topics")
+        topics = topics_response.get("topics")
+        if isinstance(topics, list):
+            impact["topic_count"] = len(topics)
+        else:
+            warnings.append("Topic count unavailable: response omitted topics")
+    except ZulipAPIError as exc:
+        warnings.append(f"Topic count unavailable: {exc.error.message}")
+    try:
+        references, queue_warnings = _read_write_state(
+            set(CHANNEL_REFERENCE_REALM_FIELDS), defaults=False,
+        )
+        impact["realm_references"] = {
+            field: value for field, value in references.items()
+            if value == stream_id
+        }
+        impact["realm_references_complete"] = True
+        warnings.extend(queue_warnings)
+    except ZulipAPIError as exc:
+        impact["realm_references"] = {}
+        impact["realm_references_complete"] = False
+        warnings.append(f"Realm channel references unavailable: {exc.error.message}")
+    folder_id = channel.get("folder_id")
+    if "folder_id" in channel:
+        impact["channel_folder_membership"] = (
+            {"folder_id": folder_id} if folder_id is not None else []
+        )
+        if folder_id is not None:
+            warnings.append("Channel folder name is unavailable; reporting its realm-local ID")
+    else:
+        warnings.append("Channel folder membership unavailable")
+    return impact, warnings
+
+
+def set_channel_archived(
+    realm_url: str,
+    channel: str,
+    archived: bool,
+    expected_archived: bool | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/streams/{stream_id}"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    feature_level = server.get("zulip_feature_level")
+    if not isinstance(feature_level, int) or feature_level < 315:
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            desired={"is_archived": archived},
+            error=APIError(
+                message="Archived channel inventory requires Zulip feature level 315",
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    if not archived and feature_level < 388:
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            desired={"is_archived": False},
+            error=APIError(
+                message="Channel unarchiving requires Zulip feature level 388",
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    if not isinstance(channel, str) or channel.isdigit():
+        return _semantic_error(endpoint, dry_run, "Numeric channel IDs are not accepted")
+    try:
+        current_channel = _find_channel(_channel_inventory(), channel)
+        if current_channel is None:
+            raise ValueError(f"Unknown channel name: {channel}")
+        stream_id = current_channel.get("stream_id")
+        if not isinstance(stream_id, int) or isinstance(stream_id, bool):
+            raise ValueError("Target channel did not have a valid stream_id")
+        if "is_archived" not in current_channel:
+            return MutationResult(
+                MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+                current=current_channel,
+                error=APIError(
+                    message="Channel inventory omitted is_archived",
+                    code="UNSUPPORTED_FIELD",
+                ),
+            )
+        impact, warnings = _channel_impact(current_channel)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return _semantic_error(endpoint, dry_run, str(exc))
+    current_archived = current_channel["is_archived"] is True
+    resolved_endpoint = f"/streams/{stream_id}"
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "channel": {"semantic": channel, "resolved": stream_id},
+    }
+    current = {"is_archived": current_archived, "impact": impact}
+    desired = {"is_archived": archived}
+    if expected_archived is not None and expected_archived != current_archived:
+        return MutationResult(
+            MutationStatus.CONFLICT, resolved_endpoint, dry_run=dry_run,
+            current=current, desired=desired, resolved_mappings=mappings,
+            warnings=warnings,
+            error=APIError(
+                message="Channel archive state did not match expected_archived",
+                code="EXPECTED_VALUE_MISMATCH",
+            ),
+        )
+    references = impact.get("realm_references")
+    blockers = []
+    if archived and current_channel.get("is_default") is True:
+        blockers.append("channel is still a default channel")
+    if archived and isinstance(references, dict) and references:
+        blockers.append("realm settings still reference the channel")
+    if archived and impact.get("realm_references_complete") is not True:
+        blockers.append("realm channel references could not be audited")
+    if blockers:
+        return MutationResult(
+            MutationStatus.CONFLICT, resolved_endpoint, dry_run=dry_run,
+            current=current, desired=desired, resolved_mappings=mappings,
+            warnings=warnings,
+            error=APIError(
+                message="; ".join(blockers), code="CHANNEL_ARCHIVE_BLOCKED",
+            ),
+        )
+    if current_archived == archived:
+        return MutationResult(
+            MutationStatus.OK, resolved_endpoint, dry_run=dry_run,
+            current=current, desired=desired, readback={"is_archived": archived},
+            resolved_mappings=mappings,
+            warnings=warnings + ["Channel already had the requested archive state"],
+        )
+    method = "DELETE" if archived else "PATCH"
+    request: dict[str, JSONValue] = {} if archived else {"is_archived": False}
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, resolved_endpoint, dry_run=True,
+            current=current, desired=desired, request=request,
+            changed_fields=["is_archived"], resolved_mappings=mappings,
+            warnings=warnings,
+        )
+    try:
+        response = administrative_mutation_request(
+            resolved_endpoint, method=method, request=request,
+        )
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, False, exc)
+        result.current, result.desired, result.request = current, desired, request
+        result.resolved_mappings, result.warnings = mappings, warnings
+        return result
+    try:
+        readback_channel = next(
+            (item for item in _channel_inventory() if item.get("stream_id") == stream_id),
+            None,
+        )
+    except (ValueError, ZulipAPIError) as exc:
+        readback_channel = None
+        message = exc.error.message if isinstance(exc, ZulipAPIError) else str(exc)
+        warnings.append(f"Archive readback failed: {message}")
+    confirmed = (
+        isinstance(readback_channel, dict)
+        and readback_channel.get("is_archived") is archived
+    )
+    ignored = response.get("ignored_parameters_unsupported")
+    unsupported = [value for value in ignored if isinstance(value, str)] \
+        if isinstance(ignored, list) else []
+    if not confirmed:
+        warnings.append("Archive readback did not confirm the requested state")
+    return MutationResult(
+        MutationStatus.OK if confirmed and not unsupported else MutationStatus.PARTIAL,
+        resolved_endpoint, dry_run=False, current=current, desired=desired,
+        request=request, response=response,
+        readback={"is_archived": readback_channel.get("is_archived")} \
+            if isinstance(readback_channel, dict) else None,
+        changed_fields=["is_archived"], resolved_mappings=mappings,
+        unsupported_fields=unsupported, warnings=warnings,
+    )
 
 
 def _resolve_channel_inputs(
