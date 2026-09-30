@@ -59,6 +59,9 @@ ordinary messaging tools. Configure every protected administrative
 tool this way for each realm-specific server:
 
 ```toml
+[mcp_servers.zulip-admin]
+default_tools_approval_mode = "writes"
+
 [mcp_servers.zulip-admin.tools.enable_administrative_writes]
 approval_mode = "prompt"
 

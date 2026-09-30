@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 from collections.abc import Callable
 from unittest.mock import Mock, call
@@ -11,11 +12,87 @@ from zulipmcp.configuration import REDACTED
 mcp_module = importlib.import_module("zulipmcp.mcp")
 
 
+READ_ONLY_TOOLS = {
+    "get_allowed_domains",
+    "get_bots",
+    "get_current_user",
+    "get_custom_emoji",
+    "get_custom_profile_fields",
+    "get_invitations",
+    "get_linkifiers",
+    "get_message_by_id",
+    "get_message_link",
+    "get_messages",
+    "get_organization_branding",
+    "get_organization_configuration",
+    "get_server_settings",
+    "get_stream_members",
+    "get_stream_topics",
+    "get_subscribed_streams",
+    "get_user_groups",
+    "get_user_info",
+    "get_users",
+    "list_emoji",
+    "list_streams",
+    "resolve_name",
+    "verify_message",
+}
+
+DESTRUCTIVE_TOOLS = {
+    "archive_channel",
+    "create_bot",
+    "create_channel",
+    "edit_message",
+    "end_session",
+    "move_messages",
+    "remove_reaction",
+    "reply",
+    "resolve_topic",
+    "send_direct_message",
+    "send_message",
+    "set_bot_channel_subscriptions",
+    "set_channel_archived",
+    "set_channel_members",
+    "set_default_channel",
+    "set_user_group_members",
+    "unsubscribe_users_from_channel",
+    "update_allowed_domain",
+    "update_bot_configuration",
+    "update_channel_configuration",
+    "update_custom_profile_field",
+    "update_default_user_settings",
+    "update_linkifier",
+    "update_organization_configuration",
+    "update_user_group",
+    "upload_file",
+    "upload_organization_branding",
+}
+
+
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> Mock:
     client = Mock(api_key="private-key")
     monkeypatch.setattr(core, "get_client", lambda: client)
     return client
+
+
+def test_all_tools_have_audited_safety_annotations() -> None:
+    tools = asyncio.run(mcp_module.mcp.list_tools())
+    annotations = {tool.name: tool.annotations for tool in tools}
+
+    assert all(annotation is not None for annotation in annotations.values())
+    assert {
+        name for name, annotation in annotations.items()
+        if annotation.readOnlyHint
+    } == READ_ONLY_TOOLS
+    assert {
+        name for name, annotation in annotations.items()
+        if annotation.destructiveHint
+    } == DESTRUCTIVE_TOOLS
+    assert all(
+        annotation.openWorldHint is False
+        for annotation in annotations.values()
+    )
 
 
 def test_list_streams_returns_full_typed_channels(client: Mock) -> None:

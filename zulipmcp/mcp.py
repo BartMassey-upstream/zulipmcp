@@ -60,6 +60,22 @@ from .configuration import (
 
 mcp = FastMCP("Zulip Messaging")
 
+READ_ONLY_TOOL_ANNOTATIONS = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "openWorldHint": False,
+}
+WRITE_TOOL_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "openWorldHint": False,
+}
+DESTRUCTIVE_TOOL_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "openWorldHint": False,
+}
+
 PRIVATE_STREAM_ERROR = (
     "Error: Private stream access denied for this session. "
     "You can only access the private stream where you were pinged."
@@ -361,7 +377,7 @@ def _init_session(stream: str, topic: str, num_messages: int = 0) -> str:
     return output
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def set_context(stream: str, topic: str, num_messages: int = 20) -> str:
     """Initialize the session context for a conversation.
     Call this once at the start of a session to set where you're chatting.
@@ -401,7 +417,7 @@ def set_context(stream: str, topic: str, num_messages: int = 20) -> str:
     return result
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def reply(content: str) -> str:
     """Reply in the current session context.
 
@@ -506,7 +522,7 @@ def _build_listen_response(visible_messages: list[dict],
     return output
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 async def listen(timeout_hours: float, ctx: Context) -> str:
     """Wait for new messages in the current conversation (blocking).
 
@@ -697,7 +713,7 @@ def _stop_typing_safe():
 _DEFAULT_FAREWELL = ":wave: Signing off"
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def end_session(message: str = _DEFAULT_FAREWELL) -> str:
     """End the current session gracefully.
     Writes a clean exit marker so the listener knows this was intentional.
@@ -791,7 +807,7 @@ def configuration_tool_result(label: str, section: SectionResult) -> ToolResult:
     return ToolResult(content=sanitize_text(text), structured_content=structured)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_server_settings() -> ToolResult:
     """Read server capabilities and all non-secret server settings as typed JSON."""
     return configuration_tool_result(
@@ -799,7 +815,7 @@ def get_server_settings() -> ToolResult:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_current_user() -> ToolResult:
     """Read the authenticated audit principal's ID, role, and authority flags."""
     return configuration_tool_result(
@@ -807,7 +823,7 @@ def get_current_user() -> ToolResult:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def list_streams(
     include_all: bool = True,
     include_default: bool = True,
@@ -857,7 +873,7 @@ def _configuration_collection_result(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_users(
     include_deactivated: bool = False,
     include_sensitive_user_fields: bool = False,
@@ -874,7 +890,7 @@ def get_users(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_bots(include_deactivated: bool = False) -> ToolResult:
     """Audit safe bot metadata and authoritative channel subscriptions."""
     return configuration_tool_result(
@@ -882,7 +898,7 @@ def get_bots(include_deactivated: bool = False) -> ToolResult:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_user_groups() -> ToolResult:
     """Audit active and deactivated user groups, nesting, and permissions."""
     return _configuration_collection_result(
@@ -890,7 +906,7 @@ def get_user_groups() -> ToolResult:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_custom_profile_fields() -> ToolResult:
     """Audit custom profile-field definitions as typed data."""
     return _configuration_collection_result(
@@ -900,7 +916,7 @@ def get_custom_profile_fields() -> ToolResult:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_allowed_domains() -> ToolResult:
     """Audit allowed email domains as typed data."""
     return _configuration_collection_result(
@@ -908,7 +924,7 @@ def get_allowed_domains() -> ToolResult:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_linkifiers() -> ToolResult:
     """Audit organization linkifiers as typed data."""
     return _configuration_collection_result(
@@ -916,7 +932,7 @@ def get_linkifiers() -> ToolResult:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_custom_emoji() -> ToolResult:
     """Audit custom emoji metadata as typed data."""
     return _configuration_collection_result(
@@ -924,7 +940,7 @@ def get_custom_emoji() -> ToolResult:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_invitations() -> ToolResult:
     """Audit pending invitations when the authenticated principal is allowed."""
     return _configuration_collection_result(
@@ -932,7 +948,7 @@ def get_invitations() -> ToolResult:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_organization_configuration(
     sections: list[str] | None = None,
     include_deactivated: bool = False,
@@ -958,7 +974,7 @@ def get_organization_configuration(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_organization_branding() -> ToolResult:
     """Read icon, light-logo, and dark-logo metadata as typed data."""
     return configuration_tool_result(
@@ -966,7 +982,7 @@ def get_organization_branding() -> ToolResult:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def download_organization_branding(
     asset: str,
     output_directory: str | None = None,
@@ -1000,11 +1016,7 @@ def _write_authorization_result(status: str, message: str) -> ToolResult:
     )
 
 
-@mcp.tool(annotations={
-    "readOnlyHint": False,
-    "destructiveHint": False,
-    "openWorldHint": False,
-})
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def enable_administrative_writes() -> ToolResult:
     """Enable administrative writes until disabled or the server restarts."""
     if zulip_core.admin_writes_enabled():
@@ -1017,7 +1029,7 @@ def enable_administrative_writes() -> ToolResult:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def disable_administrative_writes() -> ToolResult:
     """Disable administrative writes for this server process immediately."""
     zulip_core.set_admin_writes_enabled(False)
@@ -1026,7 +1038,7 @@ def disable_administrative_writes() -> ToolResult:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def upload_organization_branding(
     realm_url: str,
     asset: str,
@@ -1043,7 +1055,7 @@ def upload_organization_branding(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def create_bot(
     realm_url: str,
     short_name: str,
@@ -1069,7 +1081,7 @@ def create_bot(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def update_bot_configuration(
     realm_url: str,
     bot: str,
@@ -1086,7 +1098,7 @@ def update_bot_configuration(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def set_bot_channel_subscriptions(
     realm_url: str,
     bot: str,
@@ -1102,7 +1114,7 @@ def set_bot_channel_subscriptions(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def update_organization_configuration(
     changes: dict[str, Any],
     expected: dict[str, Any] | None = None,
@@ -1115,7 +1127,7 @@ def update_organization_configuration(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def update_default_user_settings(
     changes: dict[str, Any],
     expected: dict[str, Any] | None = None,
@@ -1128,7 +1140,7 @@ def update_default_user_settings(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def create_channel(
     realm_url: str,
     name: str,
@@ -1157,7 +1169,7 @@ def create_channel(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def update_channel_configuration(
     realm_url: str,
     channel: str,
@@ -1174,7 +1186,7 @@ def update_channel_configuration(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def set_default_channel(
     realm_url: str,
     channel: str,
@@ -1193,7 +1205,7 @@ def set_default_channel(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def set_channel_archived(
     realm_url: str,
     channel: str,
@@ -1210,7 +1222,7 @@ def set_channel_archived(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def archive_channel(
     realm_url: str,
     channel: str,
@@ -1226,7 +1238,7 @@ def archive_channel(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def subscribe_users_to_channel(
     realm_url: str,
     channel: str,
@@ -1242,7 +1254,7 @@ def subscribe_users_to_channel(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def unsubscribe_users_from_channel(
     realm_url: str,
     channel: str,
@@ -1258,7 +1270,7 @@ def unsubscribe_users_from_channel(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def set_channel_members(
     realm_url: str,
     channel: str,
@@ -1275,7 +1287,7 @@ def set_channel_members(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def create_user_group(
     realm_url: str,
     name: str,
@@ -1300,7 +1312,7 @@ def create_user_group(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def update_user_group(
     realm_url: str,
     group: str,
@@ -1317,7 +1329,7 @@ def update_user_group(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def set_user_group_members(
     realm_url: str,
     group: str,
@@ -1342,7 +1354,7 @@ def set_user_group_members(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def create_custom_profile_field(
     realm_url: str,
     name: str,
@@ -1359,7 +1371,7 @@ def create_custom_profile_field(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def update_custom_profile_field(
     realm_url: str,
     field: str,
@@ -1376,7 +1388,7 @@ def update_custom_profile_field(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def add_allowed_domain(
     realm_url: str,
     domain: str,
@@ -1392,7 +1404,7 @@ def add_allowed_domain(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def update_allowed_domain(
     realm_url: str,
     domain: str,
@@ -1413,7 +1425,7 @@ def update_allowed_domain(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def create_linkifier(
     realm_url: str,
     pattern: str,
@@ -1430,7 +1442,7 @@ def create_linkifier(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def update_linkifier(
     realm_url: str,
     pattern: str,
@@ -1447,7 +1459,7 @@ def update_linkifier(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_stream_topics(stream: str, limit: int = 20) -> str:
     """Get recent topics in a stream.
 
@@ -1470,7 +1482,7 @@ def get_stream_topics(stream: str, limit: int = 20) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_stream_members(stream: str) -> str:
     """Get the members of a stream/channel.
 
@@ -1492,7 +1504,7 @@ def get_stream_members(stream: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_messages(stream: str = "", topic: str = "", num_messages: int = 20,
                  before_message_id: Optional[int] = None,
                  message_id: Optional[int] = None) -> str:
@@ -1544,7 +1556,7 @@ def get_messages(stream: str = "", topic: str = "", num_messages: int = 20,
     return header + "\n\n" + zulip_core.format_messages(messages)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_message_by_id(message_id: int) -> str:
     """Get a specific message by its ID.
 
@@ -1562,7 +1574,7 @@ def get_message_by_id(message_id: int) -> str:
     return zulip_core.format_messages([msg], include_topic=True)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_message_link(message_id: int) -> str:
     """Get a permalink for a Zulip message.
 
@@ -1589,7 +1601,7 @@ def get_message_link(message_id: int) -> str:
 # Security tools — message verification
 # ============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def verify_message(message_id: int) -> str:
     """Securely fetch a single message to verify its true sender and content.
 
@@ -1630,7 +1642,7 @@ def verify_message(message_id: int) -> str:
 # Write tools — sending messages and reactions
 # ============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def send_message(stream: str, topic: str, content: str) -> str:
     """Send a message to a specific stream and topic (fire-and-forget).
 
@@ -1652,7 +1664,7 @@ def send_message(stream: str, topic: str, content: str) -> str:
     return f"Message sent to #{stream} > {topic} (id: {result.get('id')})"
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def send_direct_message(recipients: list[str], content: str) -> str:
     """Send a direct message (DM) to one or more users.
 
@@ -1673,7 +1685,7 @@ def send_direct_message(recipients: list[str], content: str) -> str:
     return f"DM sent to {recipient_str} (id: {result.get('id')})"
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def add_reaction(message_id: int, emoji_name: str) -> str:
     """Add an emoji reaction to a message.
 
@@ -1687,7 +1699,7 @@ def add_reaction(message_id: int, emoji_name: str) -> str:
     return f"Added :{emoji_name}: to message {message_id}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def remove_reaction(message_id: int, emoji_name: str,
                     reaction_type: Optional[str] = None) -> str:
     """Remove an emoji reaction from a message.
@@ -1706,7 +1718,7 @@ def remove_reaction(message_id: int, emoji_name: str,
     return f"Removed :{emoji_name}: from message {message_id}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def edit_message(message_id: int, content: str) -> str:
     """Edit a message the bot previously sent.
 
@@ -1729,7 +1741,7 @@ def edit_message(message_id: int, content: str) -> str:
     return f"Message {message_id} updated."
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def move_messages(message_id: int, topic: str, stream: str = "",
                   propagate_mode: str = "change_one") -> str:
     """Move message(s) to a different topic and/or stream.
@@ -1774,7 +1786,7 @@ def move_messages(message_id: int, topic: str, stream: str = "",
     return f"Moved {mode_desc[propagate_mode]} to {dest}."
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def resolve_topic(message_id: int, topic: str,
                   propagate_mode: str = "change_all") -> str:
     """Rename a topic silently to mark it resolved or unresolved.
@@ -1808,7 +1820,7 @@ def resolve_topic(message_id: int, topic: str,
     return f"Topic renamed to '{topic}' (no notification sent)."
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def list_emoji(query: str = "") -> str:
     """Search custom emoji available on this Zulip server.
 
@@ -1827,7 +1839,7 @@ def list_emoji(query: str = "") -> str:
     return f"{total} custom emoji: {', '.join(matches)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def typing() -> str:
     """Send a typing indicator in the current conversation.
     Call this before heavy tool work (code execution, searches, analysis)
@@ -1846,7 +1858,7 @@ def typing() -> str:
     return "Typing indicator start."
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def stop_typing() -> str:
     """Stop the typing indicator in the current conversation.
     Call this when you've finished working but aren't about to send a message
@@ -1869,7 +1881,7 @@ def stop_typing() -> str:
 # Info tools — users, subscriptions
 # ============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_user_info(email: str) -> str:
     """Get information about a Zulip user, including their full profile.
 
@@ -1909,7 +1921,7 @@ def get_user_info(email: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def resolve_name(query: str) -> str:
     """Look up a user's display name by substring before mentioning them.
 
@@ -1930,7 +1942,7 @@ def resolve_name(query: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_subscribed_streams() -> str:
     """Get streams the bot is subscribed to."""
     subs = zulip_core.get_subscribed_streams()
@@ -1947,7 +1959,7 @@ def get_subscribed_streams() -> str:
 # File tools — downloading and uploading
 # ============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def fetch_image(path: str) -> str:
     """Fetch an image from Zulip and save it to a temp file for viewing.
 
@@ -1961,7 +1973,7 @@ def fetch_image(path: str) -> str:
     return f"Image saved to: {temp_path}\n\nUse the Read tool to view the image at this path."
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def fetch_file(path: str, save_dir: Optional[str] = None) -> str:
     """Fetch any file from Zulip and save it locally.
 
@@ -1976,7 +1988,7 @@ def fetch_file(path: str, save_dir: Optional[str] = None) -> str:
     return f"File saved to: {saved_path}\nSize: {size_bytes / 1024:.1f} KB\nContent-Type: {content_type}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def upload_file(file_path: str) -> str:
     """Upload a local file to Zulip and return markdown to embed it in messages.
 
