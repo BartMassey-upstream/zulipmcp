@@ -88,6 +88,14 @@ size limit. Zulip transforms uploaded branding and does not publish a
 source-file hash, so uploads are not content-idempotent; use
 `expected_source` to guard against stale state.
 
+Bot administration tools can create or converge generic bots, update
+their safe configuration, and set exact channel subscriptions using
+realm-local user emails and channel names. Bot API keys returned during
+creation are discarded and never included in MCP results. Exact
+subscription changes fail closed unless the authenticated principal
+has complete channel visibility, and additions are applied before
+removals.
+
 Dry runs remain available while writes are disabled: they can read
 current state, validate inputs, and show proposed requests without
 issuing a mutation.

@@ -807,6 +807,12 @@ _BRANDING_ASSETS = {
 }
 
 
+class _LocalFileError(ValueError):
+    def __init__(self, message: str, code: str) -> None:
+        self.code = code
+        super().__init__(message)
+
+
 def _branding_section(snapshot: dict[str, JSONValue]) -> SectionResult:
     data: dict[str, JSONValue] = {}
     absent: list[str] = []
@@ -842,7 +848,9 @@ def get_organization_branding() -> SectionResult:
 
 
 def _add_bot_subscriptions(
-    section: SectionResult, realm_wide_visibility: bool,
+    section: SectionResult,
+    realm_wide_visibility: bool,
+    users_response: dict[str, JSONValue] | None = None,
 ) -> None:
     if section.status not in {SectionStatus.OK, SectionStatus.PARTIAL}:
         return
@@ -851,6 +859,26 @@ def _add_bot_subscriptions(
     bots = section.data.get("bots")
     if not isinstance(bots, list) or not bots:
         return
+
+    members = users_response.get("members") if users_response is not None else None
+    if isinstance(members, list):
+        people = {
+            user["user_id"]: user
+            for user in members
+            if isinstance(user, dict)
+            and isinstance(user.get("user_id"), int)
+            and not isinstance(user.get("user_id"), bool)
+        }
+        for bot in bots:
+            if not isinstance(bot, dict):
+                continue
+            owner = people.get(bot.get("bot_owner_id"))
+            if isinstance(owner, dict):
+                bot["owner"] = {
+                    key: owner[key]
+                    for key in ("user_id", "email", "full_name")
+                    if key in owner
+                }
 
     active_bots = []
     for bot in bots:
@@ -896,6 +924,25 @@ def _add_bot_subscriptions(
                 "http_status": None,
             }]
         return
+
+    stream_names = {
+        stream["stream_id"]: stream["name"]
+        for stream in streams
+        if isinstance(stream, dict)
+        and isinstance(stream.get("stream_id"), int)
+        and not isinstance(stream.get("stream_id"), bool)
+        and isinstance(stream.get("name"), str)
+    }
+    for bot in bots:
+        if not isinstance(bot, dict):
+            continue
+        for source, target in (
+            ("default_sending_stream", "default_sending_channel"),
+            ("default_events_register_stream", "default_events_register_channel"),
+        ):
+            stream_id = bot.get(source)
+            if isinstance(stream_id, int) and stream_id in stream_names:
+                bot[target] = stream_names[stream_id]
 
     bot_by_id = {
         bot["user_id"]: bot
@@ -999,7 +1046,7 @@ def get_bots_audit(include_deactivated: bool = False) -> SectionResult:
         lambda: project_bot_inventory(users_response, include_deactivated),
         collection_field="bots",
     )
-    _add_bot_subscriptions(result, realm_wide_visibility)
+    _add_bot_subscriptions(result, realm_wide_visibility, users_response)
     if principal.error is not None:
         result.status = SectionStatus.PARTIAL
         result.warnings.append(
@@ -1078,7 +1125,7 @@ def get_organization_configuration(
                     )
                 )
                 _add_bot_subscriptions(
-                    results["bots"], realm_wide_visibility,
+                    results["bots"], realm_wide_visibility, users_response,
                 )
 
     if "permissions" in results and "groups" in results:
@@ -1873,7 +1920,10 @@ def _detect_image(content: bytes) -> tuple[str, str]:
         return "image/gif", ".gif"
     if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
         return "image/webp", ".webp"
-    raise ValueError("Branding file is not a supported PNG, JPEG, GIF, or WebP image")
+    raise _LocalFileError(
+        "Branding file is not a supported PNG, JPEG, GIF, or WebP image",
+        "INVALID_IMAGE",
+    )
 
 
 def _read_branding_file(
@@ -1881,9 +1931,12 @@ def _read_branding_file(
 ) -> tuple[Path, bytes, str, str]:
     path = Path(file_path)
     if not path.is_absolute():
-        raise ValueError("file_path must be absolute")
+        raise _LocalFileError("file_path must be absolute", "LOCAL_FILE_INVALID")
     if path.is_symlink() or not path.is_file():
-        raise ValueError("file_path must be an existing regular file, not a symlink")
+        raise _LocalFileError(
+            "file_path must be an existing regular file, not a symlink",
+            "LOCAL_FILE_INVALID",
+        )
     content = path.read_bytes()
     media_type, extension = _detect_image(content)
     if (
@@ -1891,8 +1944,9 @@ def _read_branding_file(
         and not isinstance(max_file_size_mib, bool)
         and len(content) > max_file_size_mib * 1024 * 1024
     ):
-        raise ValueError(
-            f"Branding file exceeds the advertised {max_file_size_mib} MiB limit"
+        raise _LocalFileError(
+            f"Branding file exceeds the advertised {max_file_size_mib} MiB limit",
+            "FILE_TOO_LARGE",
         )
     return path, content, media_type, extension
 
@@ -2008,7 +2062,10 @@ def upload_organization_branding(
     except (OSError, ValueError) as exc:
         return MutationResult(
             MutationStatus.ERROR, endpoint, dry_run=dry_run, current=current,
-            error=APIError(message=str(exc), code="INVALID_IMAGE_FILE"),
+            error=APIError(
+                message=str(exc),
+                code=exc.code if isinstance(exc, _LocalFileError) else "LOCAL_FILE_INVALID",
+            ),
         )
     summary: dict[str, JSONValue] = {
         "asset": asset,
@@ -2041,7 +2098,7 @@ def upload_organization_branding(
             result = _mutation_failure(endpoint, False, exc)
         else:
             result = MutationResult(
-                MutationStatus.ERROR, endpoint,
+                MutationStatus.ERROR, endpoint, dry_run=False,
                 error=APIError(message=str(exc), code="FILE_READ_FAILED"),
             )
         result.current = current
@@ -2071,6 +2128,539 @@ def upload_organization_branding(
         readback=selected if isinstance(selected, dict) else None,
         changed_fields=[asset],
         warnings=warnings + readback_section.warnings,
+    )
+
+
+_BOT_UPDATE_FIELDS = frozenset({
+    "full_name", "short_name", "owner", "default_sending_channel",
+    "default_events_register_channel", "default_all_public_channels",
+})
+
+
+def _semantic_error(endpoint: str, dry_run: bool, message: str) -> MutationResult:
+    return MutationResult(
+        MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+        error=APIError(message=message, code="SEMANTIC_RESOLUTION_ERROR"),
+    )
+
+
+def _resolve_person(
+    members: list[JSONValue], reference: str, *, bot: bool,
+) -> dict[str, JSONValue]:
+    if not isinstance(reference, str) or reference.isdigit():
+        raise ValueError("Numeric user IDs are not accepted")
+    candidates = [
+        user for user in members
+        if isinstance(user, dict)
+        and user.get("is_bot") is bot
+        and (
+            str(user.get("email", "")).casefold() == reference.casefold()
+            or user.get("full_name") == reference
+        )
+    ]
+    if len(candidates) != 1:
+        raise ValueError(f"Reference {reference!r} did not identify exactly one user")
+    return candidates[0]
+
+
+def _resolve_channels(
+    streams: list[JSONValue], names: list[str],
+) -> tuple[dict[str, int], list[dict[str, JSONValue]]]:
+    if any(not isinstance(name, str) or name.isdigit() for name in names):
+        raise ValueError("Numeric channel IDs are not accepted")
+    mapping: dict[str, int] = {}
+    resolved: list[dict[str, JSONValue]] = []
+    for name in names:
+        candidates = [
+            stream for stream in streams
+            if isinstance(stream, dict) and stream.get("name") == name
+        ]
+        if len(candidates) != 1:
+            raise ValueError(f"Channel {name!r} did not resolve uniquely")
+        stream_id = candidates[0].get("stream_id")
+        if not isinstance(stream_id, int) or isinstance(stream_id, bool):
+            raise ValueError(f"Channel {name!r} has no valid ID")
+        mapping[name] = stream_id
+        resolved.append({"semantic": name, "resolved": stream_id})
+    return mapping, resolved
+
+
+def _bot_public_state(bot: dict[str, JSONValue]) -> dict[str, JSONValue]:
+    email = bot.get("email")
+    short_name = None
+    if isinstance(email, str):
+        short_name = email.split("@", 1)[0].removesuffix("-bot")
+    owner = bot.get("owner")
+    return {
+        "full_name": bot.get("full_name"),
+        "short_name": short_name,
+        "owner": owner.get("email") if isinstance(owner, dict) else None,
+        "default_sending_channel": bot.get("default_sending_channel"),
+        "default_events_register_channel": bot.get(
+            "default_events_register_channel"
+        ),
+        "default_all_public_channels": bot.get("default_all_public_streams"),
+    }
+
+
+def _bot_audit_item(reference: str) -> tuple[SectionResult, dict[str, JSONValue] | None]:
+    audit = get_bots_audit(include_deactivated=True)
+    if not isinstance(audit.data, dict):
+        return audit, None
+    bots = audit.data.get("bots")
+    if not isinstance(bots, list):
+        return audit, None
+    try:
+        return audit, _resolve_person(bots, reference, bot=True)
+    except ValueError:
+        return audit, None
+
+
+def update_bot_configuration(
+    realm_url: str,
+    bot: str,
+    changes: dict[str, JSONValue],
+    expected: dict[str, JSONValue] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/bots"
+    _, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    invalid = (set(changes) | set(expected or {})) - _BOT_UPDATE_FIELDS
+    if invalid:
+        return _invalid_fields_result(endpoint, dry_run, invalid)
+    audit, item = _bot_audit_item(bot)
+    if item is None:
+        return _semantic_error(endpoint, dry_run, f"Bot {bot!r} did not resolve uniquely")
+    bot_id = item.get("user_id")
+    if not isinstance(bot_id, int) or isinstance(bot_id, bool):
+        return _semantic_error(endpoint, dry_run, "Bot has no valid user ID")
+    endpoint = f"/bots/{bot_id}"
+    users = get_users_configuration().get("members")
+    streams = get_streams_configuration().get("streams")
+    if not isinstance(users, list) or not isinstance(streams, list):
+        return _semantic_error(endpoint, dry_run, "User or channel inventory unavailable")
+    current = _bot_public_state(item)
+    mappings: dict[str, JSONValue] = {"bot": {"semantic": bot, "resolved": bot_id}}
+    request: dict[str, JSONValue] = {}
+    desired = dict(changes)
+    resolved_expected = dict(expected or {})
+    field_map = {
+        "full_name": "full_name", "short_name": "short_name",
+        "default_all_public_channels": "default_all_public_streams",
+    }
+    try:
+        for source, value in changes.items():
+            if source == "owner":
+                owner = _resolve_person(users, str(value), bot=False)
+                if owner.get("is_active") is False:
+                    raise ValueError("Bot owner must be active")
+                request["bot_owner_id"] = owner["user_id"]
+                desired[source] = owner.get("email")
+                mappings["owner"] = {"semantic": value, "resolved": owner["user_id"]}
+            elif source in {"default_sending_channel", "default_events_register_channel"}:
+                target = source.replace("_channel", "_stream")
+                if value in (None, ""):
+                    request[target] = ""
+                    desired[source] = None
+                else:
+                    channel_map, resolved = _resolve_channels(streams, [str(value)])
+                    request[target] = channel_map[str(value)]
+                    mappings[source] = resolved[0]
+            else:
+                request[field_map[source]] = value
+    except (KeyError, ValueError) as exc:
+        return _semantic_error(endpoint, dry_run, str(exc))
+    try:
+        if "owner" in resolved_expected:
+            expected_owner = _resolve_person(
+                users, str(resolved_expected["owner"]), bot=False,
+            )
+            resolved_expected["owner"] = expected_owner.get("email")
+    except ValueError as exc:
+        return _semantic_error(endpoint, dry_run, str(exc))
+    for field, expected_value in resolved_expected.items():
+        if current.get(field) != expected_value:
+            return MutationResult(
+                MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+                current=current, desired=desired, resolved_mappings=mappings,
+                error=APIError(
+                    message=f"Expected value did not match for {field}",
+                    code="EXPECTED_VALUE_MISMATCH",
+                ),
+            )
+    unchanged = [field for field, value in desired.items() if current.get(field) == value]
+    for field in unchanged:
+        upstream = {
+            "owner": "bot_owner_id",
+            "default_sending_channel": "default_sending_stream",
+            "default_events_register_channel": "default_events_register_stream",
+            **field_map,
+        }[field]
+        request.pop(upstream, None)
+    changed = sorted(set(changes) - set(unchanged))
+    if not request:
+        return MutationResult(
+            MutationStatus.OK, endpoint, dry_run=dry_run, current=current,
+            desired=desired, request={}, resolved_mappings=mappings,
+            warnings=["Bot already had the desired configuration"],
+        )
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, endpoint, dry_run=True, current=current,
+            desired=desired, request=request, changed_fields=changed,
+            resolved_mappings=mappings,
+        )
+    try:
+        response = administrative_mutation_request(endpoint, "PATCH", request)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, False, exc)
+        result.current, result.desired, result.request = current, desired, request
+        return result
+    _, readback_item = _bot_audit_item(bot)
+    readback = _bot_public_state(readback_item) if readback_item is not None else None
+    mismatch = readback is None or any(readback.get(k) != v for k, v in desired.items())
+    return MutationResult(
+        MutationStatus.PARTIAL if mismatch else MutationStatus.OK,
+        endpoint, dry_run=False, current=current, desired=desired, request=request,
+        response=response, readback=readback, changed_fields=changed,
+        resolved_mappings=mappings,
+        warnings=["Bot readback did not match requested configuration"] if mismatch else [],
+    )
+
+
+def set_bot_channel_subscriptions(
+    realm_url: str,
+    bot: str,
+    channels: list[str],
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/users/me/subscriptions"
+    _, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    audit, item = _bot_audit_item(bot)
+    if item is None:
+        return _semantic_error(endpoint, dry_run, f"Bot {bot!r} did not resolve uniquely")
+    if audit.status != SectionStatus.OK or item.get("subscription_status") != "ok":
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="Exact subscriptions require complete channel visibility",
+                code="CHANNEL_VISIBILITY_INCOMPLETE",
+            ),
+        )
+    bot_id = item.get("user_id")
+    streams = get_streams_configuration().get("streams")
+    if not isinstance(bot_id, int) or isinstance(bot_id, bool) or not isinstance(streams, list):
+        return _semantic_error(endpoint, dry_run, "Bot or channel inventory unavailable")
+    try:
+        _, resolved = _resolve_channels(streams, channels)
+    except ValueError as exc:
+        return _semantic_error(endpoint, dry_run, str(exc))
+    subscriptions = item.get("channel_subscriptions")
+    subscription_entries = subscriptions if isinstance(subscriptions, list) else []
+    current_names = {
+        entry["name"] for entry in subscription_entries
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+    }
+    desired_names = set(channels)
+    additions = sorted(desired_names - current_names)
+    removals = sorted(current_names - desired_names)
+    request: dict[str, JSONValue] = {
+        "to_subscribe": additions, "to_unsubscribe": removals,
+        "principal": bot_id,
+    }
+    mappings: dict[str, JSONValue] = {
+        "bot": {"semantic": bot, "resolved": bot_id}, "channels": resolved,
+    }
+    if not additions and not removals:
+        return MutationResult(
+            MutationStatus.OK, endpoint, dry_run=dry_run,
+            current={"channels": sorted(current_names)},
+            desired={"channels": sorted(desired_names)}, request=request,
+            resolved_mappings=mappings,
+            warnings=["Bot already had the exact requested subscriptions"],
+        )
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, endpoint, dry_run=True,
+            current={"channels": sorted(current_names)},
+            desired={"channels": sorted(desired_names)}, request=request,
+            changed_fields=["channel_subscriptions"], resolved_mappings=mappings,
+        )
+    completed_additions: list[str] = []
+    completed_removals: list[str] = []
+    try:
+        if additions:
+            administrative_mutation_request(
+                endpoint, "POST", {
+                    "subscriptions": [{"name": name} for name in additions],
+                    "principals": [bot_id],
+                    "authorization_errors_fatal": True,
+                },
+            )
+            completed_additions = additions
+        if removals:
+            administrative_mutation_request(
+                endpoint, "DELETE", {
+                    "subscriptions": removals, "principals": [bot_id],
+                },
+            )
+            completed_removals = removals
+    except ZulipAPIError as exc:
+        return MutationResult(
+            MutationStatus.PARTIAL if completed_additions else _mutation_status(exc),
+            endpoint, dry_run=False,
+            current={"channels": sorted(current_names)},
+            desired={"channels": sorted(desired_names)}, request=request,
+            response={
+                "subscribed": completed_additions,
+                "unsubscribed": completed_removals,
+                "remaining_subscriptions": [
+                    name for name in additions if name not in completed_additions
+                ],
+                "remaining_unsubscriptions": [
+                    name for name in removals if name not in completed_removals
+                ],
+            },
+            changed_fields=["channel_subscriptions"], resolved_mappings=mappings,
+            error=exc.error,
+        )
+    readback_audit, readback_item = _bot_audit_item(bot)
+    readback_subs = (
+        readback_item.get("channel_subscriptions")
+        if readback_item is not None else None
+    )
+    readback_entries = readback_subs if isinstance(readback_subs, list) else []
+    readback_names = {
+        entry["name"] for entry in readback_entries
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+    }
+    confirmed = readback_audit.status == SectionStatus.OK and readback_names == desired_names
+    return MutationResult(
+        MutationStatus.OK if confirmed else MutationStatus.PARTIAL,
+        endpoint, dry_run=False,
+        current={"channels": sorted(current_names)},
+        desired={"channels": sorted(desired_names)}, request=request,
+        response={"subscribed": additions, "unsubscribed": removals},
+        readback={"channels": sorted(readback_names)},
+        changed_fields=["channel_subscriptions"], resolved_mappings=mappings,
+        warnings=[] if confirmed else ["Subscription readback was incomplete or mismatched"],
+    )
+
+
+def create_bot(
+    realm_url: str,
+    short_name: str,
+    full_name: str,
+    owner: str,
+    bot_type: str = "generic",
+    default_sending_channel: str | None = None,
+    default_events_register_channel: str | None = None,
+    default_all_public_channels: bool = False,
+    channel_subscriptions: list[str] | None = None,
+    avatar_path: str | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/bots"
+    _, principal, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    if bot_type != "generic":
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(message="Only generic bots are supported", code="INVALID_BOT_TYPE"),
+        )
+    if not short_name or short_name.isdigit():
+        return _semantic_error(endpoint, dry_run, "short_name must be a non-numeric name")
+    users_response = get_users_configuration()
+    members = users_response.get("members")
+    streams_response = get_streams_configuration()
+    streams = streams_response.get("streams")
+    if not isinstance(members, list) or not isinstance(streams, list):
+        return _semantic_error(endpoint, dry_run, "User or channel inventory unavailable")
+    try:
+        owner_item = _resolve_person(members, owner, bot=False)
+        if owner_item.get("is_active") is False:
+            raise ValueError("Bot owner must be active")
+        channel_names = [
+            name for name in (
+                default_sending_channel, default_events_register_channel,
+            ) if name is not None
+        ] + list(channel_subscriptions or [])
+        channel_map, resolved_channels = _resolve_channels(streams, channel_names)
+        avatar = None
+        if avatar_path is not None:
+            avatar = _read_branding_file(avatar_path)
+    except _LocalFileError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(message=str(exc), code=exc.code),
+        )
+    except (KeyError, OSError, ValueError) as exc:
+        return _semantic_error(endpoint, dry_run, str(exc))
+    matching = []
+    collision = []
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+        email = member.get("email")
+        local = email.split("@", 1)[0].removesuffix("-bot") if isinstance(email, str) else ""
+        if local.casefold() == short_name.casefold():
+            (matching if member.get("is_bot") is True else collision).append(member)
+    if collision or len(matching) > 1:
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="Bot short name is ambiguous or collides with a non-bot user",
+                code="BOT_IDENTITY_CONFLICT",
+            ),
+        )
+    if matching:
+        existing = matching[0]
+        if existing.get("is_active") is False:
+            return MutationResult(
+                MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+                error=APIError(
+                    message="Matching bot is deactivated",
+                    code="BOT_ALREADY_DEACTIVATED",
+                ),
+            )
+        reference = existing.get("email")
+        assert isinstance(reference, str)
+        changes: dict[str, JSONValue] = {
+            "full_name": full_name,
+            "short_name": short_name,
+            "owner": owner,
+            "default_sending_channel": default_sending_channel,
+            "default_events_register_channel": default_events_register_channel,
+            "default_all_public_channels": default_all_public_channels,
+        }
+        result = update_bot_configuration(
+            realm_url, reference, changes, dry_run=dry_run,
+        )
+        result.warnings.append("Converged an existing active bot; no bot was created")
+        if channel_subscriptions is not None and result.status in {
+            MutationStatus.OK, MutationStatus.DRY_RUN,
+        }:
+            subscriptions_result = set_bot_channel_subscriptions(
+                realm_url, reference, channel_subscriptions, dry_run,
+            )
+            result.status = subscriptions_result.status
+            result.resolved_mappings["channel_subscriptions"] = (
+                subscriptions_result.resolved_mappings.get("channels", [])
+            )
+            result.warnings.extend(subscriptions_result.warnings)
+        return result
+    request: dict[str, JSONValue] = {
+        "short_name": short_name,
+        "full_name": full_name,
+        "bot_type": 1,
+        "default_all_public_streams": default_all_public_channels,
+    }
+    if default_sending_channel is not None:
+        request["default_sending_stream"] = channel_map[default_sending_channel]
+    if default_events_register_channel is not None:
+        request["default_events_register_stream"] = channel_map[
+            default_events_register_channel
+        ]
+    mappings: dict[str, JSONValue] = {
+        "owner": {"semantic": owner, "resolved": owner_item.get("user_id")},
+        "channels": resolved_channels,
+    }
+    desired: dict[str, JSONValue] = {
+        "short_name": short_name, "full_name": full_name,
+        "owner": owner_item.get("email"),
+        "bot_type": bot_type,
+        "default_sending_channel": default_sending_channel,
+        "default_events_register_channel": default_events_register_channel,
+        "default_all_public_channels": default_all_public_channels,
+        "channel_subscriptions": channel_subscriptions or [],
+    }
+    if avatar is not None:
+        _, content, media_type, _ = avatar
+        request["avatar"] = {
+            "file_path": avatar_path, "byte_count": len(content),
+            "media_type": media_type, "sha256": hashlib.sha256(content).hexdigest(),
+        }
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, endpoint, dry_run=True,
+            desired=desired, request=request, changed_fields=["bot"],
+            resolved_mappings=mappings,
+        )
+    try:
+        if avatar is None:
+            response = administrative_mutation_request(endpoint, "POST", request)
+        else:
+            avatar_file = avatar[0]
+            wire_request = {key: value for key, value in request.items() if key != "avatar"}
+            with avatar_file.open("rb") as upload:
+                response = administrative_mutation_request(
+                    endpoint, "POST", wire_request, files=[upload],
+                )
+        response.pop("api_key", None)
+    except (OSError, ZulipAPIError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="FILE_READ_FAILED",
+        )
+        return MutationResult(
+            _mutation_status(exc) if isinstance(exc, ZulipAPIError) else MutationStatus.ERROR,
+            endpoint, dry_run=False, desired=desired, request=request,
+            resolved_mappings=mappings, error=error,
+        )
+    bot_id = response.get("user_id")
+    bot_email = response.get("email")
+    if not isinstance(bot_id, int) or isinstance(bot_id, bool):
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=False,
+            desired=desired, request=request,
+            response=response, changed_fields=["bot"], resolved_mappings=mappings,
+            warnings=["Bot was created but the response omitted its user ID"],
+        )
+    warnings: list[str] = []
+    if isinstance(principal, dict) and principal.get("user_id") != owner_item.get("user_id"):
+        try:
+            administrative_mutation_request(
+                f"/bots/{bot_id}", "PATCH", {"bot_owner_id": owner_item["user_id"]},
+            )
+        except ZulipAPIError as exc:
+            warnings.append(f"Bot was created but owner update failed: {exc.error.message}")
+    if channel_subscriptions is not None:
+        if not isinstance(bot_email, str):
+            warnings.append("Bot was created but subscriptions could not resolve its email")
+        else:
+            sub_result = set_bot_channel_subscriptions(
+                realm_url, bot_email, channel_subscriptions, False,
+            )
+            if sub_result.status != MutationStatus.OK:
+                warnings.append("Bot was created but exact subscriptions were not completed")
+    readback = None
+    if isinstance(bot_email, str):
+        _, readback_item = _bot_audit_item(bot_email)
+        if readback_item is not None:
+            readback = _bot_public_state(readback_item)
+            expected_readback = {
+                key: desired[key] for key in (
+                    "full_name", "short_name", "owner",
+                    "default_sending_channel",
+                    "default_events_register_channel",
+                    "default_all_public_channels",
+                )
+            }
+            if any(readback.get(key) != value for key, value in expected_readback.items()):
+                warnings.append("Bot was created but configuration readback mismatched")
+        else:
+            warnings.append("Bot was created but authoritative readback failed")
+    else:
+        warnings.append("Bot was created but its email was unavailable for readback")
+    return MutationResult(
+        MutationStatus.PARTIAL if warnings else MutationStatus.OK,
+        endpoint, dry_run=False, desired=desired, request=request, response=response,
+        readback=readback, changed_fields=["bot"],
+        resolved_mappings=mappings, warnings=warnings,
     )
 
 

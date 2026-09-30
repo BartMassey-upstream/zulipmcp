@@ -173,6 +173,6 @@ def test_upload_branding_rejects_active_or_invalid_image(
     ).structured_content
 
     assert result["status"] == "error"
-    assert result["error"]["code"] == "INVALID_IMAGE_FILE"
+    assert result["error"]["code"] == "INVALID_IMAGE"
     assert call(url="/realm/icon", method="POST", request={}) \
         not in client.call_endpoint.call_args_list

@@ -1063,6 +1063,65 @@ def upload_organization_branding(
 
 
 @mcp.tool()
+def create_bot(
+    realm_url: str,
+    short_name: str,
+    full_name: str,
+    owner: str,
+    bot_type: str = "generic",
+    default_sending_channel: str | None = None,
+    default_events_register_channel: str | None = None,
+    default_all_public_channels: bool = False,
+    channel_subscriptions: list[str] | None = None,
+    avatar_path: str | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Create or converge a generic bot using realm-local semantic names."""
+    return mutation_tool_result(
+        "Bot creation",
+        zulip_core.create_bot(
+            realm_url, short_name, full_name, owner, bot_type,
+            default_sending_channel, default_events_register_channel,
+            default_all_public_channels, channel_subscriptions, avatar_path,
+            dry_run,
+        ),
+    )
+
+
+@mcp.tool()
+def update_bot_configuration(
+    realm_url: str,
+    bot: str,
+    changes: dict[str, Any],
+    expected: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Update one bot's safe configuration with optimistic checks."""
+    return mutation_tool_result(
+        "Bot configuration update",
+        zulip_core.update_bot_configuration(
+            realm_url, bot, changes, expected, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
+def set_bot_channel_subscriptions(
+    realm_url: str,
+    bot: str,
+    channels: list[str],
+    dry_run: bool = False,
+) -> ToolResult:
+    """Set a bot's exact channels, failing closed on incomplete visibility."""
+    return mutation_tool_result(
+        "Bot channel subscriptions",
+        zulip_core.set_bot_channel_subscriptions(
+            realm_url, bot, channels, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
 def update_organization_configuration(
     changes: dict[str, Any],
     expected: dict[str, Any] | None = None,
