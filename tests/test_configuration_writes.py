@@ -1,13 +1,7 @@
-import asyncio
 import importlib
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import Mock, call
 
 import pytest
-from fastmcp.server.elicitation import (
-    AcceptedElicitation,
-    CancelledElicitation,
-    DeclinedElicitation,
-)
 from fastmcp.tools.tool import ToolResult
 
 from zulipmcp import core
@@ -84,40 +78,20 @@ def test_writes_are_disabled_until_confirmed(client: Mock) -> None:
     )
 
 
-def test_confirmation_enables_writes() -> None:
-    ctx = Mock()
-    ctx.elicit = AsyncMock(return_value=AcceptedElicitation(data=True))
-
-    result = asyncio.run(mcp_module.enable_administrative_writes(ctx))
+def test_enable_administrative_writes() -> None:
+    result = mcp_module.enable_administrative_writes()
 
     assert result.structured_content == {"status": "enabled", "enabled": True}
-    ctx.elicit.assert_awaited_once()
 
 
-@pytest.mark.parametrize(
-    ("response", "status"),
-    [
-        (AcceptedElicitation(data=False), "accept"),
-        (DeclinedElicitation(), "decline"),
-        (CancelledElicitation(), "cancel"),
-    ],
-)
-def test_unconfirmed_enable_request_fails_closed(response: object, status: str) -> None:
-    ctx = Mock()
-    ctx.elicit = AsyncMock(return_value=response)
+def test_enable_administrative_writes_is_idempotent() -> None:
+    core.set_admin_writes_enabled(True)
 
-    result = asyncio.run(mcp_module.enable_administrative_writes(ctx))
+    result = mcp_module.enable_administrative_writes()
 
-    assert result.structured_content == {"status": status, "enabled": False}
-
-
-def test_unavailable_confirmation_fails_closed() -> None:
-    ctx = Mock()
-    ctx.elicit = AsyncMock(side_effect=RuntimeError("not supported"))
-
-    result = asyncio.run(mcp_module.enable_administrative_writes(ctx))
-
-    assert result.structured_content == {"status": "unsupported", "enabled": False}
+    assert result.structured_content == {
+        "status": "already_enabled", "enabled": True,
+    }
 
 
 def test_disable_administrative_writes() -> None:

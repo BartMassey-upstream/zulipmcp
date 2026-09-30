@@ -47,9 +47,24 @@ organization snapshot. Structured results preserve nested values and
 distinguish empty, forbidden, unsupported, partial, and failed reads.
 
 Administrative writes start disabled. To use a write tool, first call
-`enable_administrative_writes` and approve the confirmation presented
-by the MCP client. Authorization lasts until it is revoked with
-`disable_administrative_writes` or the server process restarts.
+`enable_administrative_writes` and approve that tool call in the MCP
+client. Authorization lasts until it is revoked with
+`disable_administrative_writes` or the server process restarts. The
+client's approval policy is the confirmation boundary for enabling
+writes.
+
+Codex can prompt for the gate while pre-approving tools protected by
+it. This avoids redundant prompts without changing the policy for
+ordinary messaging tools. Configure every protected administrative
+tool this way for each realm-specific server:
+
+```toml
+[mcp_servers.zulip-admin.tools.enable_administrative_writes]
+approval_mode = "prompt"
+
+[mcp_servers.zulip-admin.tools.create_channel]
+approval_mode = "approve"
+```
 
 ```json
 {
