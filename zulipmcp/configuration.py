@@ -415,6 +415,38 @@ UNLIMITED_REALM_FIELDS = frozenset({
     "move_messages_between_streams_limit_seconds",
     "move_messages_within_stream_limit_seconds",
 })
+
+CHANNEL_GROUP_FIELDS = frozenset({
+    "can_add_subscribers_group",
+    "can_administer_channel_group",
+    "can_create_topic_group",
+    "can_delete_any_message_group",
+    "can_delete_own_message_group",
+    "can_move_messages_out_of_channel_group",
+    "can_move_messages_within_channel_group",
+    "can_remove_subscribers_group",
+    "can_resolve_topics_group",
+    "can_send_message_group",
+    "can_subscribe_group",
+})
+
+CHANNEL_CREATE_FIELDS = frozenset({
+    "announce",
+    "is_default_stream",
+    "history_public_to_subscribers",
+    "message_retention_days",
+    "topics_policy",
+})
+
+CHANNEL_UPDATE_FIELDS = frozenset({
+    "new_name",
+    "description",
+    "privacy",
+    "history_public_to_subscribers",
+    "is_default_stream",
+    "message_retention_days",
+    "topics_policy",
+}) | CHANNEL_GROUP_FIELDS
 QUEUE_SECTIONS = frozenset({
     "profile",
     "authentication",

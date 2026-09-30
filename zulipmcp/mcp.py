@@ -997,6 +997,85 @@ def update_default_user_settings(
 
 
 @mcp.tool()
+def create_channel(
+    realm_url: str,
+    name: str,
+    subscribers: list[str],
+    privacy: str,
+    permissions: dict[str, Any],
+    description: str = "",
+    settings: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Create a channel from semantic user/group names with idempotent readback."""
+    return mutation_tool_result(
+        "Channel creation",
+        zulip_core.create_channel(
+            realm_url=realm_url,
+            name=name,
+            subscribers=subscribers,
+            privacy=privacy,
+            permissions=permissions,
+            description=description,
+            settings=settings,
+            dry_run=dry_run,
+        ),
+    )
+
+
+@mcp.tool()
+def update_channel_configuration(
+    realm_url: str,
+    channel: str,
+    changes: dict[str, Any],
+    expected: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Update one named channel with semantic permissions and readback."""
+    return mutation_tool_result(
+        "Channel update",
+        zulip_core.update_channel_configuration(
+            realm_url, channel, changes, expected, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
+def set_default_channel(
+    realm_url: str,
+    channel: str,
+    is_default: bool,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Add or remove a named public channel from new-user defaults."""
+    return mutation_tool_result(
+        "Default channel update",
+        zulip_core.update_channel_configuration(
+            realm_url,
+            channel,
+            {"is_default_stream": is_default},
+            dry_run=dry_run,
+        ),
+    )
+
+
+@mcp.tool()
+def subscribe_users_to_channel(
+    realm_url: str,
+    channel: str,
+    users: list[str],
+    dry_run: bool = False,
+) -> ToolResult:
+    """Subscribe explicitly named users to an existing named channel."""
+    return mutation_tool_result(
+        "Channel subscriptions",
+        zulip_core.subscribe_users_to_channel(
+            realm_url, channel, users, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
 def get_stream_topics(stream: str, limit: int = 20) -> str:
     """Get recent topics in a stream.
 
