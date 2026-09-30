@@ -38,6 +38,55 @@ Run AI agents in Zulip as @mentionable bots — or wire into any [MCP](https://m
 - A `.zuliprc` file for Zulip API auth (see [Quickstart](#quickstart))
 - For listener mode: the selected backend CLI installed and authenticated (`claude` by default, `codex` with `--backend codex`, or `opencode` with `--backend opencode`)
 
+## Organization configuration
+
+The MCP server includes typed audit tools for server capabilities,
+the authenticated identity, channels, users, groups, profile fields,
+allowed domains, linkifiers, emoji, invitations, and an aggregate
+organization snapshot. Structured results preserve nested values and
+distinguish empty, forbidden, unsupported, partial, and failed reads.
+
+Administrative writes are disabled by default. Enable them only for
+an MCP server intended to configure its authenticated realm:
+
+```json
+{
+  "mcpServers": {
+    "zulip-admin": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "zulipmcp.mcp"],
+      "env": {
+        "ZULIP_RC_PATH": "/absolute/path/to/realm.zuliprc",
+        "ZULIPMCP_ENABLE_ADMIN_WRITES": "true"
+      }
+    }
+  }
+}
+```
+
+Run a separate MCP server for each realm. Every write also requires
+the destination realm URL as an argument and verifies it against
+`GET /server_settings` before changing anything. Numeric user, group,
+and channel IDs are not accepted as cross-realm references; use names
+or email addresses and inspect the returned ID mappings.
+
+Write tools cover organization settings, new-user defaults, channels,
+subscriptions, user groups and membership, custom profile fields,
+allowed domains, and linkifiers. They support `dry_run`, read current
+state first, avoid duplicate creates by semantic name, and read back
+successful mutations. Allowed-domain changes require an organization
+owner. No deletion, unsubscription, or blind realm-clone tool is
+provided.
+
+Use this workflow for configuration changes:
+
+1. Call `get_organization_configuration` for the source and target.
+2. Resolve differences using semantic names, not IDs.
+3. Call the relevant write tool with `dry_run=true` and, where
+   supported, expected current values.
+4. Review the resolved mappings and sanitized request.
+5. Repeat with `dry_run=false` and verify the returned readback.
+
 ## Entry Points
 
 | Entry Point | Description |
@@ -221,6 +270,7 @@ Topics containing `/nobots` or `/nb` are hidden from the bot entirely. Messages 
 | `ZULIPMCP_CACHE_DIR` | Override the disk cache directory (defaults to system temp dir). |
 | `ZULIPMCP_LOG_DIR` | Override the log directory (defaults to `/tmp/zulipmcp_logs`). |
 | `ZULIPMCP_MARKDOWN_AUTOFIX` | Disables all outgoing markdown normalization (blank-line-before-table injection and bold/link rewrites) when set to `0` or `false`. Defaults to enabled. |
+| `ZULIPMCP_ENABLE_ADMIN_WRITES` | Enables guarded administrative configuration tools when set to `1`, `true`, or `yes`. Defaults to disabled; read-only audit tools remain available. |
 
 ## License
 
