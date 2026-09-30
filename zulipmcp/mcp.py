@@ -1076,6 +1076,73 @@ def subscribe_users_to_channel(
 
 
 @mcp.tool()
+def create_user_group(
+    realm_url: str,
+    name: str,
+    description: str,
+    members: list[str],
+    subgroups: list[str] | None = None,
+    permissions: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Create a user group using semantic user and subgroup names."""
+    return mutation_tool_result(
+        "User-group creation",
+        zulip_core.create_user_group(
+            realm_url,
+            name,
+            description,
+            members,
+            subgroups,
+            permissions,
+            dry_run,
+        ),
+    )
+
+
+@mcp.tool()
+def update_user_group(
+    realm_url: str,
+    group: str,
+    changes: dict[str, Any],
+    expected: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Update one named user group's metadata or permissions."""
+    return mutation_tool_result(
+        "User-group update",
+        zulip_core.update_user_group(
+            realm_url, group, changes, expected, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
+def set_user_group_members(
+    realm_url: str,
+    group: str,
+    members: list[str],
+    subgroups: list[str] | None = None,
+    expected_members: list[str] | None = None,
+    expected_subgroups: list[str] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Converge a named user group's direct users and subgroups."""
+    return mutation_tool_result(
+        "User-group membership update",
+        zulip_core.set_user_group_members(
+            realm_url,
+            group,
+            members,
+            subgroups,
+            expected_members,
+            expected_subgroups,
+            dry_run,
+        ),
+    )
+
+
+@mcp.tool()
 def get_stream_topics(stream: str, limit: int = 20) -> str:
     """Get recent topics in a stream.
 

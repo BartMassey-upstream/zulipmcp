@@ -447,6 +447,20 @@ CHANNEL_UPDATE_FIELDS = frozenset({
     "message_retention_days",
     "topics_policy",
 }) | CHANNEL_GROUP_FIELDS
+
+USER_GROUP_PERMISSION_FIELDS = frozenset({
+    "can_add_members_group",
+    "can_join_group",
+    "can_leave_group",
+    "can_manage_group",
+    "can_mention_group",
+    "can_remove_members_group",
+})
+
+USER_GROUP_UPDATE_FIELDS = frozenset({
+    "name",
+    "description",
+}) | USER_GROUP_PERMISSION_FIELDS
 QUEUE_SECTIONS = frozenset({
     "profile",
     "authentication",

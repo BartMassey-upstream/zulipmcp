@@ -35,6 +35,8 @@ from .configuration import (
     QUEUE_SECTIONS,
     REALM_WRITE_FIELDS,
     UNLIMITED_REALM_FIELDS,
+    USER_GROUP_PERMISSION_FIELDS,
+    USER_GROUP_UPDATE_FIELDS,
     SectionResult,
     SectionStatus,
     ZulipAPIError,
@@ -1228,6 +1230,7 @@ def _semantic_name_maps() -> tuple[dict[str, int], dict[str, int]]:
             not isinstance(user, dict)
             or not isinstance(user.get("user_id"), int)
             or isinstance(user.get("user_id"), bool)
+            or user.get("is_active") is False
         ):
             continue
         user_id = user["user_id"]
@@ -2550,6 +2553,677 @@ def subscribe_users_to_channel(
         resolved_mappings=mappings,
         unsupported_fields=unsupported,
         warnings=warnings,
+    )
+
+
+def _group_inventory() -> list[dict[str, JSONValue]]:
+    response = get_user_groups_configuration()
+    groups = response.get("user_groups")
+    if not isinstance(groups, list):
+        raise ValueError("User-group inventory was absent or null")
+    return [group for group in groups if isinstance(group, dict)]
+
+
+def _find_group(
+    groups: list[dict[str, JSONValue]], name: str,
+) -> dict[str, JSONValue] | None:
+    matches = [group for group in groups if group.get("name") == name]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous user-group name: {name}")
+    return None
+
+
+def _group_id(group: dict[str, JSONValue]) -> int:
+    group_id = group.get("id")
+    if not isinstance(group_id, int) or isinstance(group_id, bool):
+        raise ValueError("Target user group did not have a valid id")
+    return group_id
+
+
+def _group_list_value(group: dict[str, JSONValue], field: str) -> list[int]:
+    value = group.get(field)
+    if not isinstance(value, list):
+        raise ValueError(f"User-group response omitted {field}")
+    return sorted(
+        item for item in value
+        if isinstance(item, int) and not isinstance(item, bool)
+    )
+
+
+def _resolve_group_fields(
+    values: dict[str, JSONValue],
+    group_ids: dict[str, int],
+    user_ids: dict[str, int],
+) -> tuple[dict[str, JSONValue], dict[str, JSONValue]]:
+    resolved = dict(values)
+    mappings: dict[str, JSONValue] = {}
+    for field in sorted(set(values) & USER_GROUP_PERMISSION_FIELDS):
+        value = _resolve_group_setting(values[field], group_ids, user_ids)
+        resolved[field] = value
+        mappings[field] = {"semantic": values[field], "resolved": value}
+    return resolved, mappings
+
+
+def _canonical_group_setting(value: JSONValue) -> JSONValue:
+    if not isinstance(value, dict):
+        return value
+    members = value.get("direct_members")
+    subgroups = value.get("direct_subgroups")
+    if not isinstance(members, list) or not isinstance(subgroups, list):
+        return value
+    return {
+        "direct_members": sorted(members, key=repr),
+        "direct_subgroups": sorted(subgroups, key=repr),
+    }
+
+
+def create_user_group(
+    realm_url: str,
+    name: str,
+    description: str,
+    members: list[str],
+    subgroups: list[str] | None = None,
+    permissions: dict[str, JSONValue] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/user_groups/create"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    subgroups = list(subgroups or [])
+    permissions = dict(permissions or {})
+    invalid = set(permissions) - USER_GROUP_PERMISSION_FIELDS
+    if invalid:
+        return _invalid_fields_result(endpoint, dry_run, invalid)
+    null_fields = sorted(field for field, value in permissions.items() if value is None)
+    if null_fields:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired={"name": name},
+            error=APIError(
+                message=f"Null is not a supported write value for: {', '.join(null_fields)}",
+                code="NULL_WRITE_VALUE",
+            ),
+        )
+    try:
+        groups = _group_inventory()
+        group_ids, user_ids = _semantic_name_maps()
+        member_ids = sorted({_named_id(member, user_ids, "user") for member in members})
+        subgroup_ids = sorted({_named_id(group, group_ids, "group") for group in subgroups})
+        resolved_permissions, permission_mappings = _resolve_group_fields(
+            permissions, group_ids, user_ids,
+        )
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired={"name": name},
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    desired: dict[str, JSONValue] = {
+        "name": name,
+        "description": description,
+        "members": members,
+        "subgroups": subgroups,
+        "permissions": permissions,
+    }
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "members": [
+            {"semantic": member, "resolved": _named_id(member, user_ids, "user")}
+            for member in members
+        ],
+        "subgroups": [
+            {"semantic": group, "resolved": _named_id(group, group_ids, "group")}
+            for group in subgroups
+        ],
+        **permission_mappings,
+    }
+    existing = _find_group(groups, name)
+    if existing is not None:
+        mismatches = []
+        if existing.get("description") != description:
+            mismatches.append("description")
+        try:
+            if _group_list_value(existing, "members") != member_ids:
+                mismatches.append("members")
+            if _group_list_value(existing, "direct_subgroup_ids") != subgroup_ids:
+                mismatches.append("subgroups")
+        except ValueError as exc:
+            return MutationResult(
+                status=MutationStatus.UNSUPPORTED,
+                endpoint=endpoint,
+                dry_run=dry_run,
+                current=existing,
+                desired=desired,
+                resolved_mappings=mappings,
+                error=APIError(message=str(exc), code="UNSUPPORTED_FIELD"),
+            )
+        for field, value in resolved_permissions.items():
+            if (
+                field not in existing
+                or _canonical_group_setting(existing[field])
+                != _canonical_group_setting(value)
+            ):
+                mismatches.append(field)
+        if mismatches:
+            return MutationResult(
+                status=MutationStatus.CONFLICT,
+                endpoint=endpoint,
+                dry_run=dry_run,
+                current=existing,
+                desired=desired,
+                resolved_mappings=mappings,
+                error=APIError(
+                    message=f"User group already exists with different settings: {', '.join(mismatches)}",
+                    code="USER_GROUP_ALREADY_EXISTS",
+                ),
+            )
+        return MutationResult(
+            status=MutationStatus.DRY_RUN if dry_run else MutationStatus.OK,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            current=existing,
+            desired=desired,
+            readback=existing,
+            resolved_mappings=mappings,
+            warnings=["User group already exists with the requested configuration"],
+        )
+    request: dict[str, JSONValue] = {
+        "name": name,
+        "description": description,
+        "members": member_ids,
+        "subgroups": subgroup_ids,
+        **resolved_permissions,
+    }
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=endpoint,
+            dry_run=True,
+            desired=desired,
+            request=request,
+            changed_fields=sorted(request),
+            resolved_mappings=mappings,
+        )
+    try:
+        response = configuration_request(endpoint, method="POST", request=request)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, dry_run, exc)
+        result.desired = desired
+        result.request = request
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback = _find_group(_group_inventory(), name)
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=endpoint,
+            dry_run=False,
+            desired=desired,
+            request=request,
+            response=response,
+            resolved_mappings=mappings,
+            error=error,
+        )
+    mismatches = []
+    if readback is None:
+        mismatches.append("name")
+    else:
+        if readback.get("description") != description:
+            mismatches.append("description")
+        try:
+            if _group_list_value(readback, "members") != member_ids:
+                mismatches.append("members")
+            if _group_list_value(readback, "direct_subgroup_ids") != subgroup_ids:
+                mismatches.append("subgroups")
+        except ValueError as exc:
+            mismatches.append(str(exc))
+        for field, value in resolved_permissions.items():
+            if (
+                field not in readback
+                or _canonical_group_setting(readback[field])
+                != _canonical_group_setting(value)
+            ):
+                mismatches.append(field)
+    ignored = response.get("ignored_parameters_unsupported")
+    unsupported = (
+        [value for value in ignored if isinstance(value, str)]
+        if isinstance(ignored, list) else []
+    )
+    return MutationResult(
+        status=MutationStatus.PARTIAL if mismatches or unsupported else MutationStatus.OK,
+        endpoint=endpoint,
+        dry_run=False,
+        desired=desired,
+        request=request,
+        response=response,
+        readback=readback,
+        changed_fields=sorted(request),
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=(
+            ["User-group readback did not match: " + ", ".join(mismatches)]
+            if mismatches else []
+        ),
+    )
+
+
+def update_user_group(
+    realm_url: str,
+    group: str,
+    changes: dict[str, JSONValue],
+    expected: dict[str, JSONValue] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/user_groups/{user_group_id}"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    expected = dict(expected or {})
+    invalid = (set(changes) | set(expected)) - USER_GROUP_UPDATE_FIELDS
+    if invalid:
+        return _invalid_fields_result(endpoint, dry_run, invalid)
+    if not changes:
+        return _invalid_fields_result(endpoint, dry_run, {"<no changes>"}, "EMPTY_CHANGES")
+    null_fields = sorted(
+        field for field, value in {**expected, **changes}.items() if value is None
+    )
+    if null_fields:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired=changes,
+            error=APIError(
+                message=f"Null is not a supported value for: {', '.join(null_fields)}",
+                code="NULL_WRITE_VALUE",
+            ),
+        )
+    try:
+        groups = _group_inventory()
+        current_group = _find_group(groups, group)
+        if current_group is None:
+            raise ValueError(f"Unknown user-group name: {group}")
+        group_id = _group_id(current_group)
+        group_ids, user_ids = _semantic_name_maps()
+        resolved_changes, change_mappings = _resolve_group_fields(
+            changes, group_ids, user_ids,
+        )
+        resolved_expected, expected_mappings = _resolve_group_fields(
+            expected, group_ids, user_ids,
+        )
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired=changes,
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "group": {"semantic": group, "resolved": group_id},
+    }
+    for field in sorted(set(change_mappings) | set(expected_mappings)):
+        mapping: dict[str, JSONValue] = {}
+        if field in change_mappings:
+            mapping["desired"] = change_mappings[field]
+        if field in expected_mappings:
+            mapping["expected"] = expected_mappings[field]
+        mappings[field] = mapping
+    missing = sorted(
+        field for field in set(changes) | set(expected) if field not in current_group
+    )
+    if missing:
+        return MutationResult(
+            status=MutationStatus.UNSUPPORTED,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            current=current_group,
+            desired=changes,
+            unsupported_fields=missing,
+            resolved_mappings=mappings,
+            error=APIError(
+                message=f"User-group response omitted fields: {', '.join(missing)}",
+                code="UNSUPPORTED_FIELD",
+            ),
+        )
+    mismatches = sorted(
+        field for field, value in resolved_expected.items()
+        if _canonical_group_setting(current_group[field])
+        != _canonical_group_setting(value)
+    )
+    current = {field: current_group[field] for field in set(changes) | set(expected)}
+    if mismatches:
+        result = _conflict_result(endpoint, dry_run, current, changes, mismatches, [])
+        result.resolved_mappings = mappings
+        return result
+    changed = sorted(
+        field for field, value in resolved_changes.items()
+        if _canonical_group_setting(current_group[field])
+        != _canonical_group_setting(value)
+    )
+    request: dict[str, JSONValue] = {}
+    for field in changed:
+        value = resolved_changes[field]
+        request[field] = (
+            {"old": current_group[field], "new": value}
+            if field in USER_GROUP_PERMISSION_FIELDS else value
+        )
+    resolved_endpoint = f"/user_groups/{group_id}"
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=resolved_endpoint,
+            dry_run=True,
+            current=current,
+            desired=changes,
+            request=request,
+            changed_fields=changed,
+            resolved_mappings=mappings,
+        )
+    if not changed:
+        return MutationResult(
+            status=MutationStatus.OK,
+            endpoint=resolved_endpoint,
+            dry_run=False,
+            current=current,
+            desired=changes,
+            readback=current,
+            resolved_mappings=mappings,
+            warnings=["User group already had the desired configuration"],
+        )
+    try:
+        response = configuration_request(resolved_endpoint, method="PATCH", request=request)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, dry_run, exc)
+        result.current = current
+        result.desired = changes
+        result.request = request
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback_group = next(
+            (item for item in _group_inventory() if item.get("id") == group_id), None,
+        )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=resolved_endpoint,
+            dry_run=False,
+            current=current,
+            desired=changes,
+            request=request,
+            response=response,
+            changed_fields=changed,
+            resolved_mappings=mappings,
+            error=error,
+        )
+    readback: dict[str, JSONValue] = {}
+    failed = []
+    for field, value in resolved_changes.items():
+        if readback_group is not None and field in readback_group:
+            readback[field] = readback_group[field]
+        if (
+            readback_group is None
+            or field not in readback_group
+            or _canonical_group_setting(readback_group[field])
+            != _canonical_group_setting(value)
+        ):
+            failed.append(field)
+    ignored = response.get("ignored_parameters_unsupported")
+    unsupported = (
+        [value for value in ignored if isinstance(value, str)]
+        if isinstance(ignored, list) else []
+    )
+    return MutationResult(
+        status=MutationStatus.PARTIAL if failed or unsupported else MutationStatus.OK,
+        endpoint=resolved_endpoint,
+        dry_run=False,
+        current=current,
+        desired=changes,
+        request=request,
+        response=response,
+        readback=readback,
+        changed_fields=changed,
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=(
+            ["User-group readback did not match: " + ", ".join(failed)]
+            if failed else []
+        ),
+    )
+
+
+def set_user_group_members(
+    realm_url: str,
+    group: str,
+    members: list[str],
+    subgroups: list[str] | None = None,
+    expected_members: list[str] | None = None,
+    expected_subgroups: list[str] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/user_groups/{user_group_id}/members"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    requested_subgroups = None if subgroups is None else list(subgroups)
+    try:
+        groups = _group_inventory()
+        current_group = _find_group(groups, group)
+        if current_group is None:
+            raise ValueError(f"Unknown user-group name: {group}")
+        group_id = _group_id(current_group)
+        group_ids, user_ids = _semantic_name_maps()
+        desired_member_ids = sorted({_named_id(name, user_ids, "user") for name in members})
+        requested_subgroup_ids = (
+            sorted({_named_id(name, group_ids, "group") for name in requested_subgroups})
+            if requested_subgroups is not None else None
+        )
+        if requested_subgroup_ids is not None and group_id in requested_subgroup_ids:
+            raise ValueError("A user group cannot be its own subgroup")
+        expected_member_ids = (
+            sorted({_named_id(name, user_ids, "user") for name in expected_members})
+            if expected_members is not None else None
+        )
+        expected_subgroup_ids = (
+            sorted({_named_id(name, group_ids, "group") for name in expected_subgroups})
+            if expected_subgroups is not None else None
+        )
+        member_response = configuration_request(
+            f"/user_groups/{group_id}/members",
+            request={"direct_member_only": True},
+        )
+        current_members_raw = member_response.get("members")
+        if not isinstance(current_members_raw, list):
+            raise ValueError("Direct user-group members were absent or null")
+        current_member_ids = sorted(
+            item for item in current_members_raw
+            if isinstance(item, int) and not isinstance(item, bool)
+        )
+        current_subgroup_ids = _group_list_value(current_group, "direct_subgroup_ids")
+        desired_subgroup_ids = (
+            current_subgroup_ids
+            if requested_subgroup_ids is None else requested_subgroup_ids
+        )
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired={
+                "group": group,
+                "members": members,
+                **(
+                    {"subgroups": requested_subgroups}
+                    if requested_subgroups is not None else {}
+                ),
+            },
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    current: dict[str, JSONValue] = {
+        "member_ids": current_member_ids,
+        "subgroup_ids": current_subgroup_ids,
+    }
+    desired: dict[str, JSONValue] = {
+        "group": group,
+        "members": members,
+        **(
+            {"subgroups": requested_subgroups}
+            if requested_subgroups is not None else {}
+        ),
+    }
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "group": {"semantic": group, "resolved": group_id},
+        "members": [
+            {"semantic": name, "resolved": _named_id(name, user_ids, "user")}
+            for name in members
+        ],
+        **(
+            {"subgroups": [
+                {"semantic": name, "resolved": _named_id(name, group_ids, "group")}
+                for name in requested_subgroups
+            ]}
+            if requested_subgroups is not None else {}
+        ),
+    }
+    expected_mismatch = (
+        expected_member_ids is not None and expected_member_ids != current_member_ids
+    ) or (
+        expected_subgroup_ids is not None and expected_subgroup_ids != current_subgroup_ids
+    )
+    if expected_mismatch:
+        return _conflict_result(
+            endpoint, dry_run, current, desired, ["membership"], [],
+        )
+    add = sorted(set(desired_member_ids) - set(current_member_ids))
+    delete = sorted(set(current_member_ids) - set(desired_member_ids))
+    add_subgroups = sorted(set(desired_subgroup_ids) - set(current_subgroup_ids))
+    delete_subgroups = sorted(set(current_subgroup_ids) - set(desired_subgroup_ids))
+    request: dict[str, JSONValue] = {
+        key: value for key, value in {
+            "add": add,
+            "delete": delete,
+            "add_subgroups": add_subgroups,
+            "delete_subgroups": delete_subgroups,
+        }.items() if value
+    }
+    resolved_endpoint = f"/user_groups/{group_id}/members"
+    changed = [key for key in ("add", "delete", "add_subgroups", "delete_subgroups") if key in request]
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=resolved_endpoint,
+            dry_run=True,
+            current=current,
+            desired=desired,
+            request=request,
+            changed_fields=changed,
+            resolved_mappings=mappings,
+        )
+    if not request:
+        return MutationResult(
+            status=MutationStatus.OK,
+            endpoint=resolved_endpoint,
+            dry_run=False,
+            current=current,
+            desired=desired,
+            readback=current,
+            resolved_mappings=mappings,
+            warnings=["User group already had the desired direct membership"],
+        )
+    try:
+        response = configuration_request(resolved_endpoint, method="POST", request=request)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, dry_run, exc)
+        result.current = current
+        result.desired = desired
+        result.request = request
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback_members = configuration_request(
+            resolved_endpoint, request={"direct_member_only": True},
+        ).get("members")
+        readback_group = next(
+            (item for item in _group_inventory() if item.get("id") == group_id), None,
+        )
+        if not isinstance(readback_members, list) or readback_group is None:
+            raise ValueError("User-group membership readback was absent or null")
+        readback_member_ids = sorted(
+            item for item in readback_members
+            if isinstance(item, int) and not isinstance(item, bool)
+        )
+        readback_subgroup_ids = _group_list_value(readback_group, "direct_subgroup_ids")
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=resolved_endpoint,
+            dry_run=False,
+            current=current,
+            desired=desired,
+            request=request,
+            response=response,
+            changed_fields=changed,
+            resolved_mappings=mappings,
+            error=error,
+        )
+    readback: dict[str, JSONValue] = {
+        "member_ids": readback_member_ids,
+        "subgroup_ids": readback_subgroup_ids,
+    }
+    verified = (
+        readback_member_ids == desired_member_ids
+        and readback_subgroup_ids == desired_subgroup_ids
+    )
+    ignored = response.get("ignored_parameters_unsupported")
+    unsupported = (
+        [value for value in ignored if isinstance(value, str)]
+        if isinstance(ignored, list) else []
+    )
+    return MutationResult(
+        status=(
+            MutationStatus.OK
+            if verified and not unsupported else MutationStatus.PARTIAL
+        ),
+        endpoint=resolved_endpoint,
+        dry_run=False,
+        current=current,
+        desired=desired,
+        request=request,
+        response=response,
+        readback=readback,
+        changed_fields=changed,
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=[] if verified else ["User-group membership readback did not match"],
     )
 
 
