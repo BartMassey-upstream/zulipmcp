@@ -461,6 +461,23 @@ USER_GROUP_UPDATE_FIELDS = frozenset({
     "name",
     "description",
 }) | USER_GROUP_PERMISSION_FIELDS
+
+PROFILE_FIELD_CREATE_FIELDS = frozenset({
+    "name",
+    "hint",
+    "field_data",
+    "required",
+    "display_in_profile_summary",
+    "editable_by_user",
+    "use_for_user_matching",
+})
+
+PROFILE_FIELD_UPDATE_FIELDS = PROFILE_FIELD_CREATE_FIELDS
+
+LINKIFIER_REVERSE_FIELDS = frozenset({
+    "example_input",
+    "reverse_template",
+})
 QUEUE_SECTIONS = frozenset({
     "profile",
     "authentication",

@@ -28,10 +28,13 @@ from .configuration import (
     JSONValue,
     DEFAULT_USER_WRITE_FIELDS,
     GROUP_SETTING_REALM_FIELDS,
+    LINKIFIER_REVERSE_FIELDS,
     MutationResult,
     MutationStatus,
     ORGANIZATION_SECTIONS,
     OWNER_ONLY_REALM_FIELDS,
+    PROFILE_FIELD_CREATE_FIELDS,
+    PROFILE_FIELD_UPDATE_FIELDS,
     QUEUE_SECTIONS,
     REALM_WRITE_FIELDS,
     UNLIMITED_REALM_FIELDS,
@@ -3224,6 +3227,1037 @@ def set_user_group_members(
         resolved_mappings=mappings,
         unsupported_fields=unsupported,
         warnings=[] if verified else ["User-group membership readback did not match"],
+    )
+
+
+def _configuration_items(
+    response: dict[str, JSONValue], field: str, label: str,
+) -> list[dict[str, JSONValue]]:
+    items = response.get(field)
+    if not isinstance(items, list):
+        raise ValueError(f"{label} inventory was absent or null")
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _ignored_parameters(response: dict[str, JSONValue]) -> list[str]:
+    ignored = response.get("ignored_parameters_unsupported")
+    return (
+        [value for value in ignored if isinstance(value, str)]
+        if isinstance(ignored, list) else []
+    )
+
+
+def _find_named_object(
+    items: list[dict[str, JSONValue]], field: str, value: str, label: str,
+) -> dict[str, JSONValue] | None:
+    matches = [item for item in items if item.get(field) == value]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous {label}: {value}")
+    return None
+
+
+def _profile_value(field: str, value: JSONValue) -> JSONValue:
+    if field != "field_data" or not isinstance(value, str):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return value
+    return parsed if isinstance(parsed, (dict, list)) else value
+
+
+def _profile_current(
+    profile_field: dict[str, JSONValue], field: str,
+) -> tuple[bool, JSONValue]:
+    if field == "field_type":
+        return "type" in profile_field, profile_field.get("type")
+    if field in {"display_in_profile_summary", "use_for_user_matching"}:
+        return True, profile_field.get(field, False)
+    return field in profile_field, _profile_value(field, profile_field.get(field))
+
+
+def create_custom_profile_field(
+    realm_url: str,
+    name: str,
+    field_type: int,
+    settings: dict[str, JSONValue] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/realm/profile_fields"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    settings = dict(settings or {})
+    invalid = set(settings) - (PROFILE_FIELD_CREATE_FIELDS - {"name"})
+    if invalid:
+        return _invalid_fields_result(endpoint, dry_run, invalid)
+    if not isinstance(field_type, int) or isinstance(field_type, bool):
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            error=APIError(message="field_type must be an integer", code="INVALID_FIELD_TYPE"),
+        )
+    null_fields = sorted(field for field, value in settings.items() if value is None)
+    if null_fields:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            error=APIError(
+                message=f"Null is not a supported write value for: {', '.join(null_fields)}",
+                code="NULL_WRITE_VALUE",
+            ),
+        )
+    feature_level = server.get("zulip_feature_level")
+    if "use_for_user_matching" in settings and (
+        not isinstance(feature_level, int) or feature_level < 455
+    ):
+        return MutationResult(
+            status=MutationStatus.UNSUPPORTED,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            unsupported_fields=["use_for_user_matching"],
+            error=APIError(
+                message="use_for_user_matching requires Zulip feature level 455",
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    desired = {"name": name, "field_type": field_type, **settings}
+    try:
+        fields = _configuration_items(
+            get_profile_fields_configuration(), "custom_fields", "Profile-field",
+        )
+        existing = _find_named_object(fields, "name", name, "profile-field name")
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired=desired,
+            error=APIError(message=str(exc), code="INVENTORY_ERROR"),
+        )
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+    }
+    if existing is not None:
+        mismatches = []
+        for field, value in desired.items():
+            present, current_value = _profile_current(existing, field)
+            if not present or current_value != _profile_value(field, value):
+                mismatches.append(field)
+        if mismatches:
+            return MutationResult(
+                status=MutationStatus.CONFLICT,
+                endpoint=endpoint,
+                dry_run=dry_run,
+                current=existing,
+                desired=desired,
+                resolved_mappings=mappings,
+                error=APIError(
+                    message=f"Profile field already exists with different settings: {', '.join(mismatches)}",
+                    code="PROFILE_FIELD_ALREADY_EXISTS",
+                ),
+            )
+        return MutationResult(
+            status=MutationStatus.DRY_RUN if dry_run else MutationStatus.OK,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            current=existing,
+            desired=desired,
+            readback=existing,
+            resolved_mappings=mappings,
+            warnings=["Profile field already exists with the requested configuration"],
+        )
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=endpoint,
+            dry_run=True,
+            desired=desired,
+            request=desired,
+            changed_fields=sorted(desired),
+            resolved_mappings=mappings,
+        )
+    try:
+        response = configuration_request(endpoint, method="POST", request=desired)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, dry_run, exc)
+        result.desired = desired
+        result.request = desired
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback_fields = _configuration_items(
+            get_profile_fields_configuration(), "custom_fields", "Profile-field",
+        )
+        field_id = response.get("id")
+        readback = next(
+            (
+                item for item in readback_fields
+                if isinstance(field_id, int) and item.get("id") == field_id
+            ),
+            None,
+        )
+        if readback is None:
+            readback = _find_named_object(
+                readback_fields, "name", name, "profile-field name",
+            )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=endpoint,
+            dry_run=False,
+            desired=desired,
+            request=desired,
+            response=response,
+            resolved_mappings=mappings,
+            error=error,
+        )
+    failed = []
+    for field, value in desired.items():
+        present, current_value = (
+            _profile_current(readback, field)
+            if readback is not None else (False, None)
+        )
+        if not present or current_value != _profile_value(field, value):
+            failed.append(field)
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        status=MutationStatus.PARTIAL if failed or unsupported else MutationStatus.OK,
+        endpoint=endpoint,
+        dry_run=False,
+        desired=desired,
+        request=desired,
+        response=response,
+        readback=readback,
+        changed_fields=sorted(desired),
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=(
+            ["Profile-field readback did not match: " + ", ".join(failed)]
+            if failed else []
+        ),
+    )
+
+
+def update_custom_profile_field(
+    realm_url: str,
+    field: str,
+    changes: dict[str, JSONValue],
+    expected: dict[str, JSONValue] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/realm/profile_fields/{field_id}"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    expected = dict(expected or {})
+    invalid = (set(changes) | set(expected)) - PROFILE_FIELD_UPDATE_FIELDS
+    if invalid:
+        return _invalid_fields_result(endpoint, dry_run, invalid)
+    if not changes:
+        return _invalid_fields_result(endpoint, dry_run, {"<no changes>"}, "EMPTY_CHANGES")
+    null_fields = sorted(
+        key for key, value in {**expected, **changes}.items() if value is None
+    )
+    if null_fields:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired=changes,
+            error=APIError(
+                message=f"Null is not a supported value for: {', '.join(null_fields)}",
+                code="NULL_WRITE_VALUE",
+            ),
+        )
+    feature_level = server.get("zulip_feature_level")
+    if "use_for_user_matching" in set(changes) | set(expected) and (
+        not isinstance(feature_level, int) or feature_level < 455
+    ):
+        return MutationResult(
+            status=MutationStatus.UNSUPPORTED,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            unsupported_fields=["use_for_user_matching"],
+            error=APIError(
+                message="use_for_user_matching requires Zulip feature level 455",
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    try:
+        fields = _configuration_items(
+            get_profile_fields_configuration(), "custom_fields", "Profile-field",
+        )
+        current_field = _find_named_object(fields, "name", field, "profile-field name")
+        if current_field is None:
+            raise ValueError(f"Unknown profile-field name: {field}")
+        field_id = current_field.get("id")
+        if not isinstance(field_id, int) or isinstance(field_id, bool):
+            raise ValueError("Target profile field did not have a valid id")
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired=changes,
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    current_values: dict[str, JSONValue] = {}
+    missing = []
+    for key in set(changes) | set(expected):
+        present, value = _profile_current(current_field, key)
+        if present:
+            current_values[key] = value
+        else:
+            missing.append(key)
+    missing.sort()
+    if missing:
+        return MutationResult(
+            status=MutationStatus.UNSUPPORTED,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            current=current_field,
+            desired=changes,
+            unsupported_fields=missing,
+            error=APIError(message="Profile-field response omitted requested fields", code="UNSUPPORTED_FIELD"),
+        )
+    mismatches = sorted(
+        key for key, value in expected.items()
+        if current_values[key] != _profile_value(key, value)
+    )
+    current = current_values
+    if mismatches:
+        return _conflict_result(endpoint, dry_run, current, changes, mismatches, [])
+    changed = sorted(
+        key for key, value in changes.items()
+        if current_values[key] != _profile_value(key, value)
+    )
+    request = {key: changes[key] for key in changed}
+    resolved_endpoint = f"/realm/profile_fields/{field_id}"
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "field": {"semantic": field, "resolved": field_id},
+    }
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=resolved_endpoint,
+            dry_run=True,
+            current=current,
+            desired=changes,
+            request=request,
+            changed_fields=changed,
+            resolved_mappings=mappings,
+        )
+    if not changed:
+        return MutationResult(
+            status=MutationStatus.OK,
+            endpoint=resolved_endpoint,
+            dry_run=False,
+            current=current,
+            desired=changes,
+            readback=current,
+            resolved_mappings=mappings,
+            warnings=["Profile field already had the desired configuration"],
+        )
+    try:
+        response = configuration_request(resolved_endpoint, method="PATCH", request=request)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, dry_run, exc)
+        result.current = current
+        result.desired = changes
+        result.request = request
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback = next(
+            (
+                item for item in _configuration_items(
+                    get_profile_fields_configuration(), "custom_fields", "Profile-field",
+                ) if item.get("id") == field_id
+            ),
+            None,
+        )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=resolved_endpoint,
+            dry_run=False,
+            current=current,
+            desired=changes,
+            request=request,
+            response=response,
+            changed_fields=changed,
+            resolved_mappings=mappings,
+            error=error,
+        )
+    failed = []
+    for key, value in changes.items():
+        present, actual = (
+            _profile_current(readback, key)
+            if readback is not None else (False, None)
+        )
+        if not present or actual != _profile_value(key, value):
+            failed.append(key)
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        status=MutationStatus.PARTIAL if failed or unsupported else MutationStatus.OK,
+        endpoint=resolved_endpoint,
+        dry_run=False,
+        current=current,
+        desired=changes,
+        request=request,
+        response=response,
+        readback=readback,
+        changed_fields=changed,
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=(
+            ["Profile-field readback did not match: " + ", ".join(failed)]
+            if failed else []
+        ),
+    )
+
+
+def _owner_destination(
+    endpoint: str, realm_url: str, dry_run: bool,
+) -> tuple[dict[str, JSONValue] | None, MutationResult | None]:
+    server, principal, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return None, failure
+    assert server is not None and principal is not None
+    if principal.get("is_owner") is not True:
+        return None, MutationResult(
+            status=MutationStatus.FORBIDDEN,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            error=APIError(
+                message="Allowed-domain writes require an organization owner",
+                code="OWNER_REQUIRED",
+            ),
+        )
+    return server, None
+
+
+def add_allowed_domain(
+    realm_url: str,
+    domain: str,
+    allow_subdomains: bool,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/realm/domains"
+    server, failure = _owner_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    normalized = domain.strip().lower()
+    if not normalized:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            error=APIError(message="domain must not be empty", code="INVALID_DOMAIN"),
+        )
+    desired = {"domain": normalized, "allow_subdomains": allow_subdomains}
+    try:
+        domains = _configuration_items(
+            get_domains_configuration(), "domains", "Allowed-domain",
+        )
+        existing = _find_named_object(domains, "domain", normalized, "allowed domain")
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired=desired,
+            error=APIError(message=str(exc), code="INVENTORY_ERROR"),
+        )
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "domain": {"semantic": domain, "resolved": normalized},
+    }
+    if existing is not None:
+        if existing.get("allow_subdomains") != allow_subdomains:
+            return MutationResult(
+                status=MutationStatus.CONFLICT,
+                endpoint=endpoint,
+                dry_run=dry_run,
+                current=existing,
+                desired=desired,
+                resolved_mappings=mappings,
+                error=APIError(
+                    message="Allowed domain already exists with different settings",
+                    code="DOMAIN_ALREADY_EXISTS",
+                ),
+            )
+        return MutationResult(
+            status=MutationStatus.DRY_RUN if dry_run else MutationStatus.OK,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            current=existing,
+            desired=desired,
+            readback=existing,
+            resolved_mappings=mappings,
+            warnings=["Allowed domain already exists with the requested configuration"],
+        )
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=endpoint,
+            dry_run=True,
+            desired=desired,
+            request=desired,
+            changed_fields=["domain", "allow_subdomains"],
+            resolved_mappings=mappings,
+        )
+    try:
+        response = configuration_request(endpoint, method="POST", request=desired)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, dry_run, exc)
+        result.desired = desired
+        result.request = desired
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback = _find_named_object(
+            _configuration_items(
+                get_domains_configuration(), "domains", "Allowed-domain",
+            ),
+            "domain",
+            normalized,
+            "allowed domain",
+        )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=endpoint,
+            dry_run=False,
+            desired=desired,
+            request=desired,
+            response=response,
+            resolved_mappings=mappings,
+            error=error,
+        )
+    failed = readback is None or readback.get("allow_subdomains") != allow_subdomains
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        status=MutationStatus.PARTIAL if failed or unsupported else MutationStatus.OK,
+        endpoint=endpoint,
+        dry_run=False,
+        desired=desired,
+        request=desired,
+        response=response,
+        readback=readback,
+        changed_fields=["domain", "allow_subdomains"],
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=["Allowed-domain readback did not match"] if failed else [],
+    )
+
+
+def update_allowed_domain(
+    realm_url: str,
+    domain: str,
+    allow_subdomains: bool,
+    expected_allow_subdomains: bool | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    normalized = domain.strip().lower()
+    resolved_endpoint = f"/realm/domains/{urllib.parse.quote(normalized, safe='')}"
+    server, failure = _owner_destination(resolved_endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    try:
+        current_domain = _find_named_object(
+            _configuration_items(
+                get_domains_configuration(), "domains", "Allowed-domain",
+            ),
+            "domain",
+            normalized,
+            "allowed domain",
+        )
+        if current_domain is None:
+            raise ValueError(f"Unknown allowed domain: {normalized}")
+    except ZulipAPIError as exc:
+        return _mutation_failure(resolved_endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=resolved_endpoint,
+            dry_run=dry_run,
+            desired={"allow_subdomains": allow_subdomains},
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    current_value = current_domain.get("allow_subdomains")
+    current = {"allow_subdomains": current_value}
+    desired = {"allow_subdomains": allow_subdomains}
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "domain": {"semantic": domain, "resolved": normalized},
+    }
+    if expected_allow_subdomains is not None and current_value != expected_allow_subdomains:
+        result = _conflict_result(
+            resolved_endpoint, dry_run, current, desired, ["allow_subdomains"], [],
+        )
+        result.resolved_mappings = mappings
+        return result
+    request: dict[str, JSONValue] = (
+        {} if current_value == allow_subdomains
+        else {"allow_subdomains": allow_subdomains}
+    )
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=resolved_endpoint,
+            dry_run=True,
+            current=current,
+            desired=desired,
+            request=request,
+            changed_fields=list(request),
+            resolved_mappings=mappings,
+        )
+    if not request:
+        return MutationResult(
+            status=MutationStatus.OK,
+            endpoint=resolved_endpoint,
+            dry_run=False,
+            current=current,
+            desired=desired,
+            readback=current,
+            resolved_mappings=mappings,
+            warnings=["Allowed domain already had the desired configuration"],
+        )
+    try:
+        response = configuration_request(resolved_endpoint, method="PATCH", request=request)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, dry_run, exc)
+        result.current = current
+        result.desired = desired
+        result.request = request
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback = _find_named_object(
+            _configuration_items(
+                get_domains_configuration(), "domains", "Allowed-domain",
+            ),
+            "domain",
+            normalized,
+            "allowed domain",
+        )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=resolved_endpoint,
+            dry_run=False,
+            current=current,
+            desired=desired,
+            request=request,
+            response=response,
+            changed_fields=["allow_subdomains"],
+            resolved_mappings=mappings,
+            error=error,
+        )
+    failed = readback is None or readback.get("allow_subdomains") != allow_subdomains
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        status=MutationStatus.PARTIAL if failed or unsupported else MutationStatus.OK,
+        endpoint=resolved_endpoint,
+        dry_run=False,
+        current=current,
+        desired=desired,
+        request=request,
+        response=response,
+        readback=(
+            {"allow_subdomains": readback.get("allow_subdomains")}
+            if readback is not None else {}
+        ),
+        changed_fields=["allow_subdomains"],
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=["Allowed-domain readback did not match"] if failed else [],
+    )
+
+
+def _linkifier_value(field: str, value: JSONValue) -> JSONValue:
+    if field in LINKIFIER_REVERSE_FIELDS and value in (None, ""):
+        return None
+    return value
+
+
+def create_linkifier(
+    realm_url: str,
+    pattern: str,
+    url_template: str,
+    reverse: dict[str, JSONValue] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/realm/filters"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    reverse = dict(reverse or {})
+    invalid = set(reverse) - LINKIFIER_REVERSE_FIELDS
+    if invalid:
+        return _invalid_fields_result(endpoint, dry_run, invalid)
+    null_fields = sorted(field for field, value in reverse.items() if value is None)
+    if null_fields:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            error=APIError(
+                message="Use an empty string, not null, to clear reverse-linkifier fields",
+                code="NULL_WRITE_VALUE",
+            ),
+        )
+    feature_level = server.get("zulip_feature_level")
+    if reverse and (not isinstance(feature_level, int) or feature_level < 471):
+        return MutationResult(
+            status=MutationStatus.UNSUPPORTED,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            unsupported_fields=sorted(reverse),
+            error=APIError(
+                message="Reverse linkifiers require Zulip feature level 471",
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    desired = {"pattern": pattern, "url_template": url_template, **reverse}
+    try:
+        linkifiers = _configuration_items(
+            get_linkifiers_configuration(), "linkifiers", "Linkifier",
+        )
+        existing = _find_named_object(linkifiers, "pattern", pattern, "linkifier pattern")
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired=desired,
+            error=APIError(message=str(exc), code="INVENTORY_ERROR"),
+        )
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+    }
+    if existing is not None:
+        mismatches = [
+            field for field, value in desired.items()
+            if (
+                field not in existing and field not in LINKIFIER_REVERSE_FIELDS
+            ) or _linkifier_value(field, existing.get(field)) != _linkifier_value(field, value)
+        ]
+        if mismatches:
+            return MutationResult(
+                status=MutationStatus.CONFLICT,
+                endpoint=endpoint,
+                dry_run=dry_run,
+                current=existing,
+                desired=desired,
+                resolved_mappings=mappings,
+                error=APIError(
+                    message=f"Linkifier already exists with different settings: {', '.join(mismatches)}",
+                    code="LINKIFIER_ALREADY_EXISTS",
+                ),
+            )
+        return MutationResult(
+            status=MutationStatus.DRY_RUN if dry_run else MutationStatus.OK,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            current=existing,
+            desired=desired,
+            readback=existing,
+            resolved_mappings=mappings,
+            warnings=["Linkifier already exists with the requested configuration"],
+        )
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=endpoint,
+            dry_run=True,
+            desired=desired,
+            request=desired,
+            changed_fields=sorted(desired),
+            resolved_mappings=mappings,
+        )
+    try:
+        response = configuration_request(endpoint, method="POST", request=desired)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, dry_run, exc)
+        result.desired = desired
+        result.request = desired
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback_items = _configuration_items(
+            get_linkifiers_configuration(), "linkifiers", "Linkifier",
+        )
+        linkifier_id = response.get("id")
+        readback = next(
+            (
+                item for item in readback_items
+                if isinstance(linkifier_id, int) and item.get("id") == linkifier_id
+            ),
+            None,
+        )
+        if readback is None:
+            readback = _find_named_object(
+                readback_items, "pattern", pattern, "linkifier pattern",
+            )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=endpoint,
+            dry_run=False,
+            desired=desired,
+            request=desired,
+            response=response,
+            resolved_mappings=mappings,
+            error=error,
+        )
+    failed = [
+        field for field, value in desired.items()
+        if readback is None
+        or _linkifier_value(field, readback.get(field)) != _linkifier_value(field, value)
+    ]
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        status=MutationStatus.PARTIAL if failed or unsupported else MutationStatus.OK,
+        endpoint=endpoint,
+        dry_run=False,
+        desired=desired,
+        request=desired,
+        response=response,
+        readback=readback,
+        changed_fields=sorted(desired),
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=["Linkifier readback did not match"] if failed else [],
+    )
+
+
+def update_linkifier(
+    realm_url: str,
+    pattern: str,
+    changes: dict[str, JSONValue],
+    expected: dict[str, JSONValue] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/realm/filters/{filter_id}"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    expected = dict(expected or {})
+    allowed = {"pattern", "url_template"} | set(LINKIFIER_REVERSE_FIELDS)
+    invalid = (set(changes) | set(expected)) - allowed
+    if invalid:
+        return _invalid_fields_result(endpoint, dry_run, invalid)
+    if not changes:
+        return _invalid_fields_result(endpoint, dry_run, {"<no changes>"}, "EMPTY_CHANGES")
+    null_fields = sorted(key for key, value in changes.items() if value is None)
+    null_fields.extend(sorted(
+        key for key, value in expected.items()
+        if value is None and key not in LINKIFIER_REVERSE_FIELDS
+    ))
+    if null_fields:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired=changes,
+            error=APIError(
+                message="Use an empty string, not null, to clear reverse-linkifier fields",
+                code="NULL_WRITE_VALUE",
+            ),
+        )
+    feature_level = server.get("zulip_feature_level")
+    reverse_fields = (set(changes) | set(expected)) & LINKIFIER_REVERSE_FIELDS
+    if reverse_fields and (
+        not isinstance(feature_level, int) or feature_level < 471
+    ):
+        return MutationResult(
+            status=MutationStatus.UNSUPPORTED,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            unsupported_fields=sorted(reverse_fields),
+            error=APIError(
+                message="Reverse linkifiers require Zulip feature level 471",
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    try:
+        linkifiers = _configuration_items(
+            get_linkifiers_configuration(), "linkifiers", "Linkifier",
+        )
+        current_linkifier = _find_named_object(
+            linkifiers, "pattern", pattern, "linkifier pattern",
+        )
+        if current_linkifier is None:
+            raise ValueError(f"Unknown linkifier pattern: {pattern}")
+        filter_id = current_linkifier.get("id")
+        if not isinstance(filter_id, int) or isinstance(filter_id, bool):
+            raise ValueError("Target linkifier did not have a valid id")
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            desired=changes,
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    missing = sorted(
+        field for field in set(changes) | set(expected)
+        if field not in current_linkifier and field not in LINKIFIER_REVERSE_FIELDS
+    )
+    if missing:
+        return MutationResult(
+            status=MutationStatus.UNSUPPORTED,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            current=current_linkifier,
+            desired=changes,
+            unsupported_fields=missing,
+            error=APIError(message="Linkifier response omitted requested fields", code="UNSUPPORTED_FIELD"),
+        )
+    mismatches = sorted(
+        field for field, value in expected.items()
+        if _linkifier_value(field, current_linkifier.get(field))
+        != _linkifier_value(field, value)
+    )
+    current = {
+        field: current_linkifier.get(field) for field in set(changes) | set(expected)
+    }
+    if mismatches:
+        return _conflict_result(endpoint, dry_run, current, changes, mismatches, [])
+    changed = sorted(
+        field for field, value in changes.items()
+        if _linkifier_value(field, current_linkifier.get(field))
+        != _linkifier_value(field, value)
+    )
+    request: dict[str, JSONValue] = {
+        "pattern": changes.get("pattern", current_linkifier.get("pattern")),
+        "url_template": changes.get(
+            "url_template", current_linkifier.get("url_template"),
+        ),
+    }
+    request.update({field: changes[field] for field in changed if field in LINKIFIER_REVERSE_FIELDS})
+    resolved_endpoint = f"/realm/filters/{filter_id}"
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "linkifier": {"semantic": pattern, "resolved": filter_id},
+    }
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=resolved_endpoint,
+            dry_run=True,
+            current=current,
+            desired=changes,
+            request=request if changed else {},
+            changed_fields=changed,
+            resolved_mappings=mappings,
+        )
+    if not changed:
+        return MutationResult(
+            status=MutationStatus.OK,
+            endpoint=resolved_endpoint,
+            dry_run=False,
+            current=current,
+            desired=changes,
+            readback=current,
+            resolved_mappings=mappings,
+            warnings=["Linkifier already had the desired configuration"],
+        )
+    try:
+        response = configuration_request(resolved_endpoint, method="PATCH", request=request)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, dry_run, exc)
+        result.current = current
+        result.desired = changes
+        result.request = request
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback = next(
+            (
+                item for item in _configuration_items(
+                    get_linkifiers_configuration(), "linkifiers", "Linkifier",
+                ) if item.get("id") == filter_id
+            ),
+            None,
+        )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=resolved_endpoint,
+            dry_run=False,
+            current=current,
+            desired=changes,
+            request=request,
+            response=response,
+            changed_fields=changed,
+            resolved_mappings=mappings,
+            error=error,
+        )
+    failed = [
+        field for field, value in changes.items()
+        if readback is None
+        or _linkifier_value(field, readback.get(field)) != _linkifier_value(field, value)
+    ]
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        status=MutationStatus.PARTIAL if failed or unsupported else MutationStatus.OK,
+        endpoint=resolved_endpoint,
+        dry_run=False,
+        current=current,
+        desired=changes,
+        request=request,
+        response=response,
+        readback=(
+            {field: readback.get(field) for field in changes}
+            if readback is not None else {}
+        ),
+        changed_fields=changed,
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=["Linkifier readback did not match"] if failed else [],
     )
 
 

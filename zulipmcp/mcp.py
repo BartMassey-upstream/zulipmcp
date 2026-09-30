@@ -1143,6 +1143,111 @@ def set_user_group_members(
 
 
 @mcp.tool()
+def create_custom_profile_field(
+    realm_url: str,
+    name: str,
+    field_type: int,
+    settings: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Create a custom profile-field definition idempotently by name."""
+    return mutation_tool_result(
+        "Profile-field creation",
+        zulip_core.create_custom_profile_field(
+            realm_url, name, field_type, settings, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
+def update_custom_profile_field(
+    realm_url: str,
+    field: str,
+    changes: dict[str, Any],
+    expected: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Update a named custom profile-field definition with readback."""
+    return mutation_tool_result(
+        "Profile-field update",
+        zulip_core.update_custom_profile_field(
+            realm_url, field, changes, expected, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
+def add_allowed_domain(
+    realm_url: str,
+    domain: str,
+    allow_subdomains: bool,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Add an owner-authorized allowed email domain idempotently."""
+    return mutation_tool_result(
+        "Allowed-domain creation",
+        zulip_core.add_allowed_domain(
+            realm_url, domain, allow_subdomains, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
+def update_allowed_domain(
+    realm_url: str,
+    domain: str,
+    allow_subdomains: bool,
+    expected_allow_subdomains: bool | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Update one allowed domain with an optional expected value."""
+    return mutation_tool_result(
+        "Allowed-domain update",
+        zulip_core.update_allowed_domain(
+            realm_url,
+            domain,
+            allow_subdomains,
+            expected_allow_subdomains,
+            dry_run,
+        ),
+    )
+
+
+@mcp.tool()
+def create_linkifier(
+    realm_url: str,
+    pattern: str,
+    url_template: str,
+    reverse: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Create a linkifier idempotently by its regular-expression pattern."""
+    return mutation_tool_result(
+        "Linkifier creation",
+        zulip_core.create_linkifier(
+            realm_url, pattern, url_template, reverse, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
+def update_linkifier(
+    realm_url: str,
+    pattern: str,
+    changes: dict[str, Any],
+    expected: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Update a linkifier identified by its current pattern."""
+    return mutation_tool_result(
+        "Linkifier update",
+        zulip_core.update_linkifier(
+            realm_url, pattern, changes, expected, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
 def get_stream_topics(stream: str, limit: int = 20) -> str:
     """Get recent topics in a stream.
 
