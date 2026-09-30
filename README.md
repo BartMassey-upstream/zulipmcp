@@ -104,6 +104,11 @@ folder membership, default-channel status, and realm settings that
 reference the channel. Default or referenced channels must be detached
 explicitly before archival.
 
+`archive_channel` is a discoverability alias for setting the archived
+state to true. It does not permanently delete the channel, its
+messages, or its subscriber list. Use `set_channel_archived` with
+`archived=false` to restore an archived channel.
+
 Channel membership tools support additive subscription, explicit
 unsubscription, and exact-state convergence. Exact convergence reads
 the complete subscriber list first, applies additions before removals,

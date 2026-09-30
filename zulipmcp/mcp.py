@@ -1228,6 +1228,22 @@ def set_channel_archived(
 
 
 @mcp.tool()
+def archive_channel(
+    realm_url: str,
+    channel: str,
+    expected_archived: bool | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Archive a channel without deleting messages or changing subscribers."""
+    return mutation_tool_result(
+        "Channel archival",
+        zulip_core.set_channel_archived(
+            realm_url, channel, True, expected_archived, dry_run,
+        ),
+    )
+
+
+@mcp.tool()
 def subscribe_users_to_channel(
     realm_url: str,
     channel: str,

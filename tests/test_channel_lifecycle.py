@@ -212,3 +212,22 @@ def test_destination_mismatch_is_preserved(monkeypatch: pytest.MonkeyPatch) -> N
     ).structured_content
 
     assert result["error"]["code"] == "DESTINATION_REALM_MISMATCH"
+
+
+def test_archive_alias_routes_to_convergent_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    implementation = Mock(return_value=MutationResult(
+        MutationStatus.DRY_RUN, "/streams/12", dry_run=True,
+        desired={"is_archived": True},
+    ))
+    monkeypatch.setattr(core, "set_channel_archived", implementation)
+
+    result = mcp_module.archive_channel(
+        REALM_URL, "temporary test", expected_archived=False, dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "dry_run"
+    implementation.assert_called_once_with(
+        REALM_URL, "temporary test", True, False, True,
+    )
