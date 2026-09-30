@@ -1157,8 +1157,9 @@ def create_channel(
     description: str = "",
     settings: dict[str, Any] | None = None,
     dry_run: bool = False,
+    is_default: bool | None = None,
 ) -> ToolResult:
-    """Create a channel from semantic user/group names with idempotent readback."""
+    """Create a channel; is_default controls new-user default membership."""
     return mutation_tool_result(
         "Channel creation",
         zulip_core.create_channel(
@@ -1170,6 +1171,7 @@ def create_channel(
             description=description,
             settings=settings,
             dry_run=dry_run,
+            is_default=is_default,
         ),
     )
 

@@ -115,6 +115,11 @@ the complete subscriber list first, applies additions before removals,
 and protects an authenticated administrator from being removed from a
 private channel when that would compromise recovery.
 
+`create_channel` accepts the public `is_default` option and translates
+it to Zulip's `is_default_stream` request field. The older
+`settings.is_default_stream` form remains supported; contradictory
+values are rejected.
+
 Dry runs remain available while writes are disabled: they can read
 current state, validate inputs, and show proposed requests without
 issuing a mutation.

@@ -161,6 +161,43 @@ def test_create_channel_rejects_private_default(client: Mock) -> None:
     assert result["error"]["code"] == "INVALID_DEFAULT_CHANNEL"
 
 
+def test_create_channel_accepts_is_default_alias(client: Mock) -> None:
+    client.call_endpoint.side_effect = [
+        server(), principal(), streams([]), groups(), users(),
+    ]
+
+    result = mcp_module.create_channel(
+        realm_url=REALM_URL,
+        name="course",
+        subscribers=[],
+        privacy="public",
+        permissions={},
+        is_default=True,
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "dry_run"
+    assert result["request"]["is_default_stream"] is True
+
+
+def test_create_channel_rejects_conflicting_default_aliases(client: Mock) -> None:
+    client.call_endpoint.side_effect = [server(), principal()]
+
+    result = mcp_module.create_channel(
+        realm_url=REALM_URL,
+        name="course",
+        subscribers=[],
+        privacy="public",
+        permissions={},
+        settings={"is_default_stream": False},
+        is_default=True,
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "conflict"
+    assert result["error"]["code"] == "CONFLICTING_FIELD_ALIASES"
+
+
 def test_create_channel_is_idempotent_by_name(client: Mock) -> None:
     existing = {
         "stream_id": 12,

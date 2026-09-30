@@ -2992,6 +2992,7 @@ def create_channel(
     description: str = "",
     settings: dict[str, JSONValue] | None = None,
     dry_run: bool = False,
+    is_default: bool | None = None,
 ) -> MutationResult:
     endpoint = "/channels/create"
     server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
@@ -3017,6 +3018,35 @@ def create_channel(
             error=APIError(message="privacy must be public, private, or web_public", code="INVALID_PRIVACY"),
         )
     requested_settings = dict(settings or {})
+    if is_default is not None:
+        if not isinstance(is_default, bool):
+            return MutationResult(
+                status=MutationStatus.ERROR,
+                endpoint=endpoint,
+                dry_run=dry_run,
+                error=APIError(
+                    message="is_default must be a boolean",
+                    code="INVALID_FIELD_VALUE",
+                ),
+            )
+        previous = requested_settings.get("is_default_stream")
+        if "is_default_stream" in requested_settings and previous != is_default:
+            return MutationResult(
+                status=MutationStatus.CONFLICT,
+                endpoint=endpoint,
+                dry_run=dry_run,
+                desired={
+                    "is_default": is_default,
+                    "is_default_stream": previous,
+                },
+                error=APIError(
+                    message=(
+                        "is_default conflicts with settings.is_default_stream"
+                    ),
+                    code="CONFLICTING_FIELD_ALIASES",
+                ),
+            )
+        requested_settings["is_default_stream"] = is_default
     if requested_settings.get("is_default_stream") is True and privacy == "private":
         return MutationResult(
             status=MutationStatus.ERROR,
