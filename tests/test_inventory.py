@@ -19,6 +19,7 @@ READ_ONLY_TOOLS = {
     "get_current_user",
     "get_custom_emoji",
     "get_custom_profile_fields",
+    "get_data_exports",
     "get_invitations",
     "get_linkifiers",
     "get_message_by_id",
@@ -46,6 +47,7 @@ DESTRUCTIVE_TOOLS = {
     "create_channel",
     "deactivate_custom_emoji",
     "delete_custom_profile_field",
+    "delete_data_export",
     "delete_message_for_moderation",
     "edit_message",
     "end_session",
@@ -92,8 +94,10 @@ CONFIGURATION_WRITE_TOOLS = {
     "create_channel",
     "create_channel_folder",
     "create_custom_profile_field",
+    "create_data_export",
     "create_linkifier",
     "delete_custom_profile_field",
+    "delete_data_export",
     "create_user_group",
     "deactivate_custom_emoji",
     "invite_users",
@@ -160,6 +164,7 @@ UNGATED_LOCAL_OR_TRANSIENT_TOOLS = {
 }
 
 OPEN_WORLD_TOOLS = {
+    "create_data_export",
     "invite_users",
     "report_message",
     "resend_email_invitation",

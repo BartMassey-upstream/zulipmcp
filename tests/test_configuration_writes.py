@@ -327,6 +327,53 @@ def test_owner_only_and_last_authentication_method_checks(
         assert denied["error"]["code"] == "OWNER_REQUIRED"
 
 
+def test_authentication_change_requires_exact_expected_state(
+    client: Mock,
+) -> None:
+    current = {"Email": True, "LDAP": True}
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(authentication_methods=current),
+        deleted(),
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={"authentication_methods": {"Email": True, "LDAP": False}},
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "conflict"
+    assert result["error"]["code"] == "EXPECTED_STATE_REQUIRED"
+    assert all(
+        item.kwargs["method"] != "PATCH"
+        for item in client.call_endpoint.call_args_list
+    )
+
+
+def test_authentication_change_warns_external_health_is_unverified(
+    client: Mock,
+) -> None:
+    current = {"Email": True, "LDAP": True}
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(authentication_methods=current),
+        deleted(),
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={"authentication_methods": {"Email": True, "LDAP": False}},
+        expected={"authentication_methods": current},
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "dry_run"
+    assert any("identity provider" in warning for warning in result["warnings"])
+    assert all(
+        item.kwargs["method"] != "PATCH"
+        for item in client.call_endpoint.call_args_list
+    )
+
+
 def test_successful_realm_write_has_authoritative_readback(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

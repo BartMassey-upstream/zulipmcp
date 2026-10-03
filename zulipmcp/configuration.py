@@ -16,12 +16,14 @@ _SECRET_KEYS = frozenset({
     "api_key", "apikey", "password", "passwd", "secret", "token",
     "authorization", "proxy_authorization", "cookie", "set_cookie",
     "credentials", "config_data", "invite_link", "invite_url", "link_url",
+    "export_url",
     "invitation_link", "invitation_url", "webhook_url", "webhook_key",
 })
 _SECRET_SUFFIXES = (
     "_api_key", "_password", "_secret", "_token", "_credentials",
     "_config_data", "_invitation_link", "_invitation_url", "_invite_link",
     "_invite_url", "_webhook_url", "_webhook_key",
+    "_export_url",
 )
 _TEXT_KEYS = frozenset({
     "detail", "diagnostic", "error", "errors", "message", "msg", "reason",

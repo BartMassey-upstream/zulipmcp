@@ -1040,6 +1040,14 @@ def get_invitations() -> ToolResult:
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+def get_data_exports() -> ToolResult:
+    """Audit data-export jobs without exposing bearer download URLs."""
+    return _configuration_collection_result(
+        "Data exports", zulip_core.get_data_exports_configuration, "exports",
+    )
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_moderation_configuration() -> ToolResult:
     """Audit reporting destinations and realm/channel deletion policy."""
     return configuration_tool_result(
@@ -1403,6 +1411,43 @@ def revoke_reusable_invitation(
         "Reusable invitation revocation",
         zulip_core.revoke_reusable_invitation(
             realm_url, invited_at, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=EXTERNAL_WRITE_TOOL_ANNOTATIONS)
+def create_data_export(
+    realm_url: str,
+    export_type: str = "public",
+    confirmation: str = "",
+    dry_run: bool = False,
+) -> ToolResult:
+    """Queue one realm data export after an exact confirmation phrase."""
+    return mutation_tool_result(
+        "Data export creation",
+        zulip_core.create_data_export(
+            realm_url, export_type, confirmation, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def delete_data_export(
+    realm_url: str,
+    export_id: int,
+    expected_export_time: float,
+    confirmation: str = "",
+    dry_run: bool = False,
+) -> ToolResult:
+    """Permanently delete one completed data-export archive."""
+    return mutation_tool_result(
+        "Data export deletion",
+        zulip_core.delete_data_export(
+            realm_url,
+            export_id,
+            expected_export_time,
+            confirmation,
+            dry_run,
         ),
     )
 

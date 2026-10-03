@@ -611,6 +611,10 @@ def get_invitations_configuration() -> dict[str, JSONValue]:
     return configuration_request("/invites")
 
 
+def get_data_exports_configuration() -> dict[str, JSONValue]:
+    return configuration_request("/export/realm")
+
+
 def get_channel_folders_configuration() -> dict[str, JSONValue]:
     response = configuration_request(
         "/channel_folders", request={"include_archived": True},
@@ -1793,6 +1797,24 @@ def update_organization_configuration(
                     code="LAST_AUTHENTICATION_METHOD",
                 ),
             )
+        if "authentication_methods" not in expected:
+            return MutationResult(
+                status=MutationStatus.CONFLICT,
+                endpoint=endpoint,
+                dry_run=dry_run,
+                current=current,
+                desired=changes,
+                warnings=warnings,
+                error=APIError(
+                    message=(
+                        "expected.authentication_methods is required for authentication changes"
+                    ),
+                    code="EXPECTED_STATE_REQUIRED",
+                ),
+            )
+        warnings.append(
+            "Preflight cannot prove that an external identity provider is currently healthy"
+        )
     try:
         resolved_changes, resolved_expected, mappings = _resolve_realm_values(
             changes, expected,
@@ -3829,6 +3851,345 @@ def revoke_reusable_invitation(
         request={}, response=response, readback={"present": bool(remaining)},
         changed_fields=["revoked"], resolved_mappings=mappings,
         warnings=[] if confirmed else ["Reusable invitation remained after revocation"],
+    )
+
+
+def _data_export_inventory() -> list[dict[str, JSONValue]]:
+    exports = get_data_exports_configuration().get("exports")
+    if not isinstance(exports, list):
+        raise ValueError("Data-export inventory was absent or null")
+    return [item for item in exports if isinstance(item, dict)]
+
+
+def create_data_export(
+    realm_url: str,
+    export_type: str = "public",
+    confirmation: str = "",
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/export/realm"
+    server, principal, failure = _admin_destination(
+        endpoint, realm_url, dry_run,
+    )
+    if failure is not None:
+        return failure
+    assert server is not None
+    assert principal is not None
+    allowed = {"public", "full_with_consent", "full_without_consent"}
+    if export_type not in allowed:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            desired={"export_type": export_type},
+            error=APIError(message="Invalid export_type", code="INVALID_EXPORT_TYPE"),
+        )
+    feature_level = server.get("zulip_feature_level")
+    if not isinstance(feature_level, int):
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="Server did not report a Zulip feature level",
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    if feature_level < 304 and export_type != "public":
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            desired={"export_type": export_type},
+            error=APIError(
+                message="Non-public exports require Zulip feature level 304",
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    if feature_level < 449 and export_type == "full_without_consent":
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            desired={"export_type": export_type},
+            error=APIError(
+                message="Full exports without consent require Zulip feature level 449",
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    preflight_warnings: list[str] = []
+    if export_type == "full_without_consent":
+        if principal.get("is_owner") is not True:
+            return MutationResult(
+                MutationStatus.FORBIDDEN, endpoint, dry_run=dry_run,
+                desired={"export_type": export_type},
+                error=APIError(
+                    message="Full exports without consent require an organization owner",
+                    code="OWNER_REQUIRED",
+                ),
+            )
+        try:
+            security, preflight_warnings = _read_write_state(
+                {"owner_full_content_access"}, defaults=False,
+            )
+        except ZulipAPIError as exc:
+            return _mutation_failure(endpoint, dry_run, exc)
+        access = security.get("owner_full_content_access")
+        if not isinstance(access, bool):
+            return MutationResult(
+                MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+                desired={"export_type": export_type},
+                warnings=preflight_warnings,
+                error=APIError(
+                    message="Owner full-content-access policy was unavailable",
+                    code="OWNER_FULL_CONTENT_ACCESS_UNAVAILABLE",
+                ),
+            )
+        if access is not True:
+            return MutationResult(
+                MutationStatus.FORBIDDEN, endpoint, dry_run=dry_run,
+                current={"owner_full_content_access": access},
+                desired={"export_type": export_type},
+                warnings=preflight_warnings,
+                error=APIError(
+                    message=(
+                        "Organization policy does not allow owners to access all private content"
+                    ),
+                    code="OWNER_FULL_CONTENT_ACCESS_REQUIRED",
+                ),
+            )
+    wire_type: JSONValue = export_type
+    if feature_level < 304:
+        wire_type = None
+    elif feature_level < 449:
+        wire_type = 1 if export_type == "public" else 2
+    request: dict[str, JSONValue] = {}
+    if wire_type is not None:
+        request["export_type"] = wire_type
+    try:
+        exports = _data_export_inventory()
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(message=str(exc), code="INVENTORY_ERROR"),
+        )
+    pending = [item for item in exports if item.get("pending") is True]
+    current: dict[str, JSONValue] = {
+        "export_count": len(exports),
+        "pending_export_count": len(pending),
+    }
+    desired: dict[str, JSONValue] = {
+        "queued": True, "export_type": export_type,
+    }
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "export_type": {"semantic": export_type, "resolved": wire_type},
+    }
+    warnings = [
+        *preflight_warnings,
+        "Export generation is asynchronous and can take up to an hour",
+        "Completed export download URLs are bearer credentials and are always redacted",
+        "A successful queue request does not prove that export generation will succeed",
+    ]
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, endpoint, dry_run=True,
+            current=current, desired=desired, request=request,
+            changed_fields=["queued"], resolved_mappings=mappings,
+            warnings=warnings + [f"Live creation requires confirmation: CREATE {export_type} EXPORT"],
+        )
+    required_confirmation = f"CREATE {export_type} EXPORT"
+    if confirmation != required_confirmation:
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=False,
+            current=current, desired=desired, request=request,
+            resolved_mappings=mappings, warnings=warnings,
+            error=APIError(
+                message=f"confirmation must exactly equal {required_confirmation!r}",
+                code="CONFIRMATION_REQUIRED",
+            ),
+        )
+    try:
+        response = configuration_mutation_request(endpoint, "POST", request)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, False, exc)
+        result.current = current
+        result.desired = desired
+        result.request = request
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    export_id = response.get("id")
+    if not isinstance(export_id, int) or isinstance(export_id, bool):
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=False,
+            current=current, desired=desired, request=request, response=response,
+            changed_fields=["queued"], resolved_mappings=mappings,
+            warnings=warnings + ["Export response omitted its ID"],
+        )
+    mappings["export"] = {"semantic": export_type, "resolved": export_id}
+    try:
+        readback = next(
+            (item for item in _data_export_inventory() if item.get("id") == export_id),
+            None,
+        )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=False,
+            current=current, desired=desired, request=request, response=response,
+            changed_fields=["queued"], resolved_mappings=mappings,
+            warnings=warnings, error=error,
+        )
+    unsupported = _ignored_parameters(response)
+    confirmed = readback is not None
+    return MutationResult(
+        MutationStatus.OK if confirmed and not unsupported else MutationStatus.PARTIAL,
+        endpoint,
+        dry_run=False,
+        current=current,
+        desired=desired,
+        request=request,
+        response=response,
+        readback=readback,
+        changed_fields=["queued"],
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=warnings + ([] if confirmed else ["Queued export was absent from readback"]),
+    )
+
+
+def delete_data_export(
+    realm_url: str,
+    export_id: int,
+    expected_export_time: float,
+    confirmation: str = "",
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = f"/export/realm/{export_id}"
+    if not isinstance(export_id, int) or isinstance(export_id, bool) or export_id <= 0:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(message="export_id must be a positive integer", code="INVALID_EXPORT_ID"),
+        )
+    if (
+        not isinstance(expected_export_time, (int, float))
+        or isinstance(expected_export_time, bool)
+        or expected_export_time <= 0
+    ):
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="expected_export_time must be a positive number",
+                code="INVALID_EXPORT_TIME",
+            ),
+        )
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    try:
+        exports = _data_export_inventory()
+        matches = [item for item in exports if item.get("id") == export_id]
+        if len(matches) != 1:
+            raise ValueError("export_id did not identify exactly one data export")
+        current_export = matches[0]
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "export": {"semantic": export_id, "resolved": export_id},
+    }
+    desired: dict[str, JSONValue] = {"deleted": True}
+    warnings = [
+        "Deleting a completed export permanently removes its hosted archive",
+        "The export audit record may remain with a deletion timestamp",
+    ]
+    if current_export.get("export_time") != expected_export_time:
+        result = _conflict_result(
+            endpoint, dry_run, current_export, desired, ["export_time"], warnings,
+        )
+        result.resolved_mappings = mappings
+        return result
+    unavailable = []
+    if current_export.get("pending") is not False:
+        unavailable.append("pending")
+    if current_export.get("failed_timestamp") is not None:
+        unavailable.append("failed")
+    if current_export.get("deleted_timestamp") is not None:
+        unavailable.append("already_deleted")
+    if current_export.get("export_from_prior_server") is True:
+        unavailable.append("prior_server")
+    if current_export.get("export_url") in (None, ""):
+        unavailable.append("archive_unavailable")
+    if unavailable:
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+            current=current_export, desired=desired, resolved_mappings=mappings,
+            warnings=warnings,
+            error=APIError(
+                message="Data export cannot be deleted in its current state: "
+                + ", ".join(unavailable),
+                code="EXPORT_NOT_DELETABLE",
+            ),
+        )
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, endpoint, dry_run=True,
+            current=current_export, desired=desired, request={},
+            changed_fields=["deleted"], resolved_mappings=mappings,
+            warnings=warnings + [f"Live deletion requires confirmation: DELETE EXPORT {export_id}"],
+        )
+    required_confirmation = f"DELETE EXPORT {export_id}"
+    if confirmation != required_confirmation:
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=False,
+            current=current_export, desired=desired, resolved_mappings=mappings,
+            warnings=warnings,
+            error=APIError(
+                message=f"confirmation must exactly equal {required_confirmation!r}",
+                code="CONFIRMATION_REQUIRED",
+            ),
+        )
+    try:
+        response = configuration_mutation_request(endpoint, "DELETE", {})
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, False, exc)
+        result.current = current_export
+        result.desired = desired
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    try:
+        readback = next(
+            (item for item in _data_export_inventory() if item.get("id") == export_id),
+            None,
+        )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=False,
+            current=current_export, desired=desired, response=response,
+            changed_fields=["deleted"], resolved_mappings=mappings,
+            warnings=warnings, error=error,
+        )
+    confirmed = readback is None or readback.get("deleted_timestamp") is not None
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        MutationStatus.OK if confirmed and not unsupported else MutationStatus.PARTIAL,
+        endpoint,
+        dry_run=False,
+        current=current_export,
+        desired=desired,
+        response=response,
+        readback=readback,
+        changed_fields=["deleted"],
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=warnings + ([] if confirmed else ["Export deletion readback did not match"]),
     )
 
 

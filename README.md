@@ -200,6 +200,19 @@ that deletion is reversible. Zulip does not expose a dedicated report
 queue or report-resolution API, so those workflow steps remain an
 explicit capability gap.
 
+Data-export tools audit export jobs, queue public or full exports, and
+permanently delete completed hosted archives. Creation and deletion use
+exact confirmation phrases, pin the destination realm, and read the
+export inventory back after writing. Export generation is asynchronous
+and may send an administrator notification when it finishes. Download
+URLs are bearer credentials and are always redacted; this MCP server
+does not download or reveal export archives.
+
+Authentication-method changes require an exact expected-current-state
+map in addition to preserving at least one method supported by the
+server. This prevents stale configuration from silently disabling a
+method, but cannot prove that an external identity provider is healthy.
+
 `create_channel` accepts the public `is_default` option and translates
 it to Zulip's `is_default_stream` request field. The older
 `settings.is_default_stream` form remains supported; contradictory
