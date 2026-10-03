@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import json
 from unittest.mock import Mock
@@ -68,6 +69,34 @@ def test_get_data_exports_redacts_download_url(
     assert result["status"] == "ok"
     assert result["data"]["exports"][0]["export_url"] == REDACTED
     assert "bearer-secret" not in json.dumps(result)
+
+
+def test_fastmcp_dispatches_export_audit_and_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        core,
+        "get_data_exports_configuration",
+        lambda: {"exports": [export_job()]},
+    )
+
+    audit = asyncio.run(mcp_module.mcp.call_tool("get_data_exports", {}))
+    planned = asyncio.run(mcp_module.mcp.call_tool(
+        "create_data_export",
+        {
+            "realm_url": REALM_URL,
+            "export_type": "public",
+            "dry_run": True,
+        },
+    ))
+
+    assert audit.content[0].text == "Data exports: ok."
+    assert audit.structured_content["data"]["exports"][0]["export_url"] == (
+        REDACTED
+    )
+    assert planned.content[0].text == "Data export creation: dry_run."
+    assert planned.structured_content["request"] == {"export_type": "public"}
+    assert "bearer-secret" not in json.dumps(audit.structured_content)
 
 
 @pytest.mark.parametrize(

@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 from unittest.mock import Mock
 
@@ -71,6 +72,38 @@ def test_capabilities_evaluate_feature_authority_and_policy(client: Mock) -> Non
     assert realm["server_support"] == "supported"
     assert "data_exports" in result["data"]["supported_audit_sections"]
     assert "authentication" in result["data"]["organization_snapshot_sections"]
+
+
+def test_fastmcp_dispatches_capability_report(client: Mock) -> None:
+    client.call_endpoint.side_effect = [
+        {
+            "result": "success", "msg": "", "zulip_version": "12.3",
+            "zulip_feature_level": 500,
+        },
+        {
+            "result": "success", "msg": "", "user_id": 1,
+            "is_owner": True, "is_admin": True, "is_active": True,
+        },
+        {
+            "result": "success", "msg": "", "queue_id": "queue-dispatch",
+            "realm_owner_full_content_access": True,
+            "realm_moderation_request_channel_id": 12,
+        },
+        {"result": "success", "msg": ""},
+    ]
+
+    result = asyncio.run(
+        mcp_module.mcp.call_tool("get_administration_capabilities", {}),
+    )
+
+    assert result.content[0].text == "Administration capabilities: ok."
+    assert result.structured_content["status"] == "ok"
+    data = result.structured_content["data"]
+    assert data["zulip_feature_level"] == 500
+    assert any(
+        item["id"] == "exports.full_without_consent"
+        for item in data["capabilities"]
+    )
 
 
 def test_capabilities_distinguish_server_support_and_principal_authority(
