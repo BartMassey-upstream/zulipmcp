@@ -45,8 +45,8 @@ def principal() -> dict[str, object]:
 def client(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> Mock:
     client = Mock(api_key="private-key", base_url=f"{REALM_URL}/api")
     monkeypatch.setattr(core, "get_client", lambda: client)
-    core.set_admin_writes_enabled(True)
-    request.addfinalizer(lambda: core.set_admin_writes_enabled(False))
+    core.set_configuration_writes_enabled(True)
+    request.addfinalizer(lambda: core.set_configuration_writes_enabled(False))
     return client
 
 

@@ -41,7 +41,7 @@ def audit(item: dict[str, object], status: SectionStatus = SectionStatus.OK) -> 
 
 @pytest.fixture(autouse=True)
 def setup(monkeypatch: pytest.MonkeyPatch) -> None:
-    core.set_admin_writes_enabled(True)
+    core.set_configuration_writes_enabled(True)
     monkeypatch.setattr(
         core, "_admin_destination",
         lambda endpoint, realm_url, dry_run: (
@@ -61,7 +61,7 @@ def setup(monkeypatch: pytest.MonkeyPatch) -> None:
         ]},
     )
     yield
-    core.set_admin_writes_enabled(False)
+    core.set_configuration_writes_enabled(False)
 
 
 def test_update_bot_resolves_owner_and_channels_for_dry_run(
@@ -86,7 +86,7 @@ def test_update_bot_expected_conflict_makes_no_patch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mutation = Mock()
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
     monkeypatch.setattr(core, "_bot_audit_item", lambda reference: (audit(bot_item()), bot_item()))
 
     result = mcp_module.update_bot_configuration(
@@ -109,7 +109,7 @@ def test_exact_subscriptions_add_before_remove_and_read_back(
         Mock(side_effect=[(audit(before), before), (audit(after), after)]),
     )
     mutation = Mock(return_value={})
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
 
     result = mcp_module.set_bot_channel_subscriptions(
         REALM_URL, "helper-bot@example.test", ["events", "new"],
@@ -139,7 +139,7 @@ def test_exact_subscriptions_fail_closed_without_visibility(
         lambda reference: (audit(item, SectionStatus.PARTIAL), item),
     )
     mutation = Mock()
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
 
     result = mcp_module.set_bot_channel_subscriptions(
         REALM_URL, "helper-bot@example.test", [],
@@ -163,7 +163,7 @@ def test_create_bot_redacts_api_key_and_reads_back(
         "user_id": 2, "email": "helper-bot@example.test",
         "api_key": "never-return-this",
     })
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
     monkeypatch.setattr(core, "_bot_audit_item", lambda reference: (audit(created), created))
 
     result = mcp_module.create_bot(

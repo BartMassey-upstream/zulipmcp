@@ -13,16 +13,18 @@ mcp_module = importlib.import_module("zulipmcp.mcp")
 
 @pytest.fixture(autouse=True)
 def reset_write_authorization() -> None:
-    core.set_admin_writes_enabled(False)
+    core.set_configuration_writes_enabled(False)
+    core.set_user_content_writes_enabled(False)
     yield
-    core.set_admin_writes_enabled(False)
+    core.set_configuration_writes_enabled(False)
+    core.set_user_content_writes_enabled(False)
 
 
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> Mock:
     client = Mock(api_key="private-key")
     monkeypatch.setattr(core, "get_client", lambda: client)
-    core.set_admin_writes_enabled(True)
+    core.set_configuration_writes_enabled(True)
     return client
 
 
@@ -61,7 +63,7 @@ def deleted() -> dict[str, object]:
 
 
 def test_writes_are_disabled_until_confirmed(client: Mock) -> None:
-    core.set_admin_writes_enabled(False)
+    core.set_configuration_writes_enabled(False)
     client.call_endpoint.side_effect = [
         principal(), realm_snapshot(description="old"), deleted(),
     ]
@@ -72,39 +74,77 @@ def test_writes_are_disabled_until_confirmed(client: Mock) -> None:
 
     assert isinstance(result, ToolResult)
     assert result.structured_content["status"] == "disabled"
-    assert result.structured_content["error"]["code"] == "ADMIN_WRITES_DISABLED"
+    assert result.structured_content["error"]["code"] == (
+        "CONFIGURATION_WRITES_DISABLED"
+    )
     assert all(
         item.kwargs["method"] != "PATCH"
         for item in client.call_endpoint.call_args_list
     )
 
 
-def test_enable_administrative_writes() -> None:
-    result = mcp_module.enable_administrative_writes()
-
-    assert result.structured_content == {"status": "enabled", "enabled": True}
-
-
-def test_enable_administrative_writes_is_idempotent() -> None:
-    core.set_admin_writes_enabled(True)
-
-    result = mcp_module.enable_administrative_writes()
+def test_enable_configuration_writes() -> None:
+    result = mcp_module.enable_configuration_writes()
 
     assert result.structured_content == {
-        "status": "already_enabled", "enabled": True,
+        "status": "enabled",
+        "gate": "configuration",
+        "configuration_writes_enabled": True,
+        "user_content_writes_enabled": False,
     }
 
 
-def test_disable_administrative_writes() -> None:
-    core.set_admin_writes_enabled(True)
+def test_enable_configuration_writes_is_idempotent() -> None:
+    core.set_configuration_writes_enabled(True)
 
-    result = mcp_module.disable_administrative_writes()
+    result = mcp_module.enable_configuration_writes()
 
-    assert result.structured_content == {"status": "disabled", "enabled": False}
+    assert result.structured_content == {
+        "status": "already_enabled",
+        "gate": "configuration",
+        "configuration_writes_enabled": True,
+        "user_content_writes_enabled": False,
+    }
+
+
+def test_disable_configuration_writes() -> None:
+    core.set_configuration_writes_enabled(True)
+    core.set_user_content_writes_enabled(True)
+
+    result = mcp_module.disable_configuration_writes()
+
+    assert result.structured_content == {
+        "status": "disabled",
+        "gate": "configuration",
+        "configuration_writes_enabled": False,
+        "user_content_writes_enabled": True,
+    }
+
+
+def test_user_content_write_actions_are_independent() -> None:
+    enabled = mcp_module.enable_user_content_writes()
+
+    assert enabled.structured_content == {
+        "status": "enabled",
+        "gate": "user_content",
+        "configuration_writes_enabled": False,
+        "user_content_writes_enabled": True,
+    }
+
+    enabled_again = mcp_module.enable_user_content_writes()
+    assert enabled_again.structured_content["status"] == "already_enabled"
+
+    disabled = mcp_module.disable_user_content_writes()
+    assert disabled.structured_content == {
+        "status": "disabled",
+        "gate": "user_content",
+        "configuration_writes_enabled": False,
+        "user_content_writes_enabled": False,
+    }
 
 
 def test_disabled_writes_allow_dry_run(client: Mock) -> None:
-    core.set_admin_writes_enabled(False)
+    core.set_configuration_writes_enabled(False)
     client.call_endpoint.side_effect = [
         principal(), realm_snapshot(description="old"), deleted(),
     ]
@@ -124,7 +164,7 @@ def test_disabled_writes_allow_dry_run(client: Mock) -> None:
 
 
 def test_disabled_writes_allow_no_op(client: Mock) -> None:
-    core.set_admin_writes_enabled(False)
+    core.set_configuration_writes_enabled(False)
     client.call_endpoint.side_effect = [
         principal(), realm_snapshot(description="current"), deleted(),
     ]

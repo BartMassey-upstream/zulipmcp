@@ -417,8 +417,50 @@ def set_context(stream: str, topic: str, num_messages: int = 20) -> str:
     return result
 
 
+def _user_content_writes_disabled_result(
+    operation: str = "perform this operation",
+) -> ToolResult:
+    message = (
+        "User content writes are disabled; call enable_user_content_writes "
+        f"and confirm the request before attempting to {operation}."
+    )
+    return ToolResult(
+        content=message,
+        structured_content={
+            "status": "disabled",
+            "gate": "user_content",
+            "error": {
+                "message": message,
+                "code": "USER_CONTENT_WRITES_DISABLED",
+            },
+        },
+    )
+
+
+def _user_content_write_gate_result(
+    operation: str = "perform this operation",
+) -> ToolResult | None:
+    if zulip_core.user_content_writes_enabled():
+        return None
+    return _user_content_writes_disabled_result(operation)
+
+
+def _perform_user_content_mutation(
+    operation: str, action: Callable[[], Any],
+) -> Any | ToolResult:
+    denied = _user_content_write_gate_result(operation)
+    if denied is not None:
+        return denied
+    try:
+        return action()
+    except zulip_core.ZulipAPIError as exc:
+        if exc.error.code == "USER_CONTENT_WRITES_DISABLED":
+            return _user_content_writes_disabled_result(operation)
+        raise
+
+
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
-def reply(content: str) -> str:
+def reply(content: str) -> str | ToolResult:
     """Reply in the current session context.
 
     Args:
@@ -469,7 +511,14 @@ def reply(content: str) -> str:
     too_long = _length_error(content, prefix)
     if too_long:
         return too_long
-    result = zulip_core.send_message(_session.stream, _session.topic, prefix + content)
+    result = _perform_user_content_mutation(
+        "send a reply",
+        lambda: zulip_core.send_message(
+            _session.stream, _session.topic, prefix + content,
+        ),
+    )
+    if isinstance(result, ToolResult):
+        return result
     if result["result"] != "success":
         _logger.error(f"reply() send_message failed: {result}")
         return f"Error sending message: {result.get('msg', 'Unknown error')}"
@@ -549,7 +598,9 @@ async def listen(timeout_hours: float, ctx: Context) -> str:
     # Add listening indicator
     if listen_msg_id:
         try:
-            zulip_core.add_reaction(listen_msg_id, _resolve_listen_emoji())
+            zulip_core.add_transient_reaction(
+                listen_msg_id, _resolve_listen_emoji(),
+            )
         except Exception:
             pass
 
@@ -582,7 +633,12 @@ async def listen(timeout_hours: float, ctx: Context) -> str:
                     return _build_listen_response(visible, listen_msg_id)
 
         # Subscribe to the stream so the narrowed queue works.
-        zulip_core.ensure_subscribed(_session.stream)
+        if not zulip_core.ensure_subscribed(_session.stream):
+            return (
+                "Error: The bot is not subscribed to this channel. Enable "
+                "configuration writes before listening if the bot should "
+                "subscribe automatically."
+            )
 
         # Register event queue narrowed to this stream+topic.
         queue_id, last_event_id, longpoll_timeout = zulip_core.register_event_queue(
@@ -664,7 +720,7 @@ async def listen(timeout_hours: float, ctx: Context) -> str:
             zulip_core.delete_event_queue(queue_id)
         if listen_msg_id:
             try:
-                zulip_core.remove_reaction(
+                zulip_core.remove_transient_reaction(
                     listen_msg_id, _resolve_listen_emoji(),
                     reaction_type=_listen_reaction_type,
                 )
@@ -714,7 +770,7 @@ _DEFAULT_FAREWELL = ":wave: Signing off"
 
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
-def end_session(message: str = _DEFAULT_FAREWELL) -> str:
+def end_session(message: str = _DEFAULT_FAREWELL) -> str | ToolResult:
     """End the current session gracefully.
     Writes a clean exit marker so the listener knows this was intentional.
 
@@ -741,6 +797,7 @@ def end_session(message: str = _DEFAULT_FAREWELL) -> str:
     stream, topic = _session.stream, _session.topic
 
     # Post farewell (default: ":wave: Signing off | {duration}")
+    denied = None
     if message and stream and topic:
         duration_secs = int(time.time() - _session.started_at) if _session.started_at else 0
         duration_str = f"{duration_secs}s" if duration_secs < 60 else f"{duration_secs // 60}m"
@@ -757,9 +814,18 @@ def end_session(message: str = _DEFAULT_FAREWELL) -> str:
         if len(message) > budget:
             _logger.warning(f"end_session() trimmed oversized farewell to fit {zulip_core.MAX_MESSAGE_LENGTH}-char limit")
             message = message[:max(budget, 0)]
-        result = zulip_core.send_message(stream, topic, prefix + message + suffix)
-        if result["result"] != "success":
-            _logger.error(f"end_session() farewell send_message failed: {result}")
+        result = _perform_user_content_mutation(
+            "send a farewell",
+            lambda: zulip_core.send_message(
+                stream, topic, prefix + message + suffix,
+            ),
+        )
+        if isinstance(result, ToolResult):
+            denied = result
+        elif result["result"] != "success":
+            _logger.error(
+                f"end_session() farewell send_message failed: {result}"
+            )
         else:
             sent_id = result.get("id")
             _session.last_sent_message_id = sent_id
@@ -770,6 +836,15 @@ def end_session(message: str = _DEFAULT_FAREWELL) -> str:
 
     _session.reset()
     _logger.info("end_session() completed")
+    if denied is not None:
+        return ToolResult(
+            content=(
+                "Session ended without sending a farewell. User content "
+                "writes are disabled; call enable_user_content_writes and "
+                "confirm the request before attempting to send a farewell."
+            ),
+            structured_content=denied.structured_content,
+        )
     return f"Session ended. Was chatting in #{stream} > {topic}"
 
 
@@ -1006,35 +1081,69 @@ def mutation_tool_result(label: str, mutation: MutationResult) -> ToolResult:
     )
 
 
-def _write_authorization_result(status: str, message: str) -> ToolResult:
+def _write_authorization_result(
+    status: str, gate: str, message: str,
+) -> ToolResult:
     return ToolResult(
         content=message,
         structured_content={
             "status": status,
-            "enabled": zulip_core.admin_writes_enabled(),
+            "gate": gate,
+            "configuration_writes_enabled": (
+                zulip_core.configuration_writes_enabled()
+            ),
+            "user_content_writes_enabled": (
+                zulip_core.user_content_writes_enabled()
+            ),
         },
     )
 
 
 @mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
-def enable_administrative_writes() -> ToolResult:
-    """Enable administrative writes until disabled or the server restarts."""
-    if zulip_core.admin_writes_enabled():
+def enable_configuration_writes() -> ToolResult:
+    """Enable configuration writes until disabled or server restart."""
+    if zulip_core.configuration_writes_enabled():
         return _write_authorization_result(
-            "already_enabled", "Administrative writes are already enabled.",
+            "already_enabled", "configuration",
+            "Configuration writes are already enabled.",
         )
-    zulip_core.set_admin_writes_enabled(True)
+    zulip_core.set_configuration_writes_enabled(True)
     return _write_authorization_result(
-        "enabled", "Administrative writes are enabled until disabled or restart.",
+        "enabled", "configuration",
+        "Configuration writes are enabled until disabled or restart.",
     )
 
 
 @mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
-def disable_administrative_writes() -> ToolResult:
-    """Disable administrative writes for this server process immediately."""
-    zulip_core.set_admin_writes_enabled(False)
+def disable_configuration_writes() -> ToolResult:
+    """Disable configuration writes for this server process immediately."""
+    zulip_core.set_configuration_writes_enabled(False)
     return _write_authorization_result(
-        "disabled", "Administrative writes are disabled.",
+        "disabled", "configuration", "Configuration writes are disabled.",
+    )
+
+
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
+def enable_user_content_writes() -> ToolResult:
+    """Enable user-content writes until disabled or server restart."""
+    if zulip_core.user_content_writes_enabled():
+        return _write_authorization_result(
+            "already_enabled", "user_content",
+            "User content writes are already enabled.",
+        )
+    zulip_core.set_user_content_writes_enabled(True)
+    return _write_authorization_result(
+        "enabled", "user_content",
+        "User content writes are enabled until disabled or restart.",
+    )
+
+
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
+def disable_user_content_writes() -> ToolResult:
+    """Disable user-content writes for this server process immediately."""
+    zulip_core.set_user_content_writes_enabled(False)
+    return _write_authorization_result(
+        "disabled", "user_content", "User content writes are disabled.",
     )
 
 
@@ -1643,7 +1752,7 @@ def verify_message(message_id: int) -> str:
 # ============================================================================
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
-def send_message(stream: str, topic: str, content: str) -> str:
+def send_message(stream: str, topic: str, content: str) -> str | ToolResult:
     """Send a message to a specific stream and topic (fire-and-forget).
 
     Args:
@@ -1658,14 +1767,19 @@ def send_message(stream: str, topic: str, content: str) -> str:
     too_long = _length_error(content, prefix)
     if too_long:
         return too_long
-    result = zulip_core.send_message(stream, topic, prefix + content)
+    result = _perform_user_content_mutation(
+        "send a message",
+        lambda: zulip_core.send_message(stream, topic, prefix + content),
+    )
+    if isinstance(result, ToolResult):
+        return result
     if result["result"] != "success":
         return f"Error sending message: {result.get('msg', 'Unknown error')}"
     return f"Message sent to #{stream} > {topic} (id: {result.get('id')})"
 
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
-def send_direct_message(recipients: list[str], content: str) -> str:
+def send_direct_message(recipients: list[str], content: str) -> str | ToolResult:
     """Send a direct message (DM) to one or more users.
 
     Args:
@@ -1678,7 +1792,12 @@ def send_direct_message(recipients: list[str], content: str) -> str:
     too_long = _length_error(content, prefix)
     if too_long:
         return too_long
-    result = zulip_core.send_direct_message(recipients, prefix + content)
+    result = _perform_user_content_mutation(
+        "send a direct message",
+        lambda: zulip_core.send_direct_message(recipients, prefix + content),
+    )
+    if isinstance(result, ToolResult):
+        return result
     if result["result"] != "success":
         return f"Error sending DM: {result.get('msg', 'Unknown error')}"
     recipient_str = ", ".join(recipients)
@@ -1686,14 +1805,19 @@ def send_direct_message(recipients: list[str], content: str) -> str:
 
 
 @mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
-def add_reaction(message_id: int, emoji_name: str) -> str:
+def add_reaction(message_id: int, emoji_name: str) -> str | ToolResult:
     """Add an emoji reaction to a message.
 
     Args:
         message_id: The message ID.
         emoji_name: Emoji name without colons (e.g. "thumbs_up", "check").
     """
-    result = zulip_core.add_reaction(message_id, emoji_name)
+    result = _perform_user_content_mutation(
+        "add a reaction",
+        lambda: zulip_core.add_reaction(message_id, emoji_name),
+    )
+    if isinstance(result, ToolResult):
+        return result
     if result["result"] != "success":
         return f"Error adding reaction: {result.get('msg', 'Unknown error')}"
     return f"Added :{emoji_name}: to message {message_id}"
@@ -1701,7 +1825,7 @@ def add_reaction(message_id: int, emoji_name: str) -> str:
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def remove_reaction(message_id: int, emoji_name: str,
-                    reaction_type: Optional[str] = None) -> str:
+                    reaction_type: Optional[str] = None) -> str | ToolResult:
     """Remove an emoji reaction from a message.
 
     Args:
@@ -1711,15 +1835,21 @@ def remove_reaction(message_id: int, emoji_name: str,
             "zulip_extra_emoji". Required for custom emoji — the server
             defaults to "unicode_emoji" when omitted.
     """
-    result = zulip_core.remove_reaction(message_id, emoji_name,
-                                        reaction_type=reaction_type)
+    result = _perform_user_content_mutation(
+        "remove a reaction",
+        lambda: zulip_core.remove_reaction(
+            message_id, emoji_name, reaction_type=reaction_type,
+        ),
+    )
+    if isinstance(result, ToolResult):
+        return result
     if result["result"] != "success":
         return f"Error removing reaction: {result.get('msg', 'Unknown error')}"
     return f"Removed :{emoji_name}: from message {message_id}"
 
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
-def edit_message(message_id: int, content: str) -> str:
+def edit_message(message_id: int, content: str) -> str | ToolResult:
     """Edit a message the bot previously sent.
 
     Use this to update a previous reply in-place (e.g. progress updates,
@@ -1735,7 +1865,12 @@ def edit_message(message_id: int, content: str) -> str:
     too_long = _length_error(content)
     if too_long:
         return too_long
-    result = zulip_core.edit_message(message_id, content)
+    result = _perform_user_content_mutation(
+        "edit a message",
+        lambda: zulip_core.edit_message(message_id, content),
+    )
+    if isinstance(result, ToolResult):
+        return result
     if result.get("result") != "success":
         return f"Error editing message: {result.get('msg', 'Unknown error')}"
     return f"Message {message_id} updated."
@@ -1743,7 +1878,7 @@ def edit_message(message_id: int, content: str) -> str:
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def move_messages(message_id: int, topic: str, stream: str = "",
-                  propagate_mode: str = "change_one") -> str:
+                  propagate_mode: str = "change_one") -> str | ToolResult:
     """Move message(s) to a different topic and/or stream.
 
     Moves one or more messages by changing their topic and optionally their
@@ -1770,9 +1905,15 @@ def move_messages(message_id: int, topic: str, stream: str = "",
     valid_modes = ("change_one", "change_later", "change_all")
     if propagate_mode not in valid_modes:
         return f"Error: propagate_mode must be one of {valid_modes}, got '{propagate_mode}'"
-    result = zulip_core.move_messages(
-        message_id, topic, stream=stream or None, propagate_mode=propagate_mode,
+    result = _perform_user_content_mutation(
+        "move messages",
+        lambda: zulip_core.move_messages(
+            message_id, topic, stream=stream or None,
+            propagate_mode=propagate_mode,
+        ),
     )
+    if isinstance(result, ToolResult):
+        return result
     if result.get("result") != "success":
         code = result.get("code", "")
         msg = result.get("msg", "Unknown error")
@@ -1788,7 +1929,7 @@ def move_messages(message_id: int, topic: str, stream: str = "",
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def resolve_topic(message_id: int, topic: str,
-                  propagate_mode: str = "change_all") -> str:
+                  propagate_mode: str = "change_all") -> str | ToolResult:
     """Rename a topic silently to mark it resolved or unresolved.
 
     No "This topic was moved to..." notification is created in either thread.
@@ -1810,9 +1951,14 @@ def resolve_topic(message_id: int, topic: str,
     valid_modes = ("change_one", "change_later", "change_all")
     if propagate_mode not in valid_modes:
         return f"Error: propagate_mode must be one of {valid_modes}, got '{propagate_mode}'"
-    result = zulip_core.move_messages(
-        message_id, topic, propagate_mode=propagate_mode, notify=False,
+    result = _perform_user_content_mutation(
+        "resolve a topic",
+        lambda: zulip_core.move_messages(
+            message_id, topic, propagate_mode=propagate_mode, notify=False,
+        ),
     )
+    if isinstance(result, ToolResult):
+        return result
     if result.get("result") != "success":
         code = result.get("code", "")
         msg = result.get("msg", "Unknown error")
@@ -1989,7 +2135,7 @@ def fetch_file(path: str, save_dir: Optional[str] = None) -> str:
 
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
-def upload_file(file_path: str) -> str:
+def upload_file(file_path: str) -> str | ToolResult:
     """Upload a local file to Zulip and return markdown to embed it in messages.
 
     Args:
@@ -2001,11 +2147,16 @@ def upload_file(file_path: str) -> str:
         For other files, this creates a download link.
     """
     try:
-        uri, filename = zulip_core.upload_file(file_path)
+        result = _perform_user_content_mutation(
+            "upload a file", lambda: zulip_core.upload_file(file_path),
+        )
     except FileNotFoundError as e:
         return f"Error: {e}"
     except ValueError as e:
         return f"Error uploading file: {e}"
+    if isinstance(result, ToolResult):
+        return result
+    uri, filename = result
 
     # Return markdown that embeds the file
     return f"File uploaded successfully.\n\nTo embed in a message, use:\n[{filename}]({uri})"

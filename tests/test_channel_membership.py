@@ -45,9 +45,9 @@ def state(
 
 @pytest.fixture(autouse=True)
 def authorize() -> None:
-    core.set_admin_writes_enabled(True)
+    core.set_configuration_writes_enabled(True)
     yield
-    core.set_admin_writes_enabled(False)
+    core.set_configuration_writes_enabled(False)
 
 
 def test_unsubscribe_dry_run_resolves_semantic_user_without_write(
@@ -58,7 +58,7 @@ def test_unsubscribe_dry_run_resolves_semantic_user_without_write(
         lambda realm, channel, users, dry: state(users),
     )
     mutation = Mock()
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
 
     result = mcp_module.unsubscribe_users_from_channel(
         REALM_URL, "course", ["alice@example.test"], dry_run=True,
@@ -80,7 +80,7 @@ def test_unsubscribe_applies_and_reads_back(monkeypatch: pytest.MonkeyPatch) -> 
         lambda realm, channel, users, dry: state(users),
     )
     mutation = Mock(return_value={"removed": ["course"]})
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
     monkeypatch.setattr(
         core, "get_channel_subscribers_configuration",
         lambda stream_id: {"subscribers": []},
@@ -105,7 +105,7 @@ def test_exact_membership_dry_run_reports_additive_and_subtractive_deltas(
         lambda realm, channel, users, dry: state(users),
     )
     mutation = Mock()
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
 
     result = mcp_module.set_channel_members(
         REALM_URL, "course", ["bob@example.test"], dry_run=True,
@@ -164,7 +164,7 @@ def test_incomplete_membership_visibility_fails_before_removal(
         ),
     )
     mutation = Mock()
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
 
     result = mcp_module.set_channel_members(
         REALM_URL, "course", [],
@@ -180,7 +180,7 @@ def test_exact_membership_adds_before_removing(monkeypatch: pytest.MonkeyPatch) 
         lambda realm, channel, users, dry: state(users),
     )
     mutation = Mock(return_value={})
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
     monkeypatch.setattr(
         core, "get_channel_subscribers_configuration",
         lambda stream_id: {"subscribers": [8]},
@@ -212,7 +212,7 @@ def test_private_channel_protects_authenticated_admin(
         ),
     )
     mutation = Mock()
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
 
     result = mcp_module.set_channel_members(
         REALM_URL, "course", ["alice@example.test"],
@@ -233,7 +233,7 @@ def test_multi_step_failure_reports_completed_and_remaining_deltas(
     mutation = Mock(side_effect=[{}, ZulipAPIError(APIError(
         message="removal denied", code="FORBIDDEN",
     ))])
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
 
     result = mcp_module.set_channel_members(
         REALM_URL, "course", ["bob@example.test"],

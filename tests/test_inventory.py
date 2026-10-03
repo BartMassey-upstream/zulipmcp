@@ -68,6 +68,60 @@ DESTRUCTIVE_TOOLS = {
     "upload_organization_branding",
 }
 
+CONFIGURATION_WRITE_TOOLS = {
+    "add_allowed_domain",
+    "archive_channel",
+    "create_bot",
+    "create_channel",
+    "create_custom_profile_field",
+    "create_linkifier",
+    "create_user_group",
+    "set_bot_channel_subscriptions",
+    "set_channel_archived",
+    "set_channel_members",
+    "set_default_channel",
+    "set_user_group_members",
+    "subscribe_users_to_channel",
+    "unsubscribe_users_from_channel",
+    "update_allowed_domain",
+    "update_bot_configuration",
+    "update_channel_configuration",
+    "update_custom_profile_field",
+    "update_default_user_settings",
+    "update_linkifier",
+    "update_organization_configuration",
+    "update_user_group",
+    "upload_organization_branding",
+}
+
+USER_CONTENT_WRITE_TOOLS = {
+    "add_reaction",
+    "edit_message",
+    "move_messages",
+    "remove_reaction",
+    "reply",
+    "resolve_topic",
+    "send_direct_message",
+    "send_message",
+    "upload_file",
+}
+
+CONDITIONAL_USER_CONTENT_WRITE_TOOLS = {"end_session"}
+
+UNGATED_LOCAL_OR_TRANSIENT_TOOLS = {
+    "disable_configuration_writes",
+    "disable_user_content_writes",
+    "download_organization_branding",
+    "enable_configuration_writes",
+    "enable_user_content_writes",
+    "fetch_file",
+    "fetch_image",
+    "listen",
+    "set_context",
+    "stop_typing",
+    "typing",
+}
+
 
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> Mock:
@@ -93,6 +147,40 @@ def test_all_tools_have_audited_safety_annotations() -> None:
         annotation.openWorldHint is False
         for annotation in annotations.values()
     )
+
+
+def test_all_non_read_tools_have_an_audited_write_gate_classification() -> None:
+    tools = asyncio.run(mcp_module.mcp.list_tools())
+    non_read_tools = {
+        tool.name for tool in tools if not tool.annotations.readOnlyHint
+    }
+
+    classifications = [
+        CONFIGURATION_WRITE_TOOLS,
+        USER_CONTENT_WRITE_TOOLS,
+        CONDITIONAL_USER_CONTENT_WRITE_TOOLS,
+        UNGATED_LOCAL_OR_TRANSIENT_TOOLS,
+    ]
+    assert set().union(*classifications) == non_read_tools
+    assert sum(len(group) for group in classifications) == len(non_read_tools)
+
+
+def test_write_gate_actions_have_no_parameters() -> None:
+    tools = {
+        tool.name: tool for tool in asyncio.run(mcp_module.mcp.list_tools())
+    }
+
+    for name in {
+        "enable_configuration_writes",
+        "disable_configuration_writes",
+        "enable_user_content_writes",
+        "disable_user_content_writes",
+    }:
+        assert tools[name].parameters == {
+            "additionalProperties": False,
+            "properties": {},
+            "type": "object",
+        }
 
 
 def test_list_streams_returns_full_typed_channels(client: Mock) -> None:

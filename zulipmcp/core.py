@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from typing import BinaryIO, Callable, Iterator, Optional
+from typing import BinaryIO, Callable, Iterator, Optional, TypeVar
 
 import diskcache
 import requests
@@ -58,6 +58,7 @@ from .configuration import (
 _DEFAULT_TIMEZONE = "America/Los_Angeles"
 _logger = logging.getLogger(__name__)
 _response_status: ContextVar[int | None] = ContextVar("response_status", default=None)
+T = TypeVar("T")
 
 
 def _capture_response_status(response: requests.Response, *args: object, **kwargs: object) -> None:
@@ -1173,39 +1174,59 @@ def get_organization_configuration(
     return aggregate
 
 
-_admin_writes_enabled = False
+_configuration_writes_enabled = False
+_user_content_writes_enabled = False
 
 
-def admin_writes_enabled() -> bool:
-    """Return whether this server process currently permits admin writes."""
-    return _admin_writes_enabled
+def configuration_writes_enabled() -> bool:
+    return _configuration_writes_enabled
 
 
-def set_admin_writes_enabled(enabled: bool) -> None:
-    """Set process-local admin write authorization."""
-    global _admin_writes_enabled
-    _admin_writes_enabled = enabled
+def set_configuration_writes_enabled(enabled: bool) -> None:
+    global _configuration_writes_enabled
+    _configuration_writes_enabled = enabled
 
 
-def administrative_mutation_request(
+def user_content_writes_enabled() -> bool:
+    return _user_content_writes_enabled
+
+
+def set_user_content_writes_enabled(enabled: bool) -> None:
+    global _user_content_writes_enabled
+    _user_content_writes_enabled = enabled
+
+
+def user_content_mutation(action: Callable[[], T]) -> T:
+    if not user_content_writes_enabled():
+        raise ZulipAPIError(APIError(
+            message=(
+                "User content writes are disabled; call "
+                "enable_user_content_writes and confirm the request"
+            ),
+            code="USER_CONTENT_WRITES_DISABLED",
+        ))
+    return action()
+
+
+def configuration_mutation_request(
     url: str,
     method: str,
     request: dict[str, JSONValue] | None = None,
     files: list[BinaryIO] | None = None,
 ) -> dict[str, JSONValue]:
-    if not admin_writes_enabled():
+    if not configuration_writes_enabled():
         raise ZulipAPIError(APIError(
             message=(
-                "Administrative writes are disabled; call "
-                "enable_administrative_writes and confirm the request"
+                "Configuration writes are disabled; call "
+                "enable_configuration_writes and confirm the request"
             ),
-            code="ADMIN_WRITES_DISABLED",
+            code="CONFIGURATION_WRITES_DISABLED",
         ))
     return configuration_request(url, method=method, request=request, files=files)
 
 
 def _mutation_status(error: ZulipAPIError) -> MutationStatus:
-    if error.error.code == "ADMIN_WRITES_DISABLED":
+    if error.error.code == "CONFIGURATION_WRITES_DISABLED":
         return MutationStatus.DISABLED
     section = _failed_section(error)
     if section.status == SectionStatus.FORBIDDEN:
@@ -1679,7 +1700,7 @@ def update_organization_configuration(
         )
 
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             endpoint, method="PATCH", request=request,
         )
     except ZulipAPIError as exc:
@@ -1815,7 +1836,7 @@ def update_default_user_settings(
             warnings=warnings + ["All requested fields already had the desired values"],
         )
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             endpoint, method="PATCH", request=request,
         )
     except ZulipAPIError as exc:
@@ -2097,7 +2118,7 @@ def upload_organization_branding(
         )
     try:
         with path.open("rb") as upload:
-            response = administrative_mutation_request(
+            response = configuration_mutation_request(
                 endpoint, "POST", request=request, files=[upload],
             )
     except (OSError, ZulipAPIError) as exc:
@@ -2320,7 +2341,7 @@ def update_bot_configuration(
             resolved_mappings=mappings,
         )
     try:
-        response = administrative_mutation_request(endpoint, "PATCH", request)
+        response = configuration_mutation_request(endpoint, "PATCH", request)
     except ZulipAPIError as exc:
         result = _mutation_failure(endpoint, False, exc)
         result.current, result.desired, result.request = current, desired, request
@@ -2401,7 +2422,7 @@ def set_bot_channel_subscriptions(
     completed_removals: list[str] = []
     try:
         if additions:
-            administrative_mutation_request(
+            configuration_mutation_request(
                 endpoint, "POST", {
                     "subscriptions": [{"name": name} for name in additions],
                     "principals": [bot_id],
@@ -2410,7 +2431,7 @@ def set_bot_channel_subscriptions(
             )
             completed_additions = additions
         if removals:
-            administrative_mutation_request(
+            configuration_mutation_request(
                 endpoint, "DELETE", {
                     "subscriptions": removals, "principals": [bot_id],
                 },
@@ -2600,12 +2621,12 @@ def create_bot(
         )
     try:
         if avatar is None:
-            response = administrative_mutation_request(endpoint, "POST", request)
+            response = configuration_mutation_request(endpoint, "POST", request)
         else:
             avatar_file = avatar[0]
             wire_request = {key: value for key, value in request.items() if key != "avatar"}
             with avatar_file.open("rb") as upload:
-                response = administrative_mutation_request(
+                response = configuration_mutation_request(
                     endpoint, "POST", wire_request, files=[upload],
                 )
         response.pop("api_key", None)
@@ -2630,7 +2651,7 @@ def create_bot(
     warnings: list[str] = []
     if isinstance(principal, dict) and principal.get("user_id") != owner_item.get("user_id"):
         try:
-            administrative_mutation_request(
+            configuration_mutation_request(
                 f"/bots/{bot_id}", "PATCH", {"bot_owner_id": owner_item["user_id"]},
             )
         except ZulipAPIError as exc:
@@ -2934,7 +2955,7 @@ def set_channel_archived(
             warnings=warnings,
         )
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             resolved_endpoint, method=method, request=request,
         )
     except ZulipAPIError as exc:
@@ -3270,7 +3291,7 @@ def create_channel(
     was_existing = existing is not None
     if readback is None:
         try:
-            create_response = administrative_mutation_request(
+            create_response = configuration_mutation_request(
                 endpoint, method="POST", request=request,
             )
         except ZulipAPIError as exc:
@@ -3431,7 +3452,7 @@ def create_channel(
 
     if missing_subscriber_ids:
         try:
-            subscribe_response = administrative_mutation_request(
+            subscribe_response = configuration_mutation_request(
                 "/users/me/subscriptions", method="POST",
                 request=subscribe_request,
             )
@@ -3469,7 +3490,7 @@ def create_channel(
 
     if update_request:
         try:
-            update_response = administrative_mutation_request(
+            update_response = configuration_mutation_request(
                 resolved_endpoint, method="PATCH", request=update_request,
             )
         except ZulipAPIError as exc:
@@ -3800,7 +3821,7 @@ def update_channel_configuration(
             warnings=["Channel already had the desired configuration"],
         )
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             resolved_endpoint, method="PATCH", request=request,
         )
     except ZulipAPIError as exc:
@@ -3951,7 +3972,7 @@ def subscribe_users_to_channel(
             warnings=["All selected users were already subscribed"],
         )
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             endpoint, method="POST", request=request,
         )
     except ZulipAPIError as exc:
@@ -4130,7 +4151,7 @@ def unsubscribe_users_from_channel(
             warnings=["None of the selected users were subscribed"],
         )
     try:
-        response = administrative_mutation_request(endpoint, "DELETE", request)
+        response = configuration_mutation_request(endpoint, "DELETE", request)
     except ZulipAPIError as exc:
         result = _mutation_failure(endpoint, False, exc)
         result.current = {"subscriber_ids": sorted(current_ids)}
@@ -4244,14 +4265,14 @@ def set_channel_members(
     completed_removals: list[int] = []
     try:
         if add_ids:
-            administrative_mutation_request(endpoint, "POST", {
+            configuration_mutation_request(endpoint, "POST", {
                 "subscriptions": [{"name": current_channel.get("name")}],
                 "principals": add_ids,
                 "authorization_errors_fatal": True,
             })
             completed_additions = add_ids
         if remove_ids:
-            administrative_mutation_request(endpoint, "DELETE", {
+            configuration_mutation_request(endpoint, "DELETE", {
                 "subscriptions": [current_channel.get("name")],
                 "principals": remove_ids,
             })
@@ -4504,7 +4525,7 @@ def create_user_group(
             resolved_mappings=mappings,
         )
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             endpoint, method="POST", request=request,
         )
     except ZulipAPIError as exc:
@@ -4701,7 +4722,7 @@ def update_user_group(
             warnings=["User group already had the desired configuration"],
         )
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             resolved_endpoint, method="PATCH", request=request,
         )
     except ZulipAPIError as exc:
@@ -4910,7 +4931,7 @@ def set_user_group_members(
             warnings=["User group already had the desired direct membership"],
         )
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             resolved_endpoint, method="POST", request=request,
         )
     except ZulipAPIError as exc:
@@ -5137,7 +5158,7 @@ def create_custom_profile_field(
             resolved_mappings=mappings,
         )
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             endpoint, method="POST", request=desired,
         )
     except ZulipAPIError as exc:
@@ -5328,7 +5349,7 @@ def update_custom_profile_field(
             warnings=["Profile field already had the desired configuration"],
         )
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             resolved_endpoint, method="PATCH", request=request,
         )
     except ZulipAPIError as exc:
@@ -5485,7 +5506,7 @@ def add_allowed_domain(
             resolved_mappings=mappings,
         )
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             endpoint, method="POST", request=desired,
         )
     except ZulipAPIError as exc:
@@ -5608,7 +5629,7 @@ def update_allowed_domain(
             warnings=["Allowed domain already had the desired configuration"],
         )
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             resolved_endpoint, method="PATCH", request=request,
         )
     except ZulipAPIError as exc:
@@ -5769,7 +5790,7 @@ def create_linkifier(
             resolved_mappings=mappings,
         )
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             endpoint, method="POST", request=desired,
         )
     except ZulipAPIError as exc:
@@ -5965,7 +5986,7 @@ def update_linkifier(
             warnings=["Linkifier already had the desired configuration"],
         )
     try:
-        response = administrative_mutation_request(
+        response = configuration_mutation_request(
             resolved_endpoint, method="PATCH", request=request,
         )
     except ZulipAPIError as exc:
@@ -6544,12 +6565,15 @@ def send_message(stream: str, topic: str, content: str) -> dict:
     err = _stream_write_error(stream)
     if err:
         return err
-    return get_client().send_message({
-        "type": "stream",
-        "to": stream,
-        "subject": topic,
-        "content": normalize_zulip_markdown(content),
-    })
+    normalized_content = normalize_zulip_markdown(content)
+    return user_content_mutation(
+        lambda: get_client().send_message({
+            "type": "stream",
+            "to": stream,
+            "subject": topic,
+            "content": normalized_content,
+        }),
+    )
 
 
 def send_direct_message(recipients: list[str], content: str) -> dict:
@@ -6562,19 +6586,41 @@ def send_direct_message(recipients: list[str], content: str) -> dict:
     Returns:
         API result dict with 'id' on success.
     """
-    return get_client().send_message({
-        "type": "direct",
-        "to": recipients,
-        "content": normalize_zulip_markdown(content),
+    normalized_content = normalize_zulip_markdown(content)
+    return user_content_mutation(
+        lambda: get_client().send_message({
+            "type": "direct",
+            "to": recipients,
+            "content": normalized_content,
+        }),
+    )
+
+
+def _add_reaction(message_id: int, emoji_name: str) -> dict:
+    return get_client().add_reaction({
+        "message_id": message_id,
+        "emoji_name": emoji_name,
     })
 
 
 def add_reaction(message_id: int, emoji_name: str) -> dict:
     """Add emoji reaction to a message. Returns API result dict."""
-    return get_client().add_reaction({
+    return user_content_mutation(lambda: _add_reaction(message_id, emoji_name))
+
+
+def add_transient_reaction(message_id: int, emoji_name: str) -> dict:
+    return _add_reaction(message_id, emoji_name)
+
+
+def _remove_reaction(message_id: int, emoji_name: str,
+                     reaction_type: Optional[str] = None) -> dict:
+    params: dict = {
         "message_id": message_id,
         "emoji_name": emoji_name,
-    })
+    }
+    if reaction_type is not None:
+        params["reaction_type"] = reaction_type
+    return get_client().remove_reaction(params)
 
 
 def remove_reaction(message_id: int, emoji_name: str,
@@ -6586,13 +6632,14 @@ def remove_reaction(message_id: int, emoji_name: str,
     to ``"unicode_emoji"`` when omitted, so custom-emoji removals fail
     without it.
     """
-    params: dict = {
-        "message_id": message_id,
-        "emoji_name": emoji_name,
-    }
-    if reaction_type is not None:
-        params["reaction_type"] = reaction_type
-    return get_client().remove_reaction(params)
+    return user_content_mutation(
+        lambda: _remove_reaction(message_id, emoji_name, reaction_type),
+    )
+
+
+def remove_transient_reaction(message_id: int, emoji_name: str,
+                              reaction_type: Optional[str] = None) -> dict:
+    return _remove_reaction(message_id, emoji_name, reaction_type)
 
 
 def edit_message(message_id: int, content: str) -> dict:
@@ -6600,10 +6647,13 @@ def edit_message(message_id: int, content: str) -> dict:
     _, err = _get_stream_message_for_write(message_id)
     if err:
         return err
-    return get_client().update_message({
-        "message_id": message_id,
-        "content": normalize_zulip_markdown(content),
-    })
+    normalized_content = normalize_zulip_markdown(content)
+    return user_content_mutation(
+        lambda: get_client().update_message({
+            "message_id": message_id,
+            "content": normalized_content,
+        }),
+    )
 
 
 def move_messages(message_id: int, topic: str, stream: Optional[str] = None,
@@ -6643,7 +6693,7 @@ def move_messages(message_id: int, topic: str, stream: Optional[str] = None,
         if result["result"] != "success":
             return result
         request["stream_id"] = result["stream_id"]
-    return get_client().update_message(request)
+    return user_content_mutation(lambda: get_client().update_message(request))
 
 
 _stream_id_cache: dict[str, int] = {}
@@ -7059,7 +7109,7 @@ def upload_file(file_path: str) -> tuple[str, str]:
 
     client = get_client()
     with open(path, "rb") as f:
-        result = client.upload_file(f)
+        result = user_content_mutation(lambda: client.upload_file(f))
 
     if result.get("result") != "success":
         raise ValueError(f"Upload failed: {result.get('msg', 'Unknown error')}")
@@ -7091,6 +7141,8 @@ def ensure_subscribed(stream: str) -> bool:
         return True
     # Private streams can't be joined — must be invited
     if is_stream_private(stream):
+        return False
+    if not configuration_writes_enabled():
         return False
     # Try to subscribe (works for public streams)
     result = get_client().add_subscriptions(

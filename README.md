@@ -46,28 +46,45 @@ allowed domains, linkifiers, emoji, invitations, and an aggregate
 organization snapshot. Structured results preserve nested values and
 distinguish empty, forbidden, unsupported, partial, and failed reads.
 
-Administrative writes start disabled. To use a write tool, first call
-`enable_administrative_writes` and approve that tool call in the MCP
-client. Authorization lasts until it is revoked with
-`disable_administrative_writes` or the server process restarts. The
-client's approval policy is the confirmation boundary for enabling
-writes.
+Configuration writes and user-content writes have independent
+gates. Both start disabled. Call `enable_configuration_writes`
+before changing organization settings or structure, and call
+`enable_user_content_writes` before changing messages, topics,
+reactions, or uploads. Enabling one does not enable the other.
+For organization setup, leave user-content writes disabled while
+enabling configuration writes.
 
-Codex can prompt for the gate while pre-approving tools protected by
-it. This avoids redundant prompts without changing the policy for
-ordinary messaging tools. Configure every protected administrative
-tool this way for each realm-specific server:
+Authorization lasts until the matching disable action is called or
+the server process restarts. The MCP client's approval of either
+enable action is the confirmation boundary; the actions take no
+arguments and do not display a second Boolean prompt.
+
+Codex can prompt only for the enable actions while approving
+subsequent tool calls. Configure each realm-specific server like
+this:
 
 ```toml
 [mcp_servers.zulip-admin]
-default_tools_approval_mode = "writes"
+default_tools_approval_mode = "approve"
 
-[mcp_servers.zulip-admin.tools.enable_administrative_writes]
+[mcp_servers.zulip-admin.tools.enable_configuration_writes]
 approval_mode = "prompt"
 
-[mcp_servers.zulip-admin.tools.create_channel]
+[mcp_servers.zulip-admin.tools.enable_user_content_writes]
+approval_mode = "prompt"
+
+[mcp_servers.zulip-admin.tools.disable_configuration_writes]
+approval_mode = "approve"
+
+[mcp_servers.zulip-admin.tools.disable_user_content_writes]
 approval_mode = "approve"
 ```
+
+Typing indicators and `listen` are ungated transient operations.
+`listen` may add and remove its temporary indicator reaction without
+opening the user-content gate. If listening would require the bot to
+subscribe to a public channel, that configuration change requires the
+configuration gate; listening in an existing subscription does not.
 
 ```json
 {
@@ -83,19 +100,19 @@ approval_mode = "approve"
 }
 ```
 
-Run a separate MCP server for each realm. Every write also requires
-the destination realm URL as an argument and verifies it against
-`GET /server_settings` before changing anything. Numeric user, group,
-and channel IDs are not accepted as cross-realm references; use names
-or email addresses and inspect the returned ID mappings.
+Run a separate MCP server for each realm. Every configuration write
+also requires the destination realm URL as an argument and verifies
+it against `GET /server_settings` before changing anything. Numeric
+user, group, and channel IDs are not accepted as cross-realm
+references; use names or email addresses and inspect the returned ID
+mappings.
 
 Write tools cover organization settings, new-user defaults, channels,
 subscriptions, user groups and membership, custom profile fields,
 allowed domains, and linkifiers. They support `dry_run`, read current
 state first, avoid duplicate creates by semantic name, and read back
 successful mutations. Allowed-domain changes require an organization
-owner. No deletion, unsubscription, or blind realm-clone tool is
-provided.
+owner. No irreversible deletion or blind realm-clone tool is provided.
 
 Branding tools can audit, download, and upload the organization icon
 and light and dark logos. Downloads are written to new private local

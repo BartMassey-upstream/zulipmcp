@@ -45,7 +45,7 @@ def impact(*, referenced: bool = False) -> tuple[dict[str, object], list[str]]:
 
 @pytest.fixture(autouse=True)
 def setup(monkeypatch: pytest.MonkeyPatch) -> None:
-    core.set_admin_writes_enabled(True)
+    core.set_configuration_writes_enabled(True)
     monkeypatch.setattr(
         core, "_admin_destination",
         lambda endpoint, realm_url, dry_run: (
@@ -56,7 +56,7 @@ def setup(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(core, "_channel_impact", lambda item: impact())
     yield
-    core.set_admin_writes_enabled(False)
+    core.set_configuration_writes_enabled(False)
 
 
 def test_archive_dry_run_resolves_archived_inventory_and_retains_messages(
@@ -64,7 +64,7 @@ def test_archive_dry_run_resolves_archived_inventory_and_retains_messages(
 ) -> None:
     monkeypatch.setattr(core, "_channel_inventory", lambda: [channel()])
     mutation = Mock()
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
 
     result = mcp_module.set_channel_archived(
         REALM_URL, "temporary test", True, expected_archived=False, dry_run=True,
@@ -138,7 +138,7 @@ def test_archive_uses_delete_and_confirms_readback(monkeypatch: pytest.MonkeyPat
         Mock(side_effect=[[channel()], [channel(archived=True)]]),
     )
     mutation = Mock(return_value={})
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
 
     result = mcp_module.set_channel_archived(
         REALM_URL, "temporary test", True,
@@ -152,7 +152,7 @@ def test_archive_uses_delete_and_confirms_readback(monkeypatch: pytest.MonkeyPat
 def test_already_archived_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(core, "_channel_inventory", lambda: [channel(archived=True)])
     mutation = Mock()
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
 
     result = mcp_module.set_channel_archived(
         REALM_URL, "temporary test", True,
@@ -169,7 +169,7 @@ def test_unarchive_uses_patch_and_confirms_readback(monkeypatch: pytest.MonkeyPa
         Mock(side_effect=[[channel(archived=True)], [channel()]]),
     )
     mutation = Mock(return_value={})
-    monkeypatch.setattr(core, "administrative_mutation_request", mutation)
+    monkeypatch.setattr(core, "configuration_mutation_request", mutation)
 
     result = mcp_module.set_channel_archived(
         REALM_URL, "temporary test", False, expected_archived=True,
@@ -185,7 +185,7 @@ def test_mismatched_archive_readback_is_partial(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(
         core, "_channel_inventory", Mock(side_effect=[[channel()], [channel()]]),
     )
-    monkeypatch.setattr(core, "administrative_mutation_request", Mock(return_value={}))
+    monkeypatch.setattr(core, "configuration_mutation_request", Mock(return_value={}))
 
     result = mcp_module.set_channel_archived(
         REALM_URL, "temporary test", True,
