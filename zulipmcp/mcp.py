@@ -1040,6 +1040,15 @@ def get_invitations() -> ToolResult:
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+def get_moderation_configuration() -> ToolResult:
+    """Audit reporting destinations and realm/channel deletion policy."""
+    return configuration_tool_result(
+        "Moderation configuration",
+        read_section(zulip_core.get_moderation_configuration),
+    )
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_organization_configuration(
     sections: list[str] | None = None,
     include_deactivated: bool = False,
@@ -2067,6 +2076,50 @@ def verify_message(message_id: int) -> str:
         if stream and not zulip_core.is_private_stream_allowed(stream):
             return PRIVATE_STREAM_ERROR
     return zulip_core.verify_message(message_id)
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def delete_message_for_moderation(
+    realm_url: str,
+    message_id: int,
+    expected_sender: str,
+    expected_timestamp: int,
+    expected_content_sha256: str,
+    expected_channel: str | None,
+    expected_topic: str | None,
+    confirmation: str = "",
+    dry_run: bool = False,
+) -> ToolResult:
+    """Permanently delete one exactly verified message with confirmation."""
+    return mutation_tool_result(
+        "Moderation message deletion",
+        zulip_core.delete_message_for_moderation(
+            realm_url, message_id, expected_sender, expected_timestamp,
+            expected_content_sha256, expected_channel, expected_topic,
+            confirmation, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=EXTERNAL_WRITE_TOOL_ANNOTATIONS)
+def report_message(
+    realm_url: str,
+    message_id: int,
+    report_type: str,
+    description: str,
+    expected_sender: str,
+    expected_content_sha256: str,
+    confirmation: str = "",
+    dry_run: bool = False,
+) -> ToolResult:
+    """Report one verified message to the configured moderation channel."""
+    return mutation_tool_result(
+        "Message report",
+        zulip_core.report_message(
+            realm_url, message_id, report_type, description,
+            expected_sender, expected_content_sha256, confirmation, dry_run,
+        ),
+    )
 
 
 # ============================================================================

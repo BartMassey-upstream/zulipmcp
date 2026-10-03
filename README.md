@@ -191,6 +191,15 @@ the complete subscriber list first, applies additions before removals,
 and protects an authenticated administrator from being removed from a
 private channel when that would compromise recovery.
 
+Moderation tools can report one verified message or permanently delete
+one message. Both pin the destination realm, compare current sender and
+content metadata, show a dry-run impact preview, and require an exact
+per-message confirmation phrase. Deletion also verifies that the
+message is no longer accessible. There is no bulk-delete tool or claim
+that deletion is reversible. Zulip does not expose a dedicated report
+queue or report-resolution API, so those workflow steps remain an
+explicit capability gap.
+
 `create_channel` accepts the public `is_default` option and translates
 it to Zulip's `is_default_stream` request field. The older
 `settings.is_default_stream` form remains supported; contradictory

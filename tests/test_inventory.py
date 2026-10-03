@@ -23,6 +23,7 @@ READ_ONLY_TOOLS = {
     "get_linkifiers",
     "get_message_by_id",
     "get_message_link",
+    "get_moderation_configuration",
     "get_messages",
     "get_organization_branding",
     "get_organization_configuration",
@@ -45,6 +46,7 @@ DESTRUCTIVE_TOOLS = {
     "create_channel",
     "deactivate_custom_emoji",
     "delete_custom_profile_field",
+    "delete_message_for_moderation",
     "edit_message",
     "end_session",
     "move_messages",
@@ -129,9 +131,11 @@ CONFIGURATION_WRITE_TOOLS = {
 
 USER_CONTENT_WRITE_TOOLS = {
     "add_reaction",
+    "delete_message_for_moderation",
     "edit_message",
     "move_messages",
     "remove_reaction",
+    "report_message",
     "reply",
     "resolve_topic",
     "send_direct_message",
@@ -157,6 +161,7 @@ UNGATED_LOCAL_OR_TRANSIENT_TOOLS = {
 
 OPEN_WORLD_TOOLS = {
     "invite_users",
+    "report_message",
     "resend_email_invitation",
 }
 

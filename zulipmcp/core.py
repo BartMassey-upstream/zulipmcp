@@ -1109,6 +1109,114 @@ def get_bots_audit(include_deactivated: bool = False) -> SectionResult:
     return result
 
 
+_LEGACY_REPORT_TYPES = frozenset({
+    "harassment", "inappropriate", "norms", "other", "spam",
+})
+
+
+def _supported_report_types(
+    feature_level: JSONValue, realm_snapshot: dict[str, JSONValue],
+) -> set[str]:
+    if isinstance(feature_level, int) and not isinstance(feature_level, bool):
+        if 382 <= feature_level < 435:
+            return set(_LEGACY_REPORT_TYPES)
+    supported_raw = realm_snapshot.get("server_report_message_types")
+    if not isinstance(supported_raw, list):
+        return set()
+    return {
+        str(item["key"])
+        for item in supported_raw
+        if isinstance(item, dict) and isinstance(item.get("key"), str)
+    }
+
+
+def get_moderation_configuration() -> dict[str, JSONValue]:
+    server = get_server_settings()
+    principal = get_current_user()
+    groups_response = get_user_groups_configuration()
+    group_items = groups_response.get("user_groups")
+    group_names = {
+        item["id"]: item["name"]
+        for item in group_items if isinstance(group_items, list) and isinstance(item, dict)
+        and isinstance(item.get("id"), int) and not isinstance(item.get("id"), bool)
+        and isinstance(item.get("name"), str)
+    } if isinstance(group_items, list) else {}
+    streams_response = get_streams_configuration(
+        include_all=True, include_default=True, exclude_archived=False,
+    )
+    annotated = annotate_channel_configuration(streams_response, group_names)
+    streams = annotated.get("streams")
+    if not isinstance(streams, list):
+        raise ZulipAPIError(APIError(
+            message="Channel inventory was absent or null", code="INVALID_RESPONSE",
+        ))
+    queue_snapshot = None
+    with configuration_queue_snapshot() as queue_snapshot:
+        realm = queue_snapshot.data
+    moderation_channel_id = realm.get("realm_moderation_request_channel_id")
+    destination = next(
+        (
+            {
+                key: stream[key]
+                for key in ("stream_id", "name", "is_archived") if key in stream
+            }
+            for stream in streams
+            if isinstance(stream, dict)
+            and stream.get("stream_id") == moderation_channel_id
+        ),
+        None,
+    )
+    permission_keys = {
+        "realm_can_delete_any_message_group",
+        "realm_can_delete_own_message_group",
+    }
+    policy_keys = {
+        "realm_message_content_delete_limit_seconds",
+        "realm_moderation_request_channel_id",
+    }
+    realm_policy = {
+        key.removeprefix("realm_"): realm[key]
+        for key in sorted(permission_keys | policy_keys) if key in realm
+    }
+    channel_policies = []
+    for stream in streams:
+        if not isinstance(stream, dict):
+            continue
+        channel_policies.append({
+            key: stream[key]
+            for key in (
+                "stream_id", "name", "is_archived",
+                "can_delete_any_message_group", "can_delete_own_message_group",
+                "resolved_group_settings",
+            ) if key in stream
+        })
+    feature_level = server.get("zulip_feature_level")
+    report_types = _supported_report_types(feature_level, realm)
+    return {
+        "zulip_feature_level": feature_level,
+        "principal": {
+            key: principal[key]
+            for key in CURRENT_USER_FIELDS if key in principal
+        },
+        "reporting": {
+            "supported": isinstance(feature_level, int) and feature_level >= 382,
+            "report_types": sorted(report_types),
+            "moderation_destination": destination,
+            "configured_destination_id": moderation_channel_id,
+        },
+        "realm_policy": realm_policy,
+        "resolved_realm_permission_groups": resolve_permission_groups(
+            {key: realm[key] for key in permission_keys if key in realm}, group_names,
+        ),
+        "channel_policies": channel_policies,
+        "known_gaps": [
+            "No dedicated public report-queue list endpoint",
+            "No dedicated public report-resolution endpoint",
+        ],
+        "warnings": queue_snapshot.warnings,
+    }
+
+
 def get_organization_configuration(
     sections: list[str] | None = None,
     include_deactivated: bool = False,
@@ -1278,7 +1386,9 @@ def configuration_mutation_request(
 
 
 def _mutation_status(error: ZulipAPIError) -> MutationStatus:
-    if error.error.code == "CONFIGURATION_WRITES_DISABLED":
+    if error.error.code in {
+        "CONFIGURATION_WRITES_DISABLED", "USER_CONTENT_WRITES_DISABLED",
+    }:
         return MutationStatus.DISABLED
     section = _failed_section(error)
     if section.status == SectionStatus.FORBIDDEN:
@@ -1946,18 +2056,18 @@ def update_default_user_settings(
     )
 
 
-def _admin_destination(
+def _realm_destination(
     endpoint: str, realm_url: str, dry_run: bool,
-) -> tuple[dict[str, JSONValue] | None, dict[str, JSONValue] | None, MutationResult | None]:
+) -> tuple[dict[str, JSONValue] | None, MutationResult | None]:
     try:
         settings = get_server_settings()
     except ZulipAPIError as exc:
-        return None, None, _mutation_failure(endpoint, dry_run, exc)
+        return None, _mutation_failure(endpoint, dry_run, exc)
     actual_url = settings.get("realm_url")
     if not isinstance(actual_url, str):
         actual_url = settings.get("realm_uri")
     if not isinstance(actual_url, str):
-        return None, None, MutationResult(
+        return None, MutationResult(
             status=MutationStatus.UNSUPPORTED,
             endpoint=endpoint,
             dry_run=dry_run,
@@ -1967,7 +2077,7 @@ def _admin_destination(
             ),
         )
     if actual_url.rstrip("/") != realm_url.rstrip("/"):
-        return None, None, MutationResult(
+        return None, MutationResult(
             status=MutationStatus.CONFLICT,
             endpoint=endpoint,
             dry_run=dry_run,
@@ -1978,6 +2088,15 @@ def _admin_destination(
                 code="DESTINATION_REALM_MISMATCH",
             ),
         )
+    return settings, None
+
+
+def _admin_destination(
+    endpoint: str, realm_url: str, dry_run: bool,
+) -> tuple[dict[str, JSONValue] | None, dict[str, JSONValue] | None, MutationResult | None]:
+    settings, failure = _realm_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return None, None, failure
     principal, failure = _write_principal(endpoint, dry_run)
     return settings, principal, failure
 
@@ -9932,6 +10051,400 @@ def get_message_by_id(message_id: int) -> Optional[dict]:
         if stream and not is_private_stream_allowed(stream):
             return None
     return msg
+
+
+def _moderation_message_state(message: dict[str, JSONValue]) -> dict[str, JSONValue]:
+    content = message.get("content")
+    raw_content = content if isinstance(content, str) else ""
+    state: dict[str, JSONValue] = {
+        "message_id": message.get("id"),
+        "sender_email": message.get("sender_email"),
+        "sender_full_name": message.get("sender_full_name"),
+        "sender_id": message.get("sender_id"),
+        "timestamp": message.get("timestamp"),
+        "message_type": message.get("type"),
+        "content_sha256": hashlib.sha256(raw_content.encode()).hexdigest(),
+        "content_preview": sanitize_text(raw_content[:160]),
+        "content_length": len(raw_content),
+    }
+    if message.get("type") == "stream":
+        state["channel"] = message.get("display_recipient")
+        state["topic"] = message.get("subject")
+    else:
+        state["channel"] = None
+        state["topic"] = None
+    return state
+
+
+def _get_moderation_message(message_id: int) -> dict[str, JSONValue] | None:
+    client = get_client()
+    request: dict[str, JSONValue] = {
+            "anchor": message_id,
+            "num_before": 0,
+            "num_after": 0,
+            "include_anchor": True,
+            "apply_markdown": False,
+    }
+    try:
+        response = client.call_endpoint(
+            url="/messages", method="GET", request=request,
+        )
+    except (requests.RequestException, OSError, zulip.UnrecoverableNetworkError) as exc:
+        key = getattr(client, "api_key", None)
+        secrets = [key] if isinstance(key, str) else []
+        raise ZulipAPIError(APIError(
+            message=sanitize_text(str(exc), secrets), code="TRANSPORT_ERROR",
+        )) from None
+    if not isinstance(response, dict):
+        raise ZulipAPIError(APIError(
+            message="Zulip API returned a non-object response", code="INVALID_RESPONSE",
+        ))
+    if response.get("result") != "success":
+        error = APIError.from_response(response)
+        key = getattr(client, "api_key", None)
+        secrets = [key] if isinstance(key, str) else []
+        raise ZulipAPIError(APIError(
+            message=sanitize_text(error.message, secrets),
+            code=error.code,
+            http_status=error.http_status,
+        ), redact_secrets(response, secrets))
+    messages = response.get("messages")
+    if not isinstance(messages, list):
+        raise ZulipAPIError(APIError(
+            message="Message readback omitted messages", code="INVALID_RESPONSE",
+        ))
+    exact = [
+        item for item in messages
+        if isinstance(item, dict) and item.get("id") == message_id
+    ]
+    if len(exact) > 1:
+        raise ZulipAPIError(APIError(
+            message="Message readback returned duplicate IDs", code="INVALID_RESPONSE",
+        ))
+    if not exact:
+        return None
+    message = exact[0]
+    if message.get("type") == "stream":
+        stream = message.get("display_recipient")
+        if isinstance(stream, str) and not is_private_stream_allowed(stream):
+            return None
+    return message
+
+
+def _message_expected_mismatches(
+    state: dict[str, JSONValue],
+    expected_sender: str,
+    expected_timestamp: int,
+    expected_content_sha256: str,
+    expected_channel: str | None,
+    expected_topic: str | None,
+) -> list[str]:
+    expected = {
+        "sender_email": expected_sender,
+        "timestamp": expected_timestamp,
+        "content_sha256": expected_content_sha256.casefold(),
+        "channel": expected_channel,
+        "topic": expected_topic,
+    }
+    return sorted(
+        key for key, value in expected.items() if state.get(key) != value
+    )
+
+
+def delete_message_for_moderation(
+    realm_url: str,
+    message_id: int,
+    expected_sender: str,
+    expected_timestamp: int,
+    expected_content_sha256: str,
+    expected_channel: str | None,
+    expected_topic: str | None,
+    confirmation: str = "",
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = f"/messages/{message_id}"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    if (
+        not isinstance(message_id, int)
+        or isinstance(message_id, bool)
+        or message_id <= 0
+    ):
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(message="message_id must be a positive integer", code="INVALID_MESSAGE_ID"),
+        )
+    if re.fullmatch(r"[0-9a-fA-F]{64}", expected_content_sha256) is None:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="expected_content_sha256 must be a 64-digit hexadecimal digest",
+                code="INVALID_CONTENT_DIGEST",
+            ),
+        )
+    try:
+        message = _get_moderation_message(message_id)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    if not isinstance(message, dict):
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="Message was not found or is not accessible",
+                code="MESSAGE_NOT_FOUND",
+            ),
+        )
+    state = _moderation_message_state(message)
+    source_channel = state.get("channel")
+    if isinstance(source_channel, str):
+        write_error = _stream_write_error(source_channel)
+        if write_error is not None:
+            return MutationResult(
+                MutationStatus.FORBIDDEN, endpoint, dry_run=dry_run,
+                current=state, desired={"deleted": True},
+                error=APIError(
+                    message=str(write_error.get("msg", "Channel write denied")),
+                    code="CHANNEL_WRITE_DENIED",
+                ),
+            )
+    mismatches = _message_expected_mismatches(
+        state, expected_sender, expected_timestamp, expected_content_sha256,
+        expected_channel, expected_topic,
+    )
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "message": {"semantic": message_id, "resolved": message.get("id")},
+    }
+    desired: dict[str, JSONValue] = {"deleted": True}
+    warnings = [
+        "Message deletion is permanent and has no inverse operation",
+        "The Zulip server remains authoritative for deletion permission and age policy",
+    ]
+    if mismatches:
+        result = _conflict_result(
+            endpoint, dry_run, state, desired, mismatches, warnings,
+        )
+        result.resolved_mappings = mappings
+        return result
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, endpoint, dry_run=True,
+            current=state, desired=desired, request={},
+            changed_fields=["deleted"], resolved_mappings=mappings,
+            warnings=warnings + [f"Live deletion requires confirmation: DELETE MESSAGE {message_id}"],
+        )
+    required_confirmation = f"DELETE MESSAGE {message_id}"
+    if confirmation != required_confirmation:
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=False,
+            current=state, desired=desired, resolved_mappings=mappings,
+            warnings=warnings,
+            error=APIError(
+                message=f"confirmation must exactly equal {required_confirmation!r}",
+                code="CONFIRMATION_REQUIRED",
+            ),
+        )
+    try:
+        response = user_content_mutation(
+            lambda: configuration_request(endpoint, "DELETE", request={}),
+        )
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, False, exc)
+        result.current = state
+        result.desired = desired
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    try:
+        readback = _get_moderation_message(message_id)
+    except ZulipAPIError as exc:
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=False,
+            current=state, desired=desired, response=response,
+            changed_fields=["deleted"], resolved_mappings=mappings,
+            warnings=warnings,
+            error=exc.error,
+        )
+    confirmed = readback is None
+    return MutationResult(
+        MutationStatus.OK if confirmed else MutationStatus.PARTIAL,
+        endpoint,
+        dry_run=False,
+        current=state,
+        desired=desired,
+        response=response,
+        readback=None if readback is None else _moderation_message_state(readback),
+        changed_fields=["deleted"],
+        resolved_mappings=mappings,
+        warnings=warnings + (
+            [] if confirmed else ["Deleted message remained accessible after deletion"]
+        ),
+    )
+
+
+def report_message(
+    realm_url: str,
+    message_id: int,
+    report_type: str,
+    description: str,
+    expected_sender: str,
+    expected_content_sha256: str,
+    confirmation: str = "",
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = f"/messages/{message_id}/report"
+    server, failure = _realm_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    feature_level = server.get("zulip_feature_level")
+    if not isinstance(feature_level, int) or feature_level < 382:
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="Message reporting requires Zulip feature level 382",
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    try:
+        report_snapshot = None
+        with configuration_queue_snapshot() as report_snapshot:
+            report_realm = report_snapshot.data
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    moderation_channel_id = report_realm.get(
+        "realm_moderation_request_channel_id"
+    )
+    if not isinstance(moderation_channel_id, int) or isinstance(
+        moderation_channel_id, bool
+    ) or moderation_channel_id <= 0:
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="Organization has no moderation request channel configured",
+                code="MODERATION_DESTINATION_UNCONFIGURED",
+            ),
+        )
+    supported = _supported_report_types(feature_level, report_realm)
+    if not supported:
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            unsupported_fields=["server_report_message_types"],
+            error=APIError(
+                message="Server did not advertise supported message report types",
+                code="UNSUPPORTED_FIELD",
+            ),
+        )
+    if report_type not in supported:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            current={"supported_report_types": sorted(supported)},
+            desired={"report_type": report_type},
+            error=APIError(message="Unsupported report_type", code="INVALID_REPORT_TYPE"),
+        )
+    if report_type == "other" and not description.strip():
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="description is required for report_type 'other'",
+                code="DESCRIPTION_REQUIRED",
+            ),
+        )
+    if len(description) > 1000:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="description must not exceed 1000 code points",
+                code="DESCRIPTION_TOO_LONG",
+            ),
+        )
+    if re.fullmatch(r"[0-9a-fA-F]{64}", expected_content_sha256) is None:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="expected_content_sha256 must be a 64-digit hexadecimal digest",
+                code="INVALID_CONTENT_DIGEST",
+            ),
+        )
+    try:
+        message = _get_moderation_message(message_id)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    if not isinstance(message, dict):
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="Message was not found or is not accessible",
+                code="MESSAGE_NOT_FOUND",
+            ),
+        )
+    state = _moderation_message_state(message)
+    mismatches = sorted(
+        key for key, value in {
+            "sender_email": expected_sender,
+            "content_sha256": expected_content_sha256.casefold(),
+        }.items() if state.get(key) != value
+    )
+    desired: dict[str, JSONValue] = {
+        "reported": True, "report_type": report_type,
+        "description": description,
+    }
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "message": {"semantic": message_id, "resolved": message.get("id")},
+    }
+    warnings = [
+        "Reporting sends a visible notification to the configured moderation channel",
+        "Zulip exposes no dedicated report-queue readback or resolution endpoint",
+    ]
+    warnings.extend(report_snapshot.warnings)
+    if mismatches:
+        result = _conflict_result(
+            endpoint, dry_run, state, desired, mismatches, warnings,
+        )
+        result.resolved_mappings = mappings
+        return result
+    request: dict[str, JSONValue] = {
+        "report_type": report_type, "description": description,
+    }
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, endpoint, dry_run=True,
+            current=state, desired=desired, request=request,
+            changed_fields=["reported"], resolved_mappings=mappings,
+            warnings=warnings + [f"Live reporting requires confirmation: REPORT MESSAGE {message_id}"],
+        )
+    required_confirmation = f"REPORT MESSAGE {message_id}"
+    if confirmation != required_confirmation:
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=False,
+            current=state, desired=desired, request=request,
+            resolved_mappings=mappings, warnings=warnings,
+            error=APIError(
+                message=f"confirmation must exactly equal {required_confirmation!r}",
+                code="CONFIRMATION_REQUIRED",
+            ),
+        )
+    try:
+        response = user_content_mutation(
+            lambda: configuration_request(endpoint, "POST", request=request),
+        )
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, False, exc)
+        result.current = state
+        result.desired = desired
+        result.request = request
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    return MutationResult(
+        MutationStatus.OK, endpoint, dry_run=False,
+        current=state, desired=desired, request=request, response=response,
+        changed_fields=["reported"], resolved_mappings=mappings,
+        warnings=warnings,
+    )
 
 
 def verify_message(message_id: int) -> str:
