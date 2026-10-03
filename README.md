@@ -138,6 +138,16 @@ it to Zulip's `is_default_stream` request field. The older
 `settings.is_default_stream` form remains supported; contradictory
 values are rejected.
 
+Channel creation is convergent. The tool resolves every semantic
+reference before writing, creates the channel with settings honored by
+the creation endpoint, reads the result, and applies any residual
+settings through the channel-update endpoint. On Zulip 12.x this
+second step covers topic-creation and message-deletion permission
+groups that the creation endpoint accepts but does not apply. Dry-run
+results expose the ordered mutation plan. Retrying after a partial
+result converges the existing named channel instead of creating a
+duplicate.
+
 Dry runs remain available while writes are disabled: they can read
 current state, validate inputs, and show proposed requests without
 issuing a mutation.

@@ -96,7 +96,7 @@ def test_create_channel_dry_run_resolves_destination_users_and_groups(
         "invite_only": True,
         "is_web_public": False,
         "history_public_to_subscribers": True,
-        "message_retention_days": "unlimited",
+        "message_retention_days": '"unlimited"',
         "is_default_stream": False,
         "can_send_message_group": 4,
     }
@@ -107,6 +107,13 @@ def test_create_channel_dry_run_resolves_destination_users_and_groups(
         "semantic": "role:members",
         "resolved": 4,
     }
+    assert result["steps"] == [{
+        "name": "create",
+        "method": "POST",
+        "endpoint": "/channels/create",
+        "request": result["request"],
+        "status": "planned",
+    }]
     assert all(
         item.kwargs["method"] != "POST"
         for item in client.call_endpoint.call_args_list
@@ -252,7 +259,7 @@ def test_create_channel_ignores_announce_in_existing_state(client: Mock) -> None
     assert result["status"] == "ok"
 
 
-def test_create_channel_reports_missing_existing_subscriber(client: Mock) -> None:
+def test_create_channel_converges_missing_existing_subscriber(client: Mock) -> None:
     existing = {
         "stream_id": 12,
         "name": "course",
@@ -263,6 +270,8 @@ def test_create_channel_reports_missing_existing_subscriber(client: Mock) -> Non
     client.call_endpoint.side_effect = [
         server(), principal(), streams([existing]), groups(), users(),
         {"result": "success", "msg": "", "subscribers": []},
+        {"result": "success", "msg": "", "subscribed": {"7": ["course"]}},
+        {"result": "success", "msg": "", "subscribers": [7]},
     ]
 
     result = mcp_module.create_channel(
@@ -273,8 +282,9 @@ def test_create_channel_reports_missing_existing_subscriber(client: Mock) -> Non
         permissions={},
     ).structured_content
 
-    assert result["status"] == "partial"
-    assert "missing requested subscribers" in result["warnings"][1]
+    assert result["status"] == "ok"
+    assert result["steps"][0]["name"] == "subscribe"
+    assert result["steps"][0]["status"] == "ok"
 
 
 def test_create_channel_dry_run_reports_missing_existing_subscriber(
@@ -302,10 +312,12 @@ def test_create_channel_dry_run_reports_missing_existing_subscriber(
     ).structured_content
 
     assert result["status"] == "dry_run"
-    assert "missing requested subscribers" in result["warnings"][1]
+    assert result["steps"][0]["name"] == "subscribe"
+    assert result["steps"][0]["status"] == "planned"
+    assert result["remaining_fields"] == ["subscribers"]
 
 
-def test_create_channel_conflicts_with_different_existing_channel(client: Mock) -> None:
+def test_create_channel_converges_different_existing_channel(client: Mock) -> None:
     existing = {
         "stream_id": 12,
         "name": "course",
@@ -315,6 +327,8 @@ def test_create_channel_conflicts_with_different_existing_channel(client: Mock) 
     }
     client.call_endpoint.side_effect = [
         server(), principal(), streams([existing]), groups(), users(),
+        {"result": "success", "msg": ""},
+        streams([{**existing, "description": "Desired"}]),
     ]
 
     result = mcp_module.create_channel(
@@ -326,8 +340,12 @@ def test_create_channel_conflicts_with_different_existing_channel(client: Mock) 
         description="Desired",
     ).structured_content
 
-    assert result["status"] == "conflict"
-    assert result["error"]["code"] == "CHANNEL_ALREADY_EXISTS"
+    assert result["status"] == "ok"
+    assert result["steps"][0]["name"] == "configure"
+    assert not any(
+        item.kwargs.get("url") == "/channels/create"
+        for item in client.call_endpoint.call_args_list
+    )
 
 
 def test_create_channel_applies_and_reads_back(client: Mock) -> None:
@@ -368,7 +386,307 @@ def test_create_channel_applies_and_reads_back(client: Mock) -> None:
     )
 
 
-def test_create_channel_reports_mismatched_readback_as_partial(client: Mock) -> None:
+def test_create_channel_dry_run_plans_residual_permission_update(
+    client: Mock,
+) -> None:
+    client.call_endpoint.side_effect = [
+        server(), principal(), streams([]), groups(), users(),
+    ]
+
+    result = mcp_module.create_channel(
+        realm_url=REALM_URL,
+        name="course",
+        subscribers=[],
+        privacy="public",
+        permissions={"can_create_topic_group": "role:members"},
+        dry_run=True,
+    ).structured_content
+
+    assert "can_create_topic_group" not in result["request"]
+    assert result["steps"] == [
+        {
+            "name": "create",
+            "method": "POST",
+            "endpoint": "/channels/create",
+            "request": result["request"],
+            "status": "planned",
+        },
+        {
+            "name": "configure",
+            "method": "PATCH",
+            "endpoint": "/streams/{new_stream_id}",
+            "request": {
+                "can_create_topic_group": {
+                    "new": 4,
+                    "old": "<creation-readback>",
+                },
+            },
+            "status": "conditional_on_readback",
+        },
+    ]
+
+
+@pytest.mark.parametrize("field", sorted(core.CHANNEL_CREATE_RESIDUAL_FIELDS))
+def test_create_channel_converges_permissions_ignored_by_zulip_creation(
+    client: Mock, field: str,
+) -> None:
+    created = {
+        "stream_id": 12,
+        "name": "course",
+        "description": "Course discussion",
+        "invite_only": False,
+        "is_web_public": False,
+        "is_default": True,
+        field: 5,
+    }
+    updated = {**created, field: 4}
+    client.call_endpoint.side_effect = [
+        server(), principal(), streams([]), groups(), users(),
+        {"result": "success", "msg": "", "id": 12},
+        streams([created]),
+        {"result": "success", "msg": "", "subscribers": [7]},
+        {"result": "success", "msg": ""},
+        streams([updated]),
+    ]
+
+    result = mcp_module.create_channel(
+        realm_url=REALM_URL,
+        name="course",
+        subscribers=["user@example.test"],
+        privacy="public",
+        permissions={field: "role:members"},
+        description="Course discussion",
+        is_default=True,
+    ).structured_content
+
+    assert result["status"] == "ok"
+    assert result["readback"][field] == 4
+    assert result["readback"]["is_default"] is True
+    create_call = client.call_endpoint.call_args_list[5]
+    assert field not in create_call.kwargs["request"]
+    assert create_call.kwargs["request"]["is_default_stream"] is True
+    assert client.call_endpoint.call_args_list[8] == call(
+        url="/streams/12",
+        method="PATCH",
+        request={field: {"new": 4, "old": 5}},
+    )
+    assert not any(
+        item.kwargs.get("url") == "/users/me/subscriptions"
+        for item in client.call_endpoint.call_args_list
+    )
+
+
+def test_create_channel_residual_failure_is_retryable_partial(client: Mock) -> None:
+    created = {
+        "stream_id": 12,
+        "name": "course",
+        "description": "",
+        "invite_only": False,
+        "is_web_public": False,
+        "can_create_topic_group": 5,
+    }
+    client.call_endpoint.side_effect = [
+        server(), principal(), streams([]), groups(), users(),
+        {"result": "success", "msg": "", "id": 12},
+        streams([created]),
+        {"result": "error", "msg": "update failed", "code": "BAD_REQUEST"},
+    ]
+
+    result = mcp_module.create_channel(
+        realm_url=REALM_URL,
+        name="course",
+        subscribers=[],
+        privacy="public",
+        permissions={"can_create_topic_group": "role:members"},
+    ).structured_content
+
+    assert result["status"] == "partial"
+    assert result["failed_step"] == "configure"
+    assert result["readback"] == created
+    assert result["completed_fields"] == ["description", "privacy"]
+    assert result["remaining_fields"] == ["can_create_topic_group"]
+    assert result["steps"][-1]["status"] == "failed"
+
+
+def test_create_channel_retry_converges_existing_partial_channel(
+    client: Mock,
+) -> None:
+    existing = {
+        "stream_id": 12,
+        "name": "course",
+        "description": "",
+        "invite_only": False,
+        "is_web_public": False,
+        "can_create_topic_group": 5,
+    }
+    updated = {**existing, "can_create_topic_group": 4}
+    client.call_endpoint.side_effect = [
+        server(), principal(), streams([existing]), groups(), users(),
+        {"result": "success", "msg": ""},
+        streams([updated]),
+    ]
+
+    result = mcp_module.create_channel(
+        realm_url=REALM_URL,
+        name="course",
+        subscribers=[],
+        privacy="public",
+        permissions={"can_create_topic_group": "role:members"},
+    ).structured_content
+
+    assert result["status"] == "ok"
+    assert result["readback"]["can_create_topic_group"] == 4
+    assert not any(
+        item.kwargs.get("url") == "/channels/create"
+        for item in client.call_endpoint.call_args_list
+    )
+
+
+def test_create_channel_preserves_explicit_history_when_privacy_changes(
+    client: Mock,
+) -> None:
+    existing = {
+        "stream_id": 12,
+        "name": "course",
+        "description": "",
+        "invite_only": False,
+        "is_web_public": False,
+        "history_public_to_subscribers": True,
+    }
+    updated = {
+        **existing,
+        "invite_only": True,
+        "history_public_to_subscribers": True,
+    }
+    client.call_endpoint.side_effect = [
+        server(), principal(), streams([existing]), groups(), users(),
+        {"result": "success", "msg": ""},
+        streams([updated]),
+    ]
+
+    result = mcp_module.create_channel(
+        realm_url=REALM_URL,
+        name="course",
+        subscribers=[],
+        privacy="private",
+        permissions={},
+        settings={"history_public_to_subscribers": True},
+    ).structured_content
+
+    assert result["status"] == "ok"
+    assert client.call_endpoint.call_args_list[5] == call(
+        url="/streams/12",
+        method="PATCH",
+        request={
+            "is_private": True,
+            "is_web_public": False,
+            "history_public_to_subscribers": True,
+        },
+    )
+
+
+def test_create_channel_subscribes_before_tightening_permissions(
+    client: Mock,
+) -> None:
+    existing = {
+        "stream_id": 12,
+        "name": "course",
+        "description": "",
+        "invite_only": True,
+        "is_web_public": False,
+        "can_add_subscribers_group": 5,
+    }
+    updated = {**existing, "can_add_subscribers_group": 4}
+    client.call_endpoint.side_effect = [
+        server(), principal(), streams([existing]), groups(), users(),
+        {"result": "success", "msg": "", "subscribers": []},
+        {"result": "success", "msg": "", "subscribed": {"7": ["course"]}},
+        {"result": "success", "msg": ""},
+        streams([updated]),
+        {"result": "success", "msg": "", "subscribers": [7]},
+    ]
+
+    result = mcp_module.create_channel(
+        realm_url=REALM_URL,
+        name="course",
+        subscribers=["user@example.test"],
+        privacy="private",
+        permissions={"can_add_subscribers_group": "role:members"},
+    ).structured_content
+
+    assert result["status"] == "ok"
+    assert [step["name"] for step in result["steps"]] == [
+        "subscribe", "configure",
+    ]
+    assert client.call_endpoint.call_args_list[6].kwargs["url"] == (
+        "/users/me/subscriptions"
+    )
+    assert client.call_endpoint.call_args_list[7].kwargs["url"] == "/streams/12"
+
+
+def test_create_channel_final_subscriber_readback_failure_is_partial(
+    client: Mock,
+) -> None:
+    existing = {
+        "stream_id": 12,
+        "name": "course",
+        "description": "",
+        "invite_only": False,
+        "is_web_public": False,
+    }
+    client.call_endpoint.side_effect = [
+        server(), principal(), streams([existing]), groups(), users(),
+        {"result": "success", "msg": "", "subscribers": []},
+        {"result": "success", "msg": "", "subscribed": {"7": ["course"]}},
+        {"result": "error", "msg": "readback failed", "code": "BAD_GATEWAY"},
+    ]
+
+    result = mcp_module.create_channel(
+        realm_url=REALM_URL,
+        name="course",
+        subscribers=["user@example.test"],
+        privacy="public",
+        permissions={},
+    ).structured_content
+
+    assert result["status"] == "partial"
+    assert result["failed_step"] == "final_readback"
+    assert result["completed_fields"] == ["description", "privacy"]
+    assert result["remaining_fields"] == ["subscribers"]
+
+
+def test_create_channel_readback_reports_all_unverified_work(client: Mock) -> None:
+    existing = {
+        "stream_id": 12,
+        "name": "course",
+        "description": "Original",
+        "invite_only": False,
+        "is_web_public": False,
+    }
+    client.call_endpoint.side_effect = [
+        server(), principal(), streams([existing]), groups(), users(),
+        {"result": "success", "msg": "", "subscribers": []},
+        {"result": "success", "msg": "", "subscribed": {"7": ["course"]}},
+        {"result": "success", "msg": ""},
+        streams([existing]),
+        {"result": "error", "msg": "readback failed", "code": "BAD_GATEWAY"},
+    ]
+
+    result = mcp_module.create_channel(
+        realm_url=REALM_URL,
+        name="course",
+        subscribers=["user@example.test"],
+        privacy="public",
+        permissions={},
+        description="Desired",
+    ).structured_content
+
+    assert result["status"] == "partial"
+    assert result["completed_fields"] == ["privacy"]
+    assert result["remaining_fields"] == ["description", "subscribers"]
+
+
+def test_create_channel_converges_mismatched_readback(client: Mock) -> None:
     created = {
         "stream_id": 12,
         "name": "course",
@@ -380,6 +698,8 @@ def test_create_channel_reports_mismatched_readback_as_partial(client: Mock) -> 
         server(), principal(), streams([]), groups(), users(),
         {"result": "success", "msg": "", "stream_id": 12},
         streams([created]),
+        {"result": "success", "msg": ""},
+        streams([{**created, "description": "Course discussion"}]),
     ]
 
     result = mcp_module.create_channel(
@@ -391,13 +711,13 @@ def test_create_channel_reports_mismatched_readback_as_partial(client: Mock) -> 
         description="Course discussion",
     ).structured_content
 
-    assert result["status"] == "partial"
-    assert result["warnings"] == [
-        "Channel readback did not match requested values: description",
+    assert result["status"] == "ok"
+    assert [step["name"] for step in result["steps"]] == [
+        "create", "configure",
     ]
 
 
-def test_create_channel_reports_missing_subscriber_readback(client: Mock) -> None:
+def test_create_channel_converges_missing_subscriber_readback(client: Mock) -> None:
     created = {
         "stream_id": 12,
         "name": "course",
@@ -410,6 +730,8 @@ def test_create_channel_reports_missing_subscriber_readback(client: Mock) -> Non
         {"result": "success", "msg": "", "stream_id": 12},
         streams([created]),
         {"result": "success", "msg": "", "subscribers": []},
+        {"result": "success", "msg": "", "subscribed": {"7": ["course"]}},
+        {"result": "success", "msg": "", "subscribers": [7]},
     ]
 
     result = mcp_module.create_channel(
@@ -420,8 +742,8 @@ def test_create_channel_reports_missing_subscriber_readback(client: Mock) -> Non
         permissions={},
     ).structured_content
 
-    assert result["status"] == "partial"
-    assert "missing requested subscribers" in result["warnings"][0]
+    assert result["status"] == "ok"
+    assert result["completed_fields"] == ["description", "privacy", "subscribers"]
 
 
 def test_create_channel_rejects_numeric_cross_realm_references(client: Mock) -> None:

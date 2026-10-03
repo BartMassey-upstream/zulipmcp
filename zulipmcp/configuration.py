@@ -258,12 +258,16 @@ class MutationResult:
     unsupported_fields: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     error: APIError | None = None
+    steps: list[dict[str, JSONValue]] = field(default_factory=list)
+    completed_fields: list[str] = field(default_factory=list)
+    remaining_fields: list[str] = field(default_factory=list)
+    failed_step: str | None = None
 
     def __post_init__(self) -> None:
         self.status = MutationStatus(self.status)
 
     def to_dict(self) -> dict[str, JSONValue]:
-        result = redact_secrets({
+        value: dict[str, JSONValue] = {
             "status": self.status.value,
             "endpoint": self.endpoint,
             "dry_run": self.dry_run,
@@ -277,7 +281,16 @@ class MutationResult:
             "unsupported_fields": self.unsupported_fields,
             "warnings": self.warnings,
             "error": self.error.to_dict() if self.error is not None else None,
-        })
+        }
+        if self.steps:
+            value["steps"] = self.steps
+        if self.completed_fields:
+            value["completed_fields"] = self.completed_fields
+        if self.remaining_fields:
+            value["remaining_fields"] = self.remaining_fields
+        if self.failed_step is not None:
+            value["failed_step"] = self.failed_step
+        result = redact_secrets(value)
         assert isinstance(result, dict)
         return result
 
@@ -437,6 +450,12 @@ CHANNEL_CREATE_FIELDS = frozenset({
     "history_public_to_subscribers",
     "message_retention_days",
     "topics_policy",
+})
+
+CHANNEL_CREATE_RESIDUAL_FIELDS = frozenset({
+    "can_create_topic_group",
+    "can_delete_any_message_group",
+    "can_delete_own_message_group",
 })
 
 CHANNEL_UPDATE_FIELDS = frozenset({

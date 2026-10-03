@@ -20,6 +20,7 @@ import zulip
 from .configuration import (
     APIError,
     CHANNEL_CREATE_FIELDS,
+    CHANNEL_CREATE_RESIDUAL_FIELDS,
     CHANNEL_GROUP_FIELDS,
     CHANNEL_REFERENCE_REALM_FIELDS,
     CHANNEL_UPDATE_FIELDS,
@@ -2989,6 +2990,90 @@ def _resolve_channel_inputs(
     return resolved, mappings
 
 
+def _channel_write_value(field: str, value: JSONValue) -> JSONValue:
+    if field == "message_retention_days" and value in {
+        "realm_default", "unlimited",
+    }:
+        return json.dumps(value)
+    return value
+
+
+def _channel_configuration_delta(
+    channel: dict[str, JSONValue],
+    desired: dict[str, JSONValue],
+) -> tuple[
+    dict[str, JSONValue],
+    list[str],
+    list[str],
+    dict[str, JSONValue],
+]:
+    current: dict[str, JSONValue] = {}
+    changed: list[str] = []
+    absent: list[str] = []
+    request: dict[str, JSONValue] = {}
+    for field, desired_value in desired.items():
+        present, current_value = _channel_current(channel, field)
+        if not present:
+            absent.append(field)
+            continue
+        current[field] = current_value
+        if _channel_value(field, current_value) == _channel_value(
+            field, desired_value,
+        ):
+            continue
+        changed.append(field)
+        if field in CHANNEL_GROUP_FIELDS:
+            request[field] = {"new": desired_value, "old": current_value}
+        elif field == "privacy":
+            request["is_private"] = desired_value == "private"
+            request["is_web_public"] = desired_value == "web_public"
+        else:
+            request[field] = _channel_write_value(field, desired_value)
+    if (
+        "privacy" in changed
+        and "history_public_to_subscribers" in desired
+        and "history_public_to_subscribers" not in absent
+    ):
+        request["history_public_to_subscribers"] = desired[
+            "history_public_to_subscribers"
+        ]
+    return current, sorted(changed), sorted(absent), request
+
+
+def _channel_subscriber_ids(stream_id: int) -> set[int]:
+    response = get_channel_subscribers_configuration(stream_id)
+    subscribers = response.get("subscribers")
+    if not isinstance(subscribers, list):
+        raise ValueError("Channel subscriber readback was absent or null")
+    return {
+        user_id for user_id in subscribers
+        if isinstance(user_id, int) and not isinstance(user_id, bool)
+    }
+
+
+def _channel_step(
+    name: str,
+    method: str,
+    endpoint: str,
+    request: dict[str, JSONValue],
+    status: str,
+    response: dict[str, JSONValue] | None = None,
+    error: APIError | None = None,
+) -> dict[str, JSONValue]:
+    step: dict[str, JSONValue] = {
+        "name": name,
+        "method": method,
+        "endpoint": endpoint,
+        "request": request,
+        "status": status,
+    }
+    if response is not None:
+        step["response"] = response
+    if error is not None:
+        step["error"] = error.to_dict()
+    return step
+
+
 def create_channel(
     realm_url: str,
     name: str,
@@ -3122,96 +3207,47 @@ def create_channel(
         "permissions": permissions,
         **requested_settings,
     }
-    existing = _find_channel(streams, name)
-    if existing is not None:
-        comparisons: dict[str, JSONValue] = {
-            "description": description,
-            "privacy": privacy,
-            **resolved_permissions,
-            **{
-                field: value for field, value in resolved_settings.items()
-                if field != "announce"
-            },
-        }
-        mismatches = []
-        for field, value in comparisons.items():
-            present, current_value = _channel_current(existing, field)
-            if not present or current_value != _channel_value(field, value):
-                mismatches.append(field)
-        if mismatches:
-            return MutationResult(
-                status=MutationStatus.CONFLICT,
-                endpoint=endpoint,
-                dry_run=dry_run,
-                current=existing,
-                desired=desired,
-                resolved_mappings=mappings,
-                error=APIError(
-                    message=f"Channel already exists with different settings: {', '.join(mismatches)}",
-                    code="CHANNEL_ALREADY_EXISTS",
-                ),
-            )
-        subscriber_warnings = []
-        if subscribers:
-            stream_id = existing.get("stream_id")
-            if not isinstance(stream_id, int) or isinstance(stream_id, bool):
-                subscriber_warnings.append(
-                    "Existing channel did not have a valid stream_id for subscriber readback"
-                )
-            else:
-                try:
-                    subscriber_response = get_channel_subscribers_configuration(stream_id)
-                    current_subscribers = subscriber_response.get("subscribers")
-                except ZulipAPIError:
-                    subscriber_warnings.append(
-                        "Could not verify existing channel subscribers"
-                    )
-                else:
-                    current_ids = (
-                        {
-                            user_id for user_id in current_subscribers
-                            if isinstance(user_id, int) and not isinstance(user_id, bool)
-                        }
-                        if isinstance(current_subscribers, list)
-                        else set()
-                    )
-                    missing = [
-                        user for user, user_id in zip(subscribers, subscriber_ids)
-                        if user_id not in current_ids
-                    ]
-                    if missing:
-                        subscriber_warnings.append(
-                            "Existing channel is missing requested subscribers: "
-                            + ", ".join(missing)
-                        )
-        return MutationResult(
-            status=(
-                MutationStatus.DRY_RUN
-                if dry_run
-                else MutationStatus.PARTIAL if subscriber_warnings else MutationStatus.OK
-            ),
-            endpoint=endpoint,
-            dry_run=dry_run,
-            current=existing,
-            desired=desired,
-            readback=existing,
-            resolved_mappings=mappings,
-            warnings=[
-                "Channel already exists with the requested configuration",
-                *subscriber_warnings,
-            ],
-        )
-
+    desired_configuration: dict[str, JSONValue] = {
+        "description": description,
+        "privacy": privacy,
+        **resolved_permissions,
+        **{
+            field: value for field, value in resolved_settings.items()
+            if field != "announce"
+        },
+    }
+    creation_permissions = {
+        field: value for field, value in resolved_permissions.items()
+        if field not in CHANNEL_CREATE_RESIDUAL_FIELDS
+    }
     request: dict[str, JSONValue] = {
         "name": name,
         "description": description,
         "subscribers": subscriber_ids,
         "invite_only": privacy == "private",
         "is_web_public": privacy == "web_public",
-        **resolved_settings,
-        **resolved_permissions,
+        **{
+            field: _channel_write_value(field, value)
+            for field, value in resolved_settings.items()
+        },
+        **creation_permissions,
     }
-    if dry_run:
+    residual_template = {
+        field: {"new": value, "old": "<creation-readback>"}
+        for field, value in resolved_permissions.items()
+        if field in CHANNEL_CREATE_RESIDUAL_FIELDS
+    }
+    existing = _find_channel(streams, name)
+    steps: list[dict[str, JSONValue]] = []
+    if existing is None and dry_run:
+        steps.append(_channel_step(
+            "create", "POST", endpoint, request, "planned",
+        ))
+        if residual_template:
+            steps.append(_channel_step(
+                "configure", "PATCH", "/streams/{new_stream_id}",
+                residual_template, "conditional_on_readback",
+            ))
         return MutationResult(
             status=MutationStatus.DRY_RUN,
             endpoint=endpoint,
@@ -3220,110 +3256,382 @@ def create_channel(
             request=request,
             changed_fields=sorted(request),
             resolved_mappings=mappings,
+            steps=steps,
+            remaining_fields=sorted(
+                set(desired_configuration)
+                | ({"subscribers"} if subscribers else set())
+            ),
+        )
+
+    responses: dict[str, JSONValue] = {}
+    unsupported: list[str] = []
+    warnings: list[str] = []
+    readback = existing
+    was_existing = existing is not None
+    if readback is None:
+        try:
+            create_response = administrative_mutation_request(
+                endpoint, method="POST", request=request,
+            )
+        except ZulipAPIError as exc:
+            steps.append(_channel_step(
+                "create", "POST", endpoint, request, "failed",
+                error=exc.error,
+            ))
+            result = _mutation_failure(endpoint, False, exc)
+            result.desired = desired
+            result.request = request
+            result.resolved_mappings = mappings
+            result.steps = steps
+            result.remaining_fields = sorted(desired_configuration)
+            result.failed_step = "create"
+            return result
+        responses["create"] = create_response
+        steps.append(_channel_step(
+            "create", "POST", endpoint, request, "ok",
+            response=create_response,
+        ))
+        ignored = create_response.get("ignored_parameters_unsupported")
+        if isinstance(ignored, list):
+            unsupported.extend(
+                value for value in ignored if isinstance(value, str)
+            )
+        try:
+            readback = _find_channel(_channel_inventory(), name)
+        except (ZulipAPIError, ValueError) as exc:
+            error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+                message=str(exc), code="READBACK_ERROR",
+            )
+            return MutationResult(
+                MutationStatus.PARTIAL, endpoint, dry_run=False,
+                desired=desired, request=request, response=responses,
+                resolved_mappings=mappings, error=error, steps=steps,
+                remaining_fields=sorted(
+                    set(desired_configuration)
+                    | ({"subscribers"} if subscribers else set())
+                ),
+                failed_step="creation_readback",
+            )
+        if readback is None:
+            return MutationResult(
+                MutationStatus.PARTIAL, endpoint, dry_run=False,
+                desired=desired, request=request, response=responses,
+                resolved_mappings=mappings,
+                error=APIError(
+                    message="Created channel was absent from authoritative readback",
+                    code="READBACK_ERROR",
+                ),
+                steps=steps,
+                remaining_fields=sorted(
+                    set(desired_configuration)
+                    | ({"subscribers"} if subscribers else set())
+                ),
+                failed_step="creation_readback",
+            )
+    stream_id = readback.get("stream_id")
+    if not isinstance(stream_id, int) or isinstance(stream_id, bool):
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=dry_run,
+            current=readback, desired=desired, request=request,
+            response=responses or None, readback=readback,
+            resolved_mappings=mappings,
+            error=APIError(
+                message="Channel readback did not contain a valid stream_id",
+                code="READBACK_ERROR",
+            ),
+            steps=steps,
+            remaining_fields=sorted(
+                set(desired_configuration)
+                | ({"subscribers"} if subscribers else set())
+            ),
+            failed_step="creation_readback",
+        )
+    mappings["channel"] = {"semantic": name, "resolved": stream_id}
+    resolved_endpoint = f"/streams/{stream_id}"
+    current, changed, absent, update_request = _channel_configuration_delta(
+        readback, desired_configuration,
+    )
+    if absent:
+        return MutationResult(
+            MutationStatus.PARTIAL, resolved_endpoint, dry_run=dry_run,
+            current=current, desired=desired, request=request,
+            response=responses or None, readback=readback,
+            resolved_mappings=mappings, unsupported_fields=absent,
+            warnings=warnings,
+            error=APIError(
+                message="Channel readback omitted fields required for convergence: "
+                + ", ".join(absent),
+                code="UNSUPPORTED_FIELD",
+            ),
+            steps=steps, remaining_fields=sorted(
+                set(changed)
+                | set(absent)
+                | ({"subscribers"} if subscribers else set())
+            ),
+            failed_step="creation_readback",
         )
     try:
-        response = administrative_mutation_request(
-            endpoint, method="POST", request=request,
+        current_subscribers = (
+            _channel_subscriber_ids(stream_id) if subscribers else set()
         )
-    except ZulipAPIError as exc:
-        result = _mutation_failure(endpoint, dry_run, exc)
-        result.desired = desired
-        result.request = request
-        result.resolved_mappings = mappings
-        return result
-    try:
-        readback_streams = _channel_inventory()
-    except (ZulipAPIError, ValueError) as exc:
+    except (ValueError, ZulipAPIError) as exc:
         error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
             message=str(exc), code="READBACK_ERROR",
         )
         return MutationResult(
-            status=MutationStatus.PARTIAL,
-            endpoint=endpoint,
-            dry_run=False,
-            desired=desired,
-            request=request,
-            response=response,
-            resolved_mappings=mappings,
-            error=error,
+            MutationStatus.PARTIAL, resolved_endpoint, dry_run=dry_run,
+            current=current, desired=desired, request=request,
+            response=responses or None, readback=readback,
+            changed_fields=changed, resolved_mappings=mappings,
+            warnings=warnings, error=error, steps=steps,
+            remaining_fields=sorted(set(changed) | {"subscribers"}),
+            failed_step="subscriber_readback",
         )
-    readback = _find_channel(readback_streams, name)
-    ignored = response.get("ignored_parameters_unsupported")
-    unsupported = [value for value in ignored if isinstance(value, str)] if isinstance(ignored, list) else []
-    mismatched_readback = []
-    if readback is None:
-        mismatched_readback.append("name")
-    else:
-        comparisons = {
-            "description": description,
-            "privacy": privacy,
-            **resolved_permissions,
-            **{
-                field: value for field, value in resolved_settings.items()
-                if field != "announce"
-            },
-        }
-        for field, value in comparisons.items():
-            present, actual = _channel_current(readback, field)
-            if not present or actual != _channel_value(field, value):
-                mismatched_readback.append(field)
-    subscriber_warnings = []
-    if readback is not None and subscribers:
-        stream_id = readback.get("stream_id")
-        if not isinstance(stream_id, int) or isinstance(stream_id, bool):
-            subscriber_warnings.append(
-                "Created channel did not have a valid stream_id for subscriber readback"
+    missing_subscriber_ids = sorted(set(subscriber_ids) - current_subscribers)
+    if was_existing:
+        warnings.append(
+            "Channel already exists; converging requested configuration"
+            if changed or missing_subscriber_ids
+            else "Channel already exists with the requested configuration"
+        )
+    subscribe_request: dict[str, JSONValue] = {
+        "subscriptions": [{"name": name}],
+        "principals": missing_subscriber_ids,
+        "authorization_errors_fatal": True,
+    }
+    if missing_subscriber_ids:
+        steps.append(_channel_step(
+            "subscribe", "POST", "/users/me/subscriptions",
+            subscribe_request, "planned" if dry_run else "pending",
+        ))
+    if update_request:
+        steps.append(_channel_step(
+            "configure", "PATCH", resolved_endpoint, update_request,
+            "planned" if dry_run else "pending",
+        ))
+    if dry_run:
+        if not steps:
+            warnings.append("Channel already has the requested configuration")
+        return MutationResult(
+            MutationStatus.DRY_RUN, resolved_endpoint, dry_run=True,
+            current=current, desired=desired,
+            request=(
+                update_request
+                if update_request
+                else subscribe_request if missing_subscriber_ids else {}
+            ),
+            readback=readback, changed_fields=sorted(
+                set(changed) | ({"subscribers"} if missing_subscriber_ids else set())
+            ),
+            resolved_mappings=mappings, warnings=warnings, steps=steps,
+            remaining_fields=sorted(
+                set(changed) | ({"subscribers"} if missing_subscriber_ids else set())
+            ),
+        )
+
+    if missing_subscriber_ids:
+        try:
+            subscribe_response = administrative_mutation_request(
+                "/users/me/subscriptions", method="POST",
+                request=subscribe_request,
             )
-        else:
-            try:
-                subscriber_response = get_channel_subscribers_configuration(stream_id)
-                current_subscribers = subscriber_response.get("subscribers")
-            except ZulipAPIError:
-                subscriber_warnings.append(
-                    "Could not verify created channel subscribers"
-                )
-            else:
-                current_ids = (
-                    {
-                        user_id for user_id in current_subscribers
-                        if isinstance(user_id, int) and not isinstance(user_id, bool)
-                    }
-                    if isinstance(current_subscribers, list)
-                    else set()
-                )
-                missing = [
-                    user for user, user_id in zip(subscribers, subscriber_ids)
-                    if user_id not in current_ids
-                ]
-                if missing:
-                    subscriber_warnings.append(
-                        "Created channel is missing requested subscribers: "
-                        + ", ".join(missing)
+        except ZulipAPIError as exc:
+            for index, step in enumerate(steps):
+                if step.get("name") == "subscribe":
+                    steps[index] = _channel_step(
+                        "subscribe", "POST", "/users/me/subscriptions",
+                        subscribe_request, "failed", error=exc.error,
                     )
-    warnings = []
-    if mismatched_readback:
+                    break
+            return MutationResult(
+                MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+                current=current, desired=desired,
+                request=subscribe_request, response=responses or None,
+                readback=readback, changed_fields=sorted(
+                    set(changed) | {"subscribers"}
+                ),
+                resolved_mappings=mappings, unsupported_fields=unsupported,
+                warnings=warnings, error=exc.error, steps=steps,
+                completed_fields=sorted(
+                    set(desired_configuration) - set(changed)
+                ),
+                remaining_fields=sorted(set(changed) | {"subscribers"}),
+                failed_step="subscribe",
+            )
+        responses["subscribe"] = subscribe_response
+        for index, step in enumerate(steps):
+            if step.get("name") == "subscribe":
+                steps[index] = _channel_step(
+                    "subscribe", "POST", "/users/me/subscriptions",
+                    subscribe_request, "ok", response=subscribe_response,
+                )
+                break
+
+    if update_request:
+        try:
+            update_response = administrative_mutation_request(
+                resolved_endpoint, method="PATCH", request=update_request,
+            )
+        except ZulipAPIError as exc:
+            for index, step in enumerate(steps):
+                if step.get("name") == "configure":
+                    steps[index] = _channel_step(
+                        "configure", "PATCH", resolved_endpoint,
+                        update_request, "failed", error=exc.error,
+                    )
+                    break
+            return MutationResult(
+                MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+                current=current, desired=desired, request=update_request,
+                response=responses or None, readback=readback,
+                changed_fields=changed, resolved_mappings=mappings,
+                warnings=warnings, error=exc.error, steps=steps,
+                completed_fields=sorted(
+                    (set(desired_configuration) - set(changed))
+                    | (
+                        {"subscribers"}
+                        if subscribers and not missing_subscriber_ids else set()
+                    )
+                ),
+                remaining_fields=sorted(
+                    set(changed)
+                    | ({"subscribers"} if missing_subscriber_ids else set())
+                ),
+                failed_step="configure",
+            )
+        responses["configure"] = update_response
+        for index, step in enumerate(steps):
+            if step.get("name") == "configure":
+                steps[index] = _channel_step(
+                    "configure", "PATCH", resolved_endpoint, update_request,
+                    "ok", response=update_response,
+                )
+                break
+        ignored = update_response.get("ignored_parameters_unsupported")
+        if isinstance(ignored, list):
+            unsupported.extend(
+                value for value in ignored if isinstance(value, str)
+            )
+        try:
+            readback = next(
+                (
+                    item for item in _channel_inventory()
+                    if item.get("stream_id") == stream_id
+                ),
+                None,
+            )
+        except (ZulipAPIError, ValueError) as exc:
+            error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+                message=str(exc), code="READBACK_ERROR",
+            )
+            return MutationResult(
+                MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+                current=current, desired=desired, request=update_request,
+                response=responses, readback=None, changed_fields=changed,
+                resolved_mappings=mappings, unsupported_fields=unsupported,
+                warnings=warnings, error=error, steps=steps,
+                completed_fields=sorted(
+                    (set(desired_configuration) - set(changed))
+                    | (
+                        {"subscribers"}
+                        if subscribers and not missing_subscriber_ids else set()
+                    )
+                ),
+                remaining_fields=sorted(
+                    set(changed) | ({"subscribers"} if missing_subscriber_ids else set())
+                ),
+                failed_step="configuration_readback",
+            )
+        if readback is None:
+            return MutationResult(
+                MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+                current=current, desired=desired, request=update_request,
+                response=responses, readback=None, changed_fields=changed,
+                resolved_mappings=mappings, unsupported_fields=unsupported,
+                warnings=warnings,
+                error=APIError(
+                    message="Updated channel was absent from authoritative readback",
+                    code="READBACK_ERROR",
+                ),
+                steps=steps,
+                completed_fields=sorted(
+                    set(desired_configuration) - set(changed)
+                ),
+                remaining_fields=sorted(
+                    set(changed) | ({"subscribers"} if subscribers else set())
+                ),
+                failed_step="configuration_readback",
+            )
+
+    assert readback is not None
+    _, verified_config_remaining, verified_config_absent, _ = (
+        _channel_configuration_delta(readback, desired_configuration)
+    )
+    unverified_configuration = set(verified_config_remaining) | set(
+        verified_config_absent
+    )
+    verified_configuration = set(desired_configuration) - unverified_configuration
+    try:
+        final_readback = readback
+        final_subscribers = (
+            _channel_subscriber_ids(stream_id)
+            if missing_subscriber_ids
+            else current_subscribers
+        )
+    except (ValueError, ZulipAPIError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+            current=current, desired=desired, request=update_request or request,
+            response=responses, readback=readback,
+            changed_fields=sorted(
+                set(changed) | ({"subscribers"} if missing_subscriber_ids else set())
+            ),
+            resolved_mappings=mappings, unsupported_fields=unsupported,
+            warnings=warnings, error=error, steps=steps,
+            completed_fields=sorted(verified_configuration),
+            remaining_fields=sorted(
+                unverified_configuration
+                | ({"subscribers"} if subscribers else set())
+            ),
+            failed_step="final_readback",
+        )
+    if final_readback is None:
+        final_changed = sorted(desired_configuration)
+    else:
+        _, final_changed, final_absent, _ = _channel_configuration_delta(
+            final_readback, desired_configuration,
+        )
+        final_changed = sorted(set(final_changed) | set(final_absent))
+    final_missing_subscribers = sorted(
+        set(subscriber_ids) - final_subscribers
+    )
+    remaining = sorted(
+        set(final_changed)
+        | ({"subscribers"} if final_missing_subscribers else set())
+        | set(unsupported)
+    )
+    completed = sorted(
+        (set(desired_configuration) | ({"subscribers"} if subscribers else set()))
+        - set(remaining)
+    )
+    if remaining:
         warnings.append(
             "Channel readback did not match requested values: "
-            + ", ".join(mismatched_readback)
+            + ", ".join(remaining)
         )
-    warnings.extend(subscriber_warnings)
-    status = (
-        MutationStatus.OK
-        if not unsupported and not mismatched_readback and not subscriber_warnings
-        else MutationStatus.PARTIAL
-    )
     return MutationResult(
-        status=status,
-        endpoint=endpoint,
-        dry_run=False,
-        desired=desired,
-        request=request,
-        response=response,
-        readback=readback,
-        changed_fields=sorted(request),
-        resolved_mappings=mappings,
-        unsupported_fields=unsupported,
-        warnings=warnings,
+        MutationStatus.OK if not remaining else MutationStatus.PARTIAL,
+        resolved_endpoint, dry_run=False, current=current, desired=desired,
+        request=update_request or request, response=responses,
+        readback=final_readback, changed_fields=sorted(
+            set(changed) | ({"subscribers"} if missing_subscriber_ids else set())
+        ),
+        resolved_mappings=mappings, unsupported_fields=unsupported,
+        warnings=warnings, steps=steps, completed_fields=completed,
+        remaining_fields=remaining,
     )
 
 
