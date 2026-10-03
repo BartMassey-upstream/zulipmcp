@@ -535,14 +535,19 @@ def configuration_request(
         error = APIError.from_response(response)
         key = getattr(client, "api_key", None)
         secrets = [key] if isinstance(key, str) else []
-        raise ZulipAPIError(APIError(
-            message=sanitize_text(error.message, secrets),
-            code=error.code,
-            http_status=error.http_status or response_status,
-        ))
+        raise ZulipAPIError(
+            APIError(
+                message=sanitize_text(error.message, secrets),
+                code=error.code,
+                http_status=error.http_status or response_status,
+            ),
+            redact_secrets(response, secrets),
+        )
+    key = getattr(client, "api_key", None)
+    secrets = [key] if isinstance(key, str) else []
     data = redact_secrets({
         key: value for key, value in response.items() if key not in {"result", "msg"}
-    })
+    }, secrets)
     assert isinstance(data, dict)
     return data
 
@@ -2705,6 +2710,572 @@ def set_user_active(
         desired={"is_active": active}, request=request, response=response,
         readback=readback, changed_fields=["is_active"],
         resolved_mappings=mappings, warnings=warnings,
+    )
+
+
+_EMAIL_ADDRESS_RE = re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$"
+)
+
+
+def _invitation_inventory() -> list[dict[str, JSONValue]]:
+    invites = get_invitations_configuration().get("invites")
+    if not isinstance(invites, list):
+        raise ValueError("Invitation inventory was absent or null")
+    return [invite for invite in invites if isinstance(invite, dict)]
+
+
+def _email_invitation(
+    invites: list[dict[str, JSONValue]], email: str,
+) -> dict[str, JSONValue]:
+    matches = [
+        invite for invite in invites
+        if invite.get("is_multiuse") is False
+        and isinstance(invite.get("email"), str)
+        and str(invite["email"]).casefold() == email.casefold()
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Email {email!r} did not identify exactly one pending invitation"
+        )
+    return matches[0]
+
+
+def _invitation_id(invite: dict[str, JSONValue]) -> int:
+    invite_id = invite.get("id")
+    if not isinstance(invite_id, int) or isinstance(invite_id, bool):
+        raise ValueError("Invitation did not have a valid ID")
+    return invite_id
+
+
+def _invitation_public_state(
+    invite: dict[str, JSONValue],
+) -> dict[str, JSONValue]:
+    role = invite.get("invited_as")
+    return {
+        "email": invite.get("email"),
+        "is_multiuse": invite.get("is_multiuse"),
+        "invited_at": invite.get("invited"),
+        "expiry_date": invite.get("expiry_date"),
+        "role": _USER_ROLE_NAMES.get(role, role),
+        "invited_by_user_id": invite.get("invited_by_user_id"),
+        "notify_referrer_on_join": invite.get("notify_referrer_on_join"),
+    }
+
+
+def invite_users(
+    realm_url: str,
+    emails: list[str],
+    role: str,
+    channels: list[str],
+    groups: list[str] | None = None,
+    include_default_channels: bool = True,
+    expires_in_minutes: int | None = 14400,
+    notify_referrer_on_join: bool = False,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/invites"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    groups = list(groups or [])
+    normalized_emails = sorted({email.strip().casefold() for email in emails})
+    if not normalized_emails:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="At least one invitation email is required",
+                code="EMPTY_INVITATION_LIST",
+            ),
+        )
+    invalid_emails = [
+        email for email in normalized_emails
+        if not _EMAIL_ADDRESS_RE.fullmatch(email)
+    ]
+    if invalid_emails:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            desired={"emails": normalized_emails},
+            error=APIError(
+                message="Invalid invitation email addresses: "
+                + ", ".join(invalid_emails),
+                code="INVALID_EMAIL",
+            ),
+        )
+    if (
+        expires_in_minutes is not None
+        and (
+            not isinstance(expires_in_minutes, int)
+            or isinstance(expires_in_minutes, bool)
+            or expires_in_minutes <= 0
+        )
+    ):
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(
+                message="expires_in_minutes must be a positive integer or null",
+                code="INVALID_EXPIRATION",
+            ),
+        )
+    try:
+        role_id = _role_value(role)
+        streams = get_streams_configuration().get("streams")
+        if not isinstance(streams, list):
+            raise ValueError("Channel inventory was absent or null")
+        channel_ids, channel_mappings = _resolve_channels(streams, channels)
+        group_inventory = _group_inventory()
+        group_map = {
+            str(group["name"]): _group_id(group)
+            for group in group_inventory
+            if isinstance(group.get("name"), str)
+            and group.get("deactivated") is not True
+        }
+        group_ids = sorted({_named_id(group, group_map, "group") for group in groups})
+        users = get_users_configuration().get("members")
+        if not isinstance(users, list):
+            raise ValueError("User inventory was absent or null")
+        existing_emails = {
+            str(user["email"]).casefold()
+            for user in users
+            if isinstance(user, dict) and isinstance(user.get("email"), str)
+        }
+        existing_users = sorted(set(normalized_emails) & existing_emails)
+        if existing_users:
+            return MutationResult(
+                MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+                desired={"emails": normalized_emails},
+                error=APIError(
+                    message="Invitation targets already have accounts: "
+                    + ", ".join(existing_users),
+                    code="USER_ALREADY_EXISTS",
+                ),
+            )
+        pending = _invitation_inventory()
+        pending_emails = {
+            str(invite["email"]).casefold()
+            for invite in pending
+            if invite.get("is_multiuse") is False
+            and isinstance(invite.get("email"), str)
+        }
+        already_pending = sorted(set(normalized_emails) & pending_emails)
+        if already_pending:
+            return MutationResult(
+                MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+                desired={"emails": normalized_emails},
+                error=APIError(
+                    message="Invitation is already pending for: "
+                    + ", ".join(already_pending),
+                    code="INVITATION_ALREADY_PENDING",
+                ),
+            )
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            desired={"emails": normalized_emails},
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    desired: dict[str, JSONValue] = {
+        "emails": normalized_emails,
+        "role": _USER_ROLE_NAMES[role_id],
+        "channels": channels,
+        "groups": groups,
+        "include_default_channels": include_default_channels,
+        "expires_in_minutes": expires_in_minutes,
+        "notify_referrer_on_join": notify_referrer_on_join,
+    }
+    feature_level = server.get("zulip_feature_level")
+    unsupported_for_server: list[str] = []
+    if isinstance(feature_level, int) and not isinstance(feature_level, bool):
+        if feature_level < 126:
+            unsupported_for_server.append("invite_expires_in_minutes")
+        if groups and feature_level < 322:
+            unsupported_for_server.append("group_ids")
+        if include_default_channels and feature_level < 261:
+            unsupported_for_server.append("include_realm_default_subscriptions")
+        if not notify_referrer_on_join and feature_level < 267:
+            unsupported_for_server.append("notify_referrer_on_join")
+    if unsupported_for_server:
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            desired=desired,
+            unsupported_fields=sorted(unsupported_for_server),
+            error=APIError(
+                message="Server feature level cannot honor requested invitation fields: "
+                + ", ".join(sorted(unsupported_for_server)),
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    request: dict[str, JSONValue] = {
+        "invitee_emails": ",".join(normalized_emails),
+        "invite_as": role_id,
+        "stream_ids": sorted(channel_ids.values()),
+        "group_ids": group_ids,
+        "include_realm_default_subscriptions": include_default_channels,
+        "invite_expires_in_minutes": (
+            json.dumps(None) if expires_in_minutes is None else expires_in_minutes
+        ),
+        "notify_referrer_on_join": notify_referrer_on_join,
+    }
+    if isinstance(feature_level, int) and feature_level < 322 and not groups:
+        request.pop("group_ids")
+    if (
+        isinstance(feature_level, int)
+        and feature_level < 261
+        and not include_default_channels
+    ):
+        request.pop("include_realm_default_subscriptions")
+    if (
+        isinstance(feature_level, int)
+        and feature_level < 267
+        and notify_referrer_on_join
+    ):
+        request.pop("notify_referrer_on_join")
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "role": {"semantic": role, "resolved": role_id},
+        "channels": channel_mappings,
+        "groups": [
+            {"semantic": group, "resolved": _named_id(group, group_map, "group")}
+            for group in groups
+        ],
+    }
+    warnings = [
+        "This action sends externally visible invitation email",
+    ]
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, endpoint, dry_run=True, desired=desired,
+            request=request, changed_fields=["invitations"],
+            resolved_mappings=mappings, warnings=warnings,
+        )
+    mutation_error: ZulipAPIError | None = None
+    response: dict[str, JSONValue] | None = None
+    try:
+        response = configuration_mutation_request(endpoint, "POST", request)
+    except ZulipAPIError as exc:
+        if not (exc.response and exc.response.get("sent_invitations") is True):
+            result = _mutation_failure(endpoint, False, exc)
+            result.desired = desired
+            result.request = request
+            result.resolved_mappings = mappings
+            result.warnings = warnings
+            return result
+        mutation_error = exc
+        response = exc.response
+        warnings.append(
+            "Zulip reported that only some requested invitations were sent"
+        )
+    ignored = response.get("ignored_parameters_unsupported") if response else None
+    unsupported = sorted(
+        value for value in ignored if isinstance(value, str)
+    ) if isinstance(ignored, list) else []
+    if unsupported:
+        warnings.append(
+            "Zulip ignored unsupported invitation fields: "
+            + ", ".join(unsupported)
+        )
+    try:
+        readback_invites = _invitation_inventory()
+    except (ValueError, ZulipAPIError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=False, desired=desired,
+            request=request, response=response, changed_fields=["invitations"],
+            resolved_mappings=mappings, warnings=warnings, error=error,
+        )
+    readback = [
+        _invitation_public_state(invite)
+        for invite in readback_invites
+        if invite.get("is_multiuse") is False
+        and isinstance(invite.get("email"), str)
+        and str(invite["email"]).casefold() in normalized_emails
+    ]
+    found: set[str] = set()
+    for invite in readback:
+        email = invite.get("email")
+        if not isinstance(email, str):
+            continue
+        settings_match = invite.get("role") == _USER_ROLE_NAMES[role_id]
+        if expires_in_minutes is None:
+            settings_match = settings_match and invite.get("expiry_date") is None
+        else:
+            created = invite.get("invited_at")
+            expiry = invite.get("expiry_date")
+            if isinstance(created, int) and isinstance(expiry, int):
+                expiry_delay = expiry - (
+                    created + expires_in_minutes * 60
+                )
+                settings_match = (
+                    settings_match
+                    and 0 <= expiry_delay <= 60
+                )
+            else:
+                settings_match = False
+        notify = invite.get("notify_referrer_on_join")
+        if isinstance(notify, bool):
+            settings_match = settings_match and notify is notify_referrer_on_join
+        if settings_match:
+            found.add(email.casefold())
+    remaining = sorted(set(normalized_emails) - found)
+    if remaining:
+        warnings.append(
+            "Invitation readback did not find: " + ", ".join(remaining)
+        )
+    return MutationResult(
+        (
+            MutationStatus.PARTIAL
+            if mutation_error or remaining or unsupported
+            else MutationStatus.OK
+        ),
+        endpoint, dry_run=False, desired=desired, request=request,
+        response=response, readback={"invitations": readback},
+        changed_fields=["invitations"], resolved_mappings=mappings,
+        unsupported_fields=unsupported, warnings=warnings,
+        error=mutation_error.error if mutation_error is not None else None,
+        completed_fields=sorted(found), remaining_fields=remaining,
+    )
+
+
+def resend_email_invitation(
+    realm_url: str,
+    email: str,
+    expected_invited_at: int | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/invites/{invite_id}/resend"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    try:
+        invite = _email_invitation(_invitation_inventory(), email)
+        invite_id = _invitation_id(invite)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            desired={"email": email},
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    resolved_endpoint = f"/invites/{invite_id}/resend"
+    current = _invitation_public_state(invite)
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "invitation": {"semantic": email, "resolved": invite_id},
+    }
+    if expected_invited_at is not None and current.get("invited_at") != expected_invited_at:
+        result = _conflict_result(
+            resolved_endpoint, dry_run, current, {"email": email},
+            ["invited_at"], [],
+        )
+        result.resolved_mappings = mappings
+        return result
+    warnings = ["This action resends an externally visible invitation email"]
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, resolved_endpoint, dry_run=True,
+            current=current, desired={"email": email}, request={},
+            changed_fields=["invitation_email"], resolved_mappings=mappings,
+            warnings=warnings,
+        )
+    try:
+        response = configuration_mutation_request(resolved_endpoint, "POST", {})
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, False, exc)
+        result.current = current
+        result.desired = {"email": email}
+        result.request = {}
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    try:
+        readback = _invitation_public_state(
+            _email_invitation(_invitation_inventory(), email)
+        )
+    except (ValueError, ZulipAPIError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+            current=current, desired={"email": email}, request={},
+            response=response, changed_fields=["invitation_email"],
+            resolved_mappings=mappings, warnings=warnings, error=error,
+        )
+    return MutationResult(
+        MutationStatus.OK, resolved_endpoint, dry_run=False,
+        current=current, desired={"email": email}, request={},
+        response=response, readback=readback,
+        changed_fields=["invitation_email"], resolved_mappings=mappings,
+        warnings=warnings,
+    )
+
+
+def revoke_email_invitation(
+    realm_url: str,
+    email: str,
+    expected_invited_at: int | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/invites/{invite_id}"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    try:
+        invite = _email_invitation(_invitation_inventory(), email)
+        invite_id = _invitation_id(invite)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            desired={"revoked": True, "email": email},
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    resolved_endpoint = f"/invites/{invite_id}"
+    current = _invitation_public_state(invite)
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "invitation": {"semantic": email, "resolved": invite_id},
+    }
+    if expected_invited_at is not None and current.get("invited_at") != expected_invited_at:
+        result = _conflict_result(
+            resolved_endpoint, dry_run, current,
+            {"revoked": True, "email": email}, ["invited_at"], [],
+        )
+        result.resolved_mappings = mappings
+        return result
+    desired: dict[str, JSONValue] = {"revoked": True, "email": email}
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, resolved_endpoint, dry_run=True,
+            current=current, desired=desired, request={},
+            changed_fields=["revoked"], resolved_mappings=mappings,
+            warnings=["Revocation prevents this pending invitation from being used"],
+        )
+    try:
+        response = configuration_mutation_request(resolved_endpoint, "DELETE", {})
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, False, exc)
+        result.current = current
+        result.desired = desired
+        result.request = {}
+        result.resolved_mappings = mappings
+        return result
+    try:
+        remaining = [
+            invite for invite in _invitation_inventory()
+            if invite.get("is_multiuse") is False
+            and isinstance(invite.get("email"), str)
+            and str(invite["email"]).casefold() == email.casefold()
+        ]
+    except (ValueError, ZulipAPIError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+            current=current, desired=desired, request={}, response=response,
+            changed_fields=["revoked"], resolved_mappings=mappings,
+            error=error,
+        )
+    confirmed = not remaining
+    return MutationResult(
+        MutationStatus.OK if confirmed else MutationStatus.PARTIAL,
+        resolved_endpoint, dry_run=False, current=current, desired=desired,
+        request={}, response=response, readback={"present": bool(remaining)},
+        changed_fields=["revoked"], resolved_mappings=mappings,
+        warnings=[] if confirmed else ["Invitation remained present after revocation"],
+    )
+
+
+def revoke_reusable_invitation(
+    realm_url: str,
+    invited_at: int,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/invites/multiuse/{invite_id}"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    try:
+        matches = [
+            invite for invite in _invitation_inventory()
+            if invite.get("is_multiuse") is True
+            and invite.get("invited") == invited_at
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "invited_at did not identify exactly one reusable invitation"
+            )
+        invite = matches[0]
+        invite_id = _invitation_id(invite)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            desired={"revoked": True, "invited_at": invited_at},
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    resolved_endpoint = f"/invites/multiuse/{invite_id}"
+    current = _invitation_public_state(invite)
+    desired: dict[str, JSONValue] = {
+        "revoked": True, "invited_at": invited_at,
+    }
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "invitation": {"semantic": invited_at, "resolved": invite_id},
+    }
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, resolved_endpoint, dry_run=True,
+            current=current, desired=desired, request={},
+            changed_fields=["revoked"], resolved_mappings=mappings,
+            warnings=["Revocation permanently invalidates this reusable link"],
+        )
+    try:
+        response = configuration_mutation_request(resolved_endpoint, "DELETE", {})
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, False, exc)
+        result.current = current
+        result.desired = desired
+        result.request = {}
+        result.resolved_mappings = mappings
+        return result
+    try:
+        remaining = [
+            invite for invite in _invitation_inventory()
+            if invite.get("is_multiuse") is True
+            and invite.get("invited") == invited_at
+        ]
+    except (ValueError, ZulipAPIError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+            current=current, desired=desired, request={}, response=response,
+            changed_fields=["revoked"], resolved_mappings=mappings,
+            error=error,
+        )
+    confirmed = not remaining
+    return MutationResult(
+        MutationStatus.OK if confirmed else MutationStatus.PARTIAL,
+        resolved_endpoint, dry_run=False, current=current, desired=desired,
+        request={}, response=response, readback={"present": bool(remaining)},
+        changed_fields=["revoked"], resolved_mappings=mappings,
+        warnings=[] if confirmed else ["Reusable invitation remained after revocation"],
     )
 
 

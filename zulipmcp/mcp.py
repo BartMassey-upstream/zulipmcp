@@ -70,6 +70,12 @@ WRITE_TOOL_ANNOTATIONS = {
     "destructiveHint": False,
     "openWorldHint": False,
 }
+EXTERNAL_WRITE_TOOL_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": True,
+}
 DESTRUCTIVE_TOOL_ANNOTATIONS = {
     "readOnlyHint": False,
     "destructiveHint": True,
@@ -1253,6 +1259,82 @@ def set_user_active(
         "User active state",
         zulip_core.set_user_active(
             realm_url, user, active, expected_active, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=EXTERNAL_WRITE_TOOL_ANNOTATIONS)
+def invite_users(
+    realm_url: str,
+    emails: list[str],
+    role: str,
+    channels: list[str],
+    groups: list[str] | None = None,
+    include_default_channels: bool = True,
+    expires_in_minutes: int | None = 14400,
+    notify_referrer_on_join: bool = False,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Send explicit email invitations with semantic role and memberships."""
+    return mutation_tool_result(
+        "User invitations",
+        zulip_core.invite_users(
+            realm_url,
+            emails,
+            role,
+            channels,
+            groups,
+            include_default_channels,
+            expires_in_minutes,
+            notify_referrer_on_join,
+            dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=EXTERNAL_WRITE_TOOL_ANNOTATIONS)
+def resend_email_invitation(
+    realm_url: str,
+    email: str,
+    expected_invited_at: int | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Explicitly resend one pending email invitation."""
+    return mutation_tool_result(
+        "Invitation resend",
+        zulip_core.resend_email_invitation(
+            realm_url, email, expected_invited_at, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def revoke_email_invitation(
+    realm_url: str,
+    email: str,
+    expected_invited_at: int | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Revoke one pending email invitation resolved by address."""
+    return mutation_tool_result(
+        "Invitation revocation",
+        zulip_core.revoke_email_invitation(
+            realm_url, email, expected_invited_at, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def revoke_reusable_invitation(
+    realm_url: str,
+    invited_at: int,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Revoke one reusable invitation resolved by its creation timestamp."""
+    return mutation_tool_result(
+        "Reusable invitation revocation",
+        zulip_core.revoke_reusable_invitation(
+            realm_url, invited_at, dry_run,
         ),
     )
 

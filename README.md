@@ -121,6 +121,14 @@ user without deleting messages or files. Deactivation previews owned
 bots, rejects self-deactivation, and reports that owned bots will also
 be deactivated. Owner-role changes require an organization owner.
 
+Invitation tools send email invitations with semantic roles, channels,
+and groups; explicitly resend a pending email; and revoke pending email
+or reusable invitations. Reusable links are identified for revocation by
+their unique creation timestamp, not by exposing their secret URL.
+Invitation audits redact reusable links. Creating a reusable link is not
+exposed because normal MCP output and traces are not a secure credential
+delivery channel.
+
 Branding tools can audit, download, and upload the organization icon
 and light and dark logos. Downloads are written to new private local
 files, so an asset can be copied between realm-specific MCP servers

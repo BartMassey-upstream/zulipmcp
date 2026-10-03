@@ -15,7 +15,7 @@ REDACTED = "[REDACTED]"
 _SECRET_KEYS = frozenset({
     "api_key", "apikey", "password", "passwd", "secret", "token",
     "authorization", "proxy_authorization", "cookie", "set_cookie",
-    "credentials", "config_data", "invite_link", "invite_url",
+    "credentials", "config_data", "invite_link", "invite_url", "link_url",
     "invitation_link", "invitation_url", "webhook_url", "webhook_key",
 })
 _SECRET_SUFFIXES = (
@@ -134,8 +134,11 @@ def _collect_secrets(value: JSONValue) -> set[str]:
     return secrets
 
 
-def redact_secrets(value: JSONValue) -> JSONValue:
-    secrets = _collect_secrets(value)
+def redact_secrets(
+    value: JSONValue, explicit_secrets: Iterable[str] = (),
+) -> JSONValue:
+    explicit = {secret for secret in explicit_secrets if secret}
+    secrets = _collect_secrets(value) | explicit
 
     def redact(item: JSONValue, text_context: bool = False) -> JSONValue:
         if isinstance(item, dict):
@@ -152,7 +155,10 @@ def redact_secrets(value: JSONValue) -> JSONValue:
         if isinstance(item, list):
             return [redact(child, text_context) for child in item]
         if isinstance(item, str):
-            return sanitize_text(item, secrets if text_context else ())
+            return sanitize_text(
+                item,
+                explicit | (secrets if text_context else set()),
+            )
         return item
 
     return redact(value)
@@ -213,8 +219,14 @@ class APIError:
 
 
 class ZulipAPIError(Exception):
-    def __init__(self, error: APIError) -> None:
+    def __init__(
+        self,
+        error: APIError,
+        response: dict[str, JSONValue] | None = None,
+    ) -> None:
         self.error = error
+        sanitized = redact_secrets(response) if response is not None else None
+        self.response = sanitized if isinstance(sanitized, dict) else None
         super().__init__(error.message)
 
 

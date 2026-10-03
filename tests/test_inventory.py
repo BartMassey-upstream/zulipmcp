@@ -46,6 +46,8 @@ DESTRUCTIVE_TOOLS = {
     "end_session",
     "move_messages",
     "remove_reaction",
+    "revoke_email_invitation",
+    "revoke_reusable_invitation",
     "reply",
     "resolve_topic",
     "send_direct_message",
@@ -78,6 +80,10 @@ CONFIGURATION_WRITE_TOOLS = {
     "create_custom_profile_field",
     "create_linkifier",
     "create_user_group",
+    "invite_users",
+    "resend_email_invitation",
+    "revoke_email_invitation",
+    "revoke_reusable_invitation",
     "set_bot_channel_subscriptions",
     "set_channel_archived",
     "set_channel_members",
@@ -126,6 +132,11 @@ UNGATED_LOCAL_OR_TRANSIENT_TOOLS = {
     "typing",
 }
 
+OPEN_WORLD_TOOLS = {
+    "invite_users",
+    "resend_email_invitation",
+}
+
 
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> Mock:
@@ -147,10 +158,10 @@ def test_all_tools_have_audited_safety_annotations() -> None:
         name for name, annotation in annotations.items()
         if annotation.destructiveHint
     } == DESTRUCTIVE_TOOLS
-    assert all(
-        annotation.openWorldHint is False
-        for annotation in annotations.values()
-    )
+    assert {
+        name for name, annotation in annotations.items()
+        if annotation.openWorldHint
+    } == OPEN_WORLD_TOOLS
 
 
 def test_all_non_read_tools_have_an_audited_write_gate_classification() -> None:
