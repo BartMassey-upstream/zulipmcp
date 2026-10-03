@@ -232,6 +232,14 @@ Dry runs remain available while writes are disabled: they can read
 current state, validate inputs, and show proposed requests without
 issuing a mutation.
 
+`get_administration_capabilities` returns a machine-readable catalog
+of administration audit sections and mutation tools. It evaluates
+minimum feature levels, the authenticated principal's authority, and
+required server policy fields separately. The catalog also identifies
+reversibility, write gates, confirmation requirements, side effects,
+and intentional or server-side gaps, so clients can reject an
+unsupported plan before attempting its first mutation.
+
 Use this workflow for configuration changes:
 
 1. Call `get_organization_configuration` for the source and target.

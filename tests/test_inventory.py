@@ -7,12 +7,14 @@ import pytest
 from fastmcp.tools.tool import ToolResult
 
 from zulipmcp import core
+from zulipmcp.capabilities import CAPABILITY_DEFINITIONS
 from zulipmcp.configuration import REDACTED
 
 mcp_module = importlib.import_module("zulipmcp.mcp")
 
 
 READ_ONLY_TOOLS = {
+    "get_administration_capabilities",
     "get_allowed_domains",
     "get_bots",
     "get_channel_folders",
@@ -211,6 +213,29 @@ def test_all_non_read_tools_have_an_audited_write_gate_classification() -> None:
     ]
     assert set().union(*classifications) == non_read_tools
     assert sum(len(group) for group in classifications) == len(non_read_tools)
+
+
+def test_capability_catalog_references_registered_tools() -> None:
+    registered = {
+        tool.name for tool in asyncio.run(mcp_module.mcp.list_tools())
+    }
+    referenced_audits = {
+        name
+        for item in CAPABILITY_DEFINITIONS
+        for name in item.get("audit_tools", ())
+    }
+    referenced_mutations = {
+        name
+        for item in CAPABILITY_DEFINITIONS
+        for name in item.get("mutation_tools", ())
+    }
+
+    assert referenced_audits <= registered
+    assert referenced_mutations <= registered
+    assert CONFIGURATION_WRITE_TOOLS <= referenced_mutations
+    assert {
+        "delete_message_for_moderation", "report_message",
+    } <= referenced_mutations
 
 
 def test_write_gate_actions_have_no_parameters() -> None:

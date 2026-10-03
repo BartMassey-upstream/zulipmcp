@@ -905,6 +905,15 @@ def get_current_user() -> ToolResult:
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+def get_administration_capabilities() -> ToolResult:
+    """Report evaluated administration support, requirements, and gaps."""
+    return configuration_tool_result(
+        "Administration capabilities",
+        zulip_core.get_administration_capabilities(),
+    )
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def list_streams(
     include_all: bool = True,
     include_default: bool = True,

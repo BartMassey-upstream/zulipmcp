@@ -56,6 +56,7 @@ from .configuration import (
     resolve_permission_groups,
     sanitize_text,
 )
+from .capabilities import evaluate_administration_capabilities
 
 _DEFAULT_TIMEZONE = "America/Los_Angeles"
 _logger = logging.getLogger(__name__)
@@ -559,6 +560,90 @@ def get_server_settings() -> dict[str, JSONValue]:
 
 def get_current_user() -> dict[str, JSONValue]:
     return configuration_request("/users/me")
+
+
+def get_administration_capabilities() -> SectionResult:
+    server: dict[str, JSONValue] | None = None
+    principal: dict[str, JSONValue] | None = None
+    realm_fields: dict[str, JSONValue] = {}
+    warnings: list[str] = []
+    first_error: APIError | None = None
+    try:
+        server = get_server_settings()
+    except ZulipAPIError as exc:
+        first_error = exc.error
+        warnings.append(f"Server capability audit failed: {exc.error.message}")
+    try:
+        principal = get_current_user()
+    except ZulipAPIError as exc:
+        if first_error is None:
+            first_error = exc.error
+        warnings.append(f"Principal capability audit failed: {exc.error.message}")
+    feature_level = server.get("zulip_feature_level") if server else None
+    expected_realm_fields: set[str] = set()
+    if not isinstance(feature_level, int) or isinstance(feature_level, bool):
+        realm_field_status = "unknown"
+    else:
+        realm_field_status = "unsupported"
+    if isinstance(feature_level, int) and feature_level >= 382:
+        expected_realm_fields.add("realm_moderation_request_channel_id")
+    if isinstance(feature_level, int) and feature_level >= 438:
+        expected_realm_fields.add("realm_owner_full_content_access")
+    if expected_realm_fields:
+        realm_field_status = "partial"
+    if (
+        server is not None
+        and principal is not None
+        and realm_field_status != "unsupported"
+    ):
+        try:
+            with configuration_queue_snapshot() as snapshot:
+                owner_access = snapshot.data.get(
+                    "realm_owner_full_content_access"
+                )
+                if isinstance(owner_access, bool):
+                    realm_fields["realm_owner_full_content_access"] = owner_access
+                moderation_channel = snapshot.data.get(
+                    "realm_moderation_request_channel_id"
+                )
+                if (
+                    isinstance(moderation_channel, int)
+                    and not isinstance(moderation_channel, bool)
+                ):
+                    realm_fields["realm_moderation_request_channel_id"] = (
+                        moderation_channel
+                    )
+            warnings.extend(snapshot.warnings)
+            if expected_realm_fields <= realm_fields.keys():
+                realm_field_status = "ok"
+        except ZulipAPIError as exc:
+            warnings.append(
+                "Realm capability-field audit failed: " + exc.error.message
+            )
+    data = evaluate_administration_capabilities(
+        server, principal, realm_fields,
+    )
+    data["authority_status"] = {
+        "server_settings": "ok" if server is not None else "error",
+        "principal": "ok" if principal is not None else "error",
+        "realm_fields": realm_field_status,
+    }
+    if server is None and principal is None:
+        status = SectionStatus.ERROR
+    elif (
+        server is None
+        or principal is None
+        or realm_field_status in {"partial", "unknown"}
+    ):
+        status = SectionStatus.PARTIAL
+    else:
+        status = SectionStatus.OK
+    return SectionResult(
+        status=status,
+        data=data,
+        warnings=warnings,
+        error=first_error if status == SectionStatus.ERROR else None,
+    )
 
 
 def get_streams_configuration(
