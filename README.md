@@ -112,8 +112,10 @@ channels, subscriptions, user groups and membership, custom profile
 fields, allowed domains, and linkifiers. They support `dry_run`, read
 current state first, avoid duplicate creates by semantic name, and read
 back successful mutations. Allowed-domain changes require an
-organization owner. No irreversible deletion or blind realm-clone tool
-is provided.
+organization owner. Profile fields, allowed domains, and linkifiers
+also have narrowly scoped permanent-removal tools. These require an
+expected-current-state check and preview dependencies before writing.
+No blind realm-clone tool is provided.
 
 User administration can update a human user's full name, semantic role,
 and named custom profile values. It can also deactivate and reactivate a

@@ -183,6 +183,65 @@ def test_update_profile_field_treats_omitted_boolean_as_false(client: Mock) -> N
     assert result["request"] == {"display_in_profile_summary": True}
 
 
+def test_delete_profile_field_previews_values_and_reads_back(client: Mock) -> None:
+    existing = {"id": 9, "name": "Graduation year", "type": 1, "hint": "YYYY"}
+    client.call_endpoint.side_effect = [
+        server(),
+        principal(),
+        profile_fields([existing]),
+        {
+            "result": "success",
+            "msg": "",
+            "members": [
+                {
+                    "email": "one@example.test",
+                    "profile_data": {"9": {"value": "2027"}},
+                },
+                {
+                    "email": "two@example.test",
+                    "profile_data": {"9": {"value": ""}},
+                },
+                {
+                    "email": "three@example.test",
+                    "profile_data": {"9": {"value": None}},
+                },
+            ],
+        },
+        {"result": "success", "msg": ""},
+        profile_fields([]),
+    ]
+
+    result = mcp_module.delete_custom_profile_field(
+        realm_url=REALM_URL,
+        field="Graduation year",
+        expected={"field_type": 1, "hint": "YYYY"},
+    ).structured_content
+
+    assert result["status"] == "ok"
+    assert result["current"]["populated_user_count"] == 1
+    assert client.call_endpoint.call_args_list[4] == call(
+        url="/realm/profile_fields/9", method="DELETE", request={},
+    )
+
+
+def test_delete_profile_field_rejects_stale_expected_state(client: Mock) -> None:
+    existing = {"id": 9, "name": "Graduation year", "type": 1, "hint": "YYYY"}
+    client.call_endpoint.side_effect = [
+        server(), principal(), profile_fields([existing]),
+        {"result": "success", "msg": "", "members": []},
+    ]
+
+    result = mcp_module.delete_custom_profile_field(
+        realm_url=REALM_URL,
+        field="Graduation year",
+        expected={"hint": "Four digits"},
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "conflict"
+    assert client.call_endpoint.call_count == 4
+
+
 def test_allowed_domain_requires_owner(client: Mock) -> None:
     client.call_endpoint.side_effect = [server(), principal(owner=False)]
 
@@ -237,6 +296,66 @@ def test_update_allowed_domain_applies_and_reads_back(client: Mock) -> None:
         method="PATCH",
         request={"allow_subdomains": True},
     )
+
+
+def test_remove_allowed_domain_previews_dependencies_and_reads_back(client: Mock) -> None:
+    before = {"domain": "example.test", "allow_subdomains": True}
+    client.call_endpoint.side_effect = [
+        server(),
+        principal(),
+        domains([before]),
+        {
+            "result": "success",
+            "msg": "",
+            "members": [
+                {"email": "one@example.test"},
+                {"email": "two@sub.example.test"},
+                {"email": "other@elsewhere.test"},
+            ],
+        },
+        {
+            "result": "success",
+            "msg": "",
+            "invites": [
+                {"email": "invite@example.test", "is_multiuse": False},
+                {"email": None, "is_multiuse": True},
+            ],
+        },
+        {"result": "success", "msg": ""},
+        domains([]),
+    ]
+
+    result = mcp_module.remove_allowed_domain(
+        realm_url=REALM_URL,
+        domain="Example.TEST",
+        expected_allow_subdomains=True,
+    ).structured_content
+
+    assert result["status"] == "ok"
+    assert result["current"]["matching_existing_user_count"] == 2
+    assert result["current"]["matching_pending_invitation_count"] == 1
+    assert client.call_endpoint.call_args_list[5] == call(
+        url="/realm/domains/example.test", method="DELETE", request={},
+    )
+
+
+def test_remove_allowed_domain_requires_matching_expected_value(client: Mock) -> None:
+    before = {"domain": "example.test", "allow_subdomains": False}
+    client.call_endpoint.side_effect = [
+        server(), principal(), domains([before]),
+        {"result": "success", "msg": "", "members": []},
+        {"result": "success", "msg": "", "invites": []},
+    ]
+
+    result = mcp_module.remove_allowed_domain(
+        realm_url=REALM_URL,
+        domain="example.test",
+        expected_allow_subdomains=True,
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "conflict"
+    assert client.call_endpoint.call_count == 5
 
 
 def test_create_linkifier_dry_run_and_feature_gate(client: Mock) -> None:
@@ -366,3 +485,45 @@ def test_update_linkifier_verifies_clear_returned_as_null(client: Mock) -> None:
 
     assert result["status"] == "ok"
     assert result["readback"] == {"reverse_template": None}
+
+
+def test_remove_linkifier_checks_template_and_reads_back(client: Mock) -> None:
+    existing = {
+        "id": 3,
+        "pattern": r"T-(?P<id>[0-9]+)",
+        "url_template": "https://tracker.example/T-{id}",
+    }
+    client.call_endpoint.side_effect = [
+        server(), principal(), linkifiers([existing]),
+        {"result": "success", "msg": ""}, linkifiers([]),
+    ]
+
+    result = mcp_module.remove_linkifier(
+        realm_url=REALM_URL,
+        pattern=r"T-(?P<id>[0-9]+)",
+        expected_url_template="https://tracker.example/T-{id}",
+    ).structured_content
+
+    assert result["status"] == "ok"
+    assert client.call_endpoint.call_args_list[3] == call(
+        url="/realm/filters/3", method="DELETE", request={},
+    )
+
+
+def test_remove_linkifier_rejects_stale_template(client: Mock) -> None:
+    existing = {
+        "id": 3,
+        "pattern": r"T-(?P<id>[0-9]+)",
+        "url_template": "https://tracker.example/T-{id}",
+    }
+    client.call_endpoint.side_effect = [server(), principal(), linkifiers([existing])]
+
+    result = mcp_module.remove_linkifier(
+        realm_url=REALM_URL,
+        pattern=r"T-(?P<id>[0-9]+)",
+        expected_url_template="https://stale.example/T-{id}",
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "conflict"
+    assert client.call_endpoint.call_count == 3

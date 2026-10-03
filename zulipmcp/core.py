@@ -6806,6 +6806,187 @@ def _owner_destination(
     return server, None
 
 
+def delete_custom_profile_field(
+    realm_url: str,
+    field: str,
+    expected: dict[str, JSONValue],
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/realm/profile_fields/{field_id}"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    allowed = set(PROFILE_FIELD_UPDATE_FIELDS) | {"field_type"}
+    invalid = set(expected) - allowed
+    if invalid:
+        return _invalid_fields_result(endpoint, dry_run, invalid)
+    if not expected:
+        return _invalid_fields_result(
+            endpoint, dry_run, {"<expected state required>"},
+            "EXPECTED_STATE_REQUIRED",
+        )
+    try:
+        fields = _configuration_items(
+            get_profile_fields_configuration(), "custom_fields", "Profile-field",
+        )
+        current_field = _find_named_object(fields, "name", field, "profile-field name")
+        if current_field is None:
+            raise ValueError(f"Unknown profile-field name: {field}")
+        field_id = current_field.get("id")
+        if not isinstance(field_id, int) or isinstance(field_id, bool):
+            raise ValueError("Target profile field did not have a valid id")
+        members = _configuration_items(
+            get_users_configuration(), "members", "User",
+        )
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    missing = []
+    mismatches = []
+    expected_current: dict[str, JSONValue] = {}
+    for key, expected_value in expected.items():
+        present, value = _profile_current(current_field, key)
+        if not present:
+            missing.append(key)
+        else:
+            expected_current[key] = value
+            if value != _profile_value(key, expected_value):
+                mismatches.append(key)
+    resolved_endpoint = f"/realm/profile_fields/{field_id}"
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "field": {"semantic": field, "resolved": field_id},
+    }
+    if missing:
+        return MutationResult(
+            status=MutationStatus.UNSUPPORTED,
+            endpoint=resolved_endpoint,
+            dry_run=dry_run,
+            current=current_field,
+            desired={"deleted": True},
+            resolved_mappings=mappings,
+            unsupported_fields=sorted(missing),
+            error=APIError(
+                message="Profile-field response omitted expected fields",
+                code="UNSUPPORTED_FIELD",
+            ),
+        )
+    profile_key = str(field_id)
+    populated = 0
+    for member in members:
+        profile_data = member.get("profile_data")
+        value: JSONValue = None
+        if isinstance(profile_data, dict):
+            value = profile_data.get(profile_key, profile_data.get(field_id))
+            if isinstance(value, dict):
+                value = value.get("value")
+        elif isinstance(profile_data, list):
+            match = next(
+                (
+                    item for item in profile_data
+                    if isinstance(item, dict) and item.get("id") == field_id
+                ),
+                None,
+            )
+            if match is not None:
+                value = match.get("value")
+        if value not in (None, ""):
+            populated += 1
+    current: dict[str, JSONValue] = {
+        "field": current_field,
+        "expected": expected_current,
+        "populated_user_count": populated,
+        "user_count_checked": len(members),
+    }
+    desired: dict[str, JSONValue] = {"deleted": True}
+    warnings = [
+        "Deleting a custom profile field is permanent and deletes every stored user value",
+        "No inverse operation is available",
+    ]
+    if mismatches:
+        result = _conflict_result(
+            resolved_endpoint, dry_run, current, desired,
+            sorted(mismatches), warnings,
+        )
+        result.resolved_mappings = mappings
+        return result
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=resolved_endpoint,
+            dry_run=True,
+            current=current,
+            desired=desired,
+            request={},
+            changed_fields=["deleted"],
+            resolved_mappings=mappings,
+            warnings=warnings,
+        )
+    try:
+        response = configuration_mutation_request(
+            resolved_endpoint, method="DELETE", request={},
+        )
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, dry_run, exc)
+        result.current = current
+        result.desired = desired
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    try:
+        readback = next(
+            (
+                item for item in _configuration_items(
+                    get_profile_fields_configuration(), "custom_fields", "Profile-field",
+                ) if item.get("id") == field_id
+            ),
+            None,
+        )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=resolved_endpoint,
+            dry_run=False,
+            current=current,
+            desired=desired,
+            response=response,
+            changed_fields=["deleted"],
+            resolved_mappings=mappings,
+            warnings=warnings,
+            error=error,
+        )
+    persisted = readback is not None
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        status=(
+            MutationStatus.PARTIAL
+            if persisted or unsupported else MutationStatus.OK
+        ),
+        endpoint=resolved_endpoint,
+        dry_run=False,
+        current=current,
+        desired=desired,
+        response=response,
+        readback=readback,
+        changed_fields=["deleted"],
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=warnings + (
+            ["Profile field remained present after deletion"] if persisted else []
+        ),
+    )
+
+
 def add_allowed_domain(
     realm_url: str,
     domain: str,
@@ -7056,6 +7237,165 @@ def update_allowed_domain(
         resolved_mappings=mappings,
         unsupported_fields=unsupported,
         warnings=["Allowed-domain readback did not match"] if failed else [],
+    )
+
+
+def remove_allowed_domain(
+    realm_url: str,
+    domain: str,
+    expected_allow_subdomains: bool,
+    dry_run: bool = False,
+) -> MutationResult:
+    normalized = domain.strip().lower()
+    resolved_endpoint = f"/realm/domains/{urllib.parse.quote(normalized, safe='')}"
+    server, failure = _owner_destination(resolved_endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    if not normalized:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=resolved_endpoint,
+            dry_run=dry_run,
+            error=APIError(message="domain must not be empty", code="INVALID_DOMAIN"),
+        )
+    try:
+        current_domain = _find_named_object(
+            _configuration_items(
+                get_domains_configuration(), "domains", "Allowed-domain",
+            ),
+            "domain", normalized, "allowed domain",
+        )
+        if current_domain is None:
+            raise ValueError(f"Unknown allowed domain: {normalized}")
+        members = _configuration_items(get_users_configuration(), "members", "User")
+        invites = _configuration_items(
+            get_invitations_configuration(), "invites", "Invitation",
+        )
+    except ZulipAPIError as exc:
+        return _mutation_failure(resolved_endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=resolved_endpoint,
+            dry_run=dry_run,
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    current_allow = current_domain.get("allow_subdomains")
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "domain": {"semantic": domain, "resolved": normalized},
+    }
+
+    def matches(value: JSONValue) -> bool:
+        if not isinstance(value, str) or "@" not in value:
+            return False
+        email_domain = value.rsplit("@", 1)[1].casefold()
+        return email_domain == normalized or (
+            current_allow is True and email_domain.endswith("." + normalized)
+        )
+
+    current: dict[str, JSONValue] = {
+        "domain": current_domain,
+        "matching_existing_user_count": sum(
+            1 for member in members if matches(member.get("email"))
+        ),
+        "matching_pending_invitation_count": sum(
+            1 for invite in invites
+            if invite.get("is_multiuse") is False and matches(invite.get("email"))
+        ),
+    }
+    desired: dict[str, JSONValue] = {"removed": True}
+    warnings = [
+        "Removing an allowed domain is permanent but does not deactivate existing users",
+        "Pending invitations are not revoked by this operation",
+    ]
+    if not isinstance(current_allow, bool):
+        return MutationResult(
+            status=MutationStatus.UNSUPPORTED,
+            endpoint=resolved_endpoint,
+            dry_run=dry_run,
+            current=current,
+            desired=desired,
+            resolved_mappings=mappings,
+            unsupported_fields=["allow_subdomains"],
+            warnings=warnings,
+            error=APIError(
+                message="Allowed-domain response omitted allow_subdomains",
+                code="UNSUPPORTED_FIELD",
+            ),
+        )
+    if current_allow != expected_allow_subdomains:
+        result = _conflict_result(
+            resolved_endpoint, dry_run, current, desired,
+            ["allow_subdomains"], warnings,
+        )
+        result.resolved_mappings = mappings
+        return result
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=resolved_endpoint,
+            dry_run=True,
+            current=current,
+            desired=desired,
+            changed_fields=["removed"],
+            resolved_mappings=mappings,
+            warnings=warnings,
+        )
+    try:
+        response = configuration_mutation_request(
+            resolved_endpoint, method="DELETE", request={},
+        )
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, dry_run, exc)
+        result.current = current
+        result.desired = desired
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    try:
+        readback = _find_named_object(
+            _configuration_items(
+                get_domains_configuration(), "domains", "Allowed-domain",
+            ),
+            "domain", normalized, "allowed domain",
+        )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=resolved_endpoint,
+            dry_run=False,
+            current=current,
+            desired=desired,
+            response=response,
+            changed_fields=["removed"],
+            resolved_mappings=mappings,
+            warnings=warnings,
+            error=error,
+        )
+    persisted = readback is not None
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        status=(
+            MutationStatus.PARTIAL
+            if persisted or unsupported else MutationStatus.OK
+        ),
+        endpoint=resolved_endpoint,
+        dry_run=False,
+        current=current,
+        desired=desired,
+        response=response,
+        readback=readback,
+        changed_fields=["removed"],
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=warnings + (
+            ["Allowed domain remained present after removal"] if persisted else []
+        ),
     )
 
 
@@ -7417,6 +7757,124 @@ def update_linkifier(
         resolved_mappings=mappings,
         unsupported_fields=unsupported,
         warnings=["Linkifier readback did not match"] if failed else [],
+    )
+
+
+def remove_linkifier(
+    realm_url: str,
+    pattern: str,
+    expected_url_template: str,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/realm/filters/{filter_id}"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    try:
+        linkifiers = _configuration_items(
+            get_linkifiers_configuration(), "linkifiers", "Linkifier",
+        )
+        current_linkifier = _find_named_object(
+            linkifiers, "pattern", pattern, "linkifier pattern",
+        )
+        if current_linkifier is None:
+            raise ValueError(f"Unknown linkifier pattern: {pattern}")
+        filter_id = current_linkifier.get("id")
+        if not isinstance(filter_id, int) or isinstance(filter_id, bool):
+            raise ValueError("Target linkifier did not have a valid id")
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            status=MutationStatus.ERROR,
+            endpoint=endpoint,
+            dry_run=dry_run,
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    resolved_endpoint = f"/realm/filters/{filter_id}"
+    desired: dict[str, JSONValue] = {"removed": True}
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "linkifier": {"semantic": pattern, "resolved": filter_id},
+    }
+    warnings = [
+        "Removing a linkifier is permanent",
+        "Stored message text is unchanged, but rendered links may disappear",
+    ]
+    if current_linkifier.get("url_template") != expected_url_template:
+        result = _conflict_result(
+            resolved_endpoint, dry_run, current_linkifier, desired,
+            ["url_template"], warnings,
+        )
+        result.resolved_mappings = mappings
+        return result
+    if dry_run:
+        return MutationResult(
+            status=MutationStatus.DRY_RUN,
+            endpoint=resolved_endpoint,
+            dry_run=True,
+            current=current_linkifier,
+            desired=desired,
+            changed_fields=["removed"],
+            resolved_mappings=mappings,
+            warnings=warnings,
+        )
+    try:
+        response = configuration_mutation_request(
+            resolved_endpoint, method="DELETE", request={},
+        )
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, dry_run, exc)
+        result.current = current_linkifier
+        result.desired = desired
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    try:
+        readback = next(
+            (
+                item for item in _configuration_items(
+                    get_linkifiers_configuration(), "linkifiers", "Linkifier",
+                ) if item.get("id") == filter_id
+            ),
+            None,
+        )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            status=MutationStatus.PARTIAL,
+            endpoint=resolved_endpoint,
+            dry_run=False,
+            current=current_linkifier,
+            desired=desired,
+            response=response,
+            changed_fields=["removed"],
+            resolved_mappings=mappings,
+            warnings=warnings,
+            error=error,
+        )
+    persisted = readback is not None
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        status=(
+            MutationStatus.PARTIAL
+            if persisted or unsupported else MutationStatus.OK
+        ),
+        endpoint=resolved_endpoint,
+        dry_run=False,
+        current=current_linkifier,
+        desired=desired,
+        response=response,
+        readback=readback,
+        changed_fields=["removed"],
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=warnings + (
+            ["Linkifier remained present after removal"] if persisted else []
+        ),
     )
 
 

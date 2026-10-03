@@ -1647,6 +1647,22 @@ def update_custom_profile_field(
     )
 
 
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def delete_custom_profile_field(
+    realm_url: str,
+    field: str,
+    expected: dict[str, Any],
+    dry_run: bool = False,
+) -> ToolResult:
+    """Permanently delete a profile field and all of its stored values."""
+    return mutation_tool_result(
+        "Custom profile-field deletion",
+        zulip_core.delete_custom_profile_field(
+            realm_url, field, expected, dry_run,
+        ),
+    )
+
+
 @mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def add_allowed_domain(
     realm_url: str,
@@ -1684,6 +1700,22 @@ def update_allowed_domain(
     )
 
 
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def remove_allowed_domain(
+    realm_url: str,
+    domain: str,
+    expected_allow_subdomains: bool,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Permanently remove one owner-authorized allowed email domain."""
+    return mutation_tool_result(
+        "Allowed-domain removal",
+        zulip_core.remove_allowed_domain(
+            realm_url, domain, expected_allow_subdomains, dry_run,
+        ),
+    )
+
+
 @mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
 def create_linkifier(
     realm_url: str,
@@ -1714,6 +1746,22 @@ def update_linkifier(
         "Linkifier update",
         zulip_core.update_linkifier(
             realm_url, pattern, changes, expected, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def remove_linkifier(
+    realm_url: str,
+    pattern: str,
+    expected_url_template: str,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Permanently remove a linkifier after an expected-template check."""
+    return mutation_tool_result(
+        "Linkifier removal",
+        zulip_core.remove_linkifier(
+            realm_url, pattern, expected_url_template, dry_run,
         ),
     )
 
