@@ -1022,6 +1022,16 @@ def get_custom_emoji() -> ToolResult:
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+def get_channel_folders() -> ToolResult:
+    """Audit channel folders, their channels, and unassigned channels."""
+    return _configuration_collection_result(
+        "Channel folders",
+        zulip_core.get_channel_folders_configuration,
+        "channel_folders",
+    )
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def get_invitations() -> ToolResult:
     """Audit pending invitations when the authenticated principal is allowed."""
     return _configuration_collection_result(
@@ -1475,6 +1485,88 @@ def set_default_channel(
             channel,
             {"is_default_stream": is_default},
             dry_run=dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def set_default_channels(
+    realm_url: str,
+    channels: list[str],
+    expected_channels: list[str] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Converge the exact set of active public default channels."""
+    return mutation_tool_result(
+        "Exact default-channel update",
+        zulip_core.set_default_channels(
+            realm_url, channels, expected_channels, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
+def create_channel_folder(
+    realm_url: str,
+    name: str,
+    description: str = "",
+    dry_run: bool = False,
+) -> ToolResult:
+    """Create a channel folder idempotently by semantic name."""
+    return mutation_tool_result(
+        "Channel-folder creation",
+        zulip_core.create_channel_folder(
+            realm_url, name, description, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def update_channel_folder(
+    realm_url: str,
+    folder: str,
+    changes: dict[str, Any],
+    expected: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Update, archive, or unarchive a named channel folder."""
+    return mutation_tool_result(
+        "Channel-folder update",
+        zulip_core.update_channel_folder(
+            realm_url, folder, changes, expected, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def set_channel_folder(
+    realm_url: str,
+    channel: str,
+    folder: str | None,
+    expected_folder: str | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Place a channel in a named folder, or remove its placement."""
+    return mutation_tool_result(
+        "Channel-folder placement",
+        zulip_core.set_channel_folder(
+            realm_url, channel, folder, expected_folder, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def set_channel_folder_order(
+    realm_url: str,
+    folders: list[str],
+    expected_order: list[str],
+    dry_run: bool = False,
+) -> ToolResult:
+    """Set the exact order of every active and archived channel folder."""
+    return mutation_tool_result(
+        "Channel-folder ordering",
+        zulip_core.set_channel_folder_order(
+            realm_url, folders, expected_order, dry_run,
         ),
     )
 

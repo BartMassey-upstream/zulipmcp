@@ -611,6 +611,51 @@ def get_invitations_configuration() -> dict[str, JSONValue]:
     return configuration_request("/invites")
 
 
+def get_channel_folders_configuration() -> dict[str, JSONValue]:
+    response = configuration_request(
+        "/channel_folders", request={"include_archived": True},
+    )
+    folders = response.get("channel_folders")
+    if not isinstance(folders, list):
+        return response
+    streams = get_streams_configuration(
+        include_all=True, include_default=True, exclude_archived=False,
+    ).get("streams")
+    if not isinstance(streams, list):
+        return response
+    channels_by_folder: dict[int, list[JSONValue]] = {}
+    unassigned: list[JSONValue] = []
+    for stream in streams:
+        if not isinstance(stream, dict):
+            continue
+        channel = {
+            key: stream[key]
+            for key in ("stream_id", "name", "is_archived") if key in stream
+        }
+        folder_id = stream.get("folder_id")
+        if isinstance(folder_id, int) and not isinstance(folder_id, bool):
+            channels_by_folder.setdefault(folder_id, []).append(channel)
+        elif folder_id is None:
+            unassigned.append(channel)
+    enriched: list[JSONValue] = []
+    for folder in folders:
+        if not isinstance(folder, dict):
+            enriched.append(folder)
+            continue
+        item = dict(folder)
+        folder_id = item.get("id")
+        item["channels"] = (
+            channels_by_folder.get(folder_id, [])
+            if isinstance(folder_id, int) and not isinstance(folder_id, bool) else []
+        )
+        enriched.append(item)
+    return {
+        **response,
+        "channel_folders": enriched,
+        "unassigned_channels": unassigned,
+    }
+
+
 def get_channel_subscribers_configuration(stream_id: int) -> dict[str, JSONValue]:
     return configuration_request(f"/streams/{stream_id}/members")
 
@@ -4117,6 +4162,615 @@ def create_bot(
     )
 
 
+def _folder_inventory() -> list[dict[str, JSONValue]]:
+    folders = get_channel_folders_configuration().get("channel_folders")
+    if not isinstance(folders, list):
+        raise ValueError("Channel-folder inventory was absent or null")
+    return [folder for folder in folders if isinstance(folder, dict)]
+
+
+def _find_folder(
+    folders: list[dict[str, JSONValue]], name: str,
+) -> dict[str, JSONValue] | None:
+    exact = [folder for folder in folders if folder.get("name") == name]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise ValueError(f"Ambiguous channel-folder name: {name}")
+    folded = [
+        folder for folder in folders
+        if isinstance(folder.get("name"), str)
+        and folder["name"].casefold() == name.casefold()
+    ]
+    if len(folded) == 1:
+        return folded[0]
+    if len(folded) > 1:
+        raise ValueError(f"Ambiguous channel-folder name: {name}")
+    return None
+
+
+def _folder_id(folder: dict[str, JSONValue]) -> int:
+    folder_id = folder.get("id")
+    if not isinstance(folder_id, int) or isinstance(folder_id, bool):
+        raise ValueError("Channel folder did not have a valid id")
+    return folder_id
+
+
+def _folder_destination(
+    endpoint: str, realm_url: str, dry_run: bool, minimum_feature_level: int = 389,
+) -> tuple[dict[str, JSONValue] | None, MutationResult | None]:
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return None, failure
+    assert server is not None
+    feature_level = server.get("zulip_feature_level")
+    if not isinstance(feature_level, int) or feature_level < minimum_feature_level:
+        return None, MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            error=APIError(
+                message=(
+                    "Channel folders require Zulip feature level "
+                    f"{minimum_feature_level}"
+                ),
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    return server, None
+
+
+def create_channel_folder(
+    realm_url: str,
+    name: str,
+    description: str = "",
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/channel_folders/create"
+    server, failure = _folder_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    if not name.strip():
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(message="name must not be empty", code="INVALID_FOLDER_NAME"),
+        )
+    desired: dict[str, JSONValue] = {"name": name, "description": description}
+    try:
+        existing = _find_folder(_folder_inventory(), name)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run, desired=desired,
+            error=APIError(message=str(exc), code="INVENTORY_ERROR"),
+        )
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+    }
+    if existing is not None:
+        if (
+            existing.get("description") == description
+            and existing.get("is_archived") is not True
+        ):
+            mappings["folder"] = {"semantic": name, "resolved": existing.get("id")}
+            return MutationResult(
+                MutationStatus.DRY_RUN if dry_run else MutationStatus.OK,
+                endpoint,
+                dry_run=dry_run,
+                current=existing,
+                desired=desired,
+                readback=existing,
+                resolved_mappings=mappings,
+                warnings=["Channel folder already exists with the requested configuration"],
+            )
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+            current=existing, desired=desired, resolved_mappings=mappings,
+            error=APIError(
+                message="Channel folder already exists with different configuration",
+                code="FOLDER_ALREADY_EXISTS",
+            ),
+        )
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, endpoint, dry_run=True,
+            desired=desired, request=desired, changed_fields=["created"],
+            resolved_mappings=mappings,
+        )
+    try:
+        response = configuration_mutation_request(endpoint, "POST", desired)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, False, exc)
+        result.desired = desired
+        result.request = desired
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback = _find_folder(_folder_inventory(), name)
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=False,
+            desired=desired, request=desired, response=response,
+            changed_fields=["created"], resolved_mappings=mappings, error=error,
+        )
+    confirmed = (
+        readback is not None
+        and readback.get("description") == description
+        and readback.get("is_archived") is not True
+    )
+    if readback is not None:
+        mappings["folder"] = {"semantic": name, "resolved": readback.get("id")}
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        MutationStatus.OK if confirmed and not unsupported else MutationStatus.PARTIAL,
+        endpoint,
+        dry_run=False,
+        desired=desired,
+        request=desired,
+        response=response,
+        readback=readback,
+        changed_fields=["created"],
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=[] if confirmed else ["Channel-folder readback did not match"],
+    )
+
+
+def update_channel_folder(
+    realm_url: str,
+    folder: str,
+    changes: dict[str, JSONValue],
+    expected: dict[str, JSONValue] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/channel_folders/{channel_folder_id}"
+    server, failure = _folder_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    expected = dict(expected or {})
+    allowed = {"name", "description", "is_archived"}
+    invalid = (set(changes) | set(expected)) - allowed
+    if invalid:
+        return _invalid_fields_result(endpoint, dry_run, invalid)
+    if not changes:
+        return _invalid_fields_result(endpoint, dry_run, {"<no changes>"}, "EMPTY_CHANGES")
+    if "is_archived" in changes and "is_archived" not in expected:
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+            desired=changes,
+            error=APIError(
+                message="expected.is_archived is required for folder lifecycle changes",
+                code="EXPECTED_STATE_REQUIRED",
+            ),
+        )
+    if any(value is None for value in changes.values()):
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run, desired=changes,
+            error=APIError(message="Channel-folder values cannot be null", code="NULL_WRITE_VALUE"),
+        )
+    try:
+        current_folder = _find_folder(_folder_inventory(), folder)
+        if current_folder is None:
+            raise ValueError(f"Unknown channel-folder name: {folder}")
+        folder_id = _folder_id(current_folder)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run, desired=changes,
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    resolved_endpoint = f"/channel_folders/{folder_id}"
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "folder": {"semantic": folder, "resolved": folder_id},
+    }
+    missing = sorted(
+        key for key in set(changes) | set(expected) if key not in current_folder
+    )
+    if missing:
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, resolved_endpoint, dry_run=dry_run,
+            current=current_folder, desired=changes, resolved_mappings=mappings,
+            unsupported_fields=missing,
+            error=APIError(
+                message="Channel-folder response omitted requested fields",
+                code="UNSUPPORTED_FIELD",
+            ),
+        )
+    mismatches = sorted(
+        key for key, value in expected.items() if current_folder.get(key) != value
+    )
+    warnings = []
+    channels = current_folder.get("channels")
+    if changes.get("is_archived") is True and isinstance(channels, list) and channels:
+        warnings.append(
+            "Archiving this folder does not move its member channels"
+        )
+    if mismatches:
+        result = _conflict_result(
+            resolved_endpoint, dry_run, current_folder, changes, mismatches, warnings,
+        )
+        result.resolved_mappings = mappings
+        return result
+    changed = sorted(
+        key for key, value in changes.items() if current_folder.get(key) != value
+    )
+    request = {key: changes[key] for key in changed}
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, resolved_endpoint, dry_run=True,
+            current=current_folder, desired=changes, request=request,
+            changed_fields=changed, resolved_mappings=mappings, warnings=warnings,
+        )
+    if not changed:
+        return MutationResult(
+            MutationStatus.OK, resolved_endpoint, dry_run=False,
+            current=current_folder, desired=changes, readback=current_folder,
+            resolved_mappings=mappings,
+            warnings=warnings + ["Channel folder already had the desired configuration"],
+        )
+    try:
+        response = configuration_mutation_request(
+            resolved_endpoint, "PATCH", request,
+        )
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, False, exc)
+        result.current = current_folder
+        result.desired = changes
+        result.request = request
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    try:
+        readback = next(
+            (item for item in _folder_inventory() if item.get("id") == folder_id),
+            None,
+        )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+            current=current_folder, desired=changes, request=request,
+            response=response, changed_fields=changed, resolved_mappings=mappings,
+            warnings=warnings, error=error,
+        )
+    failed = [
+        key for key, value in changes.items()
+        if readback is None or readback.get(key) != value
+    ]
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        MutationStatus.OK if not failed and not unsupported else MutationStatus.PARTIAL,
+        resolved_endpoint,
+        dry_run=False,
+        current=current_folder,
+        desired=changes,
+        request=request,
+        response=response,
+        readback=readback,
+        changed_fields=changed,
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=warnings + (
+            ["Channel-folder readback did not match"] if failed else []
+        ),
+    )
+
+
+def set_channel_folder(
+    realm_url: str,
+    channel: str,
+    folder: str | None,
+    expected_folder: str | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/streams/{stream_id}"
+    server, failure = _folder_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    try:
+        folders = _folder_inventory()
+        streams = _channel_inventory()
+        current_channel = _find_channel(streams, channel)
+        if current_channel is None:
+            raise ValueError(f"Unknown channel name: {channel}")
+        stream_id = current_channel.get("stream_id")
+        if not isinstance(stream_id, int) or isinstance(stream_id, bool):
+            raise ValueError("Target channel did not have a valid stream_id")
+        target = _find_folder(folders, folder) if folder is not None else None
+        if folder is not None and target is None:
+            raise ValueError(f"Unknown channel-folder name: {folder}")
+        if target is not None and target.get("is_archived") is True:
+            raise ValueError(f"Target channel folder is archived: {folder}")
+        target_id = _folder_id(target) if target is not None else None
+        expected_item = (
+            _find_folder(folders, expected_folder)
+            if expected_folder is not None else None
+        )
+        if expected_folder is not None and expected_item is None:
+            raise ValueError(f"Unknown expected channel-folder name: {expected_folder}")
+        expected_id = _folder_id(expected_item) if expected_item is not None else None
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            desired={"folder": folder},
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    if "folder_id" not in current_channel:
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            current=current_channel, desired={"folder": folder},
+            unsupported_fields=["folder_id"],
+            error=APIError(
+                message="Channel response omitted folder_id", code="UNSUPPORTED_FIELD",
+            ),
+        )
+    current_id = current_channel.get("folder_id")
+    current_item = next(
+        (item for item in folders if item.get("id") == current_id), None,
+    )
+    if current_id is not None and current_item is None:
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            current={"folder_id": current_id}, desired={"folder": folder},
+            error=APIError(
+                message="Channel references an unknown folder",
+                code="FOLDER_INVENTORY_INCOMPLETE",
+            ),
+        )
+    current_name = current_item.get("name") if current_item is not None else None
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "channel": {"semantic": channel, "resolved": stream_id},
+        "folder": {"semantic": folder, "resolved": target_id},
+    }
+    if expected_folder is not None:
+        mappings["expected_folder"] = {
+            "semantic": expected_folder, "resolved": expected_id,
+        }
+        if current_id != expected_id:
+            result = _conflict_result(
+                f"/streams/{stream_id}", dry_run,
+                {"folder": current_name}, {"folder": folder}, ["folder"], [],
+            )
+            result.resolved_mappings = mappings
+            return result
+    if current_id is not None and current_id != target_id and expected_folder is None:
+        return MutationResult(
+            MutationStatus.CONFLICT, f"/streams/{stream_id}", dry_run=dry_run,
+            current={"folder": current_name}, desired={"folder": folder},
+            resolved_mappings=mappings,
+            error=APIError(
+                message="expected_folder is required when moving or removing a channel",
+                code="EXPECTED_STATE_REQUIRED",
+            ),
+        )
+    request: dict[str, JSONValue] = (
+        {}
+        if current_id == target_id
+        else {"folder_id": target_id if target_id is not None else "null"}
+    )
+    resolved_endpoint = f"/streams/{stream_id}"
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, resolved_endpoint, dry_run=True,
+            current={"folder": current_name}, desired={"folder": folder},
+            request=request, changed_fields=list(request),
+            resolved_mappings=mappings,
+        )
+    if not request:
+        return MutationResult(
+            MutationStatus.OK, resolved_endpoint, dry_run=False,
+            current={"folder": current_name}, desired={"folder": folder},
+            readback={"folder": current_name}, resolved_mappings=mappings,
+            warnings=["Channel already had the requested folder placement"],
+        )
+    try:
+        response = configuration_mutation_request(
+            resolved_endpoint, "PATCH", request,
+        )
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, False, exc)
+        result.current = {"folder": current_name}
+        result.desired = {"folder": folder}
+        result.request = request
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback = next(
+            (item for item in _channel_inventory() if item.get("stream_id") == stream_id),
+            None,
+        )
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+            current={"folder": current_name}, desired={"folder": folder},
+            request=request, response=response, changed_fields=["folder_id"],
+            resolved_mappings=mappings, error=error,
+        )
+    confirmed = (
+        readback is not None
+        and "folder_id" in readback
+        and readback.get("folder_id") == target_id
+    )
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        MutationStatus.OK if confirmed and not unsupported else MutationStatus.PARTIAL,
+        resolved_endpoint,
+        dry_run=False,
+        current={"folder": current_name},
+        desired={"folder": folder},
+        request=request,
+        response=response,
+        readback={"folder": folder} if confirmed else readback,
+        changed_fields=["folder_id"],
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=[] if confirmed else ["Channel-folder placement readback did not match"],
+    )
+
+
+def set_channel_folder_order(
+    realm_url: str,
+    folders: list[str],
+    expected_order: list[str],
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/channel_folders"
+    server, failure = _folder_destination(endpoint, realm_url, dry_run, 414)
+    if failure is not None:
+        return failure
+    assert server is not None
+    try:
+        inventory = _folder_inventory()
+        missing_order = [
+            str(item.get("name", "<unnamed>")) for item in inventory
+            if not isinstance(item.get("order"), int)
+            or isinstance(item.get("order"), bool)
+        ]
+        if missing_order:
+            return MutationResult(
+                MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+                desired={"folders": folders}, unsupported_fields=["order"],
+                error=APIError(
+                    message="Channel-folder inventory omitted order for: "
+                    + ", ".join(sorted(missing_order)),
+                    code="UNSUPPORTED_FIELD",
+                ),
+            )
+        resolved = []
+        expected_resolved = []
+        for name in folders:
+            item = _find_folder(inventory, name)
+            if item is None:
+                raise ValueError(f"Unknown channel-folder name: {name}")
+            resolved.append(item)
+        for name in expected_order:
+            item = _find_folder(inventory, name)
+            if item is None:
+                raise ValueError(f"Unknown expected channel-folder name: {name}")
+            expected_resolved.append(item)
+        all_ids = {_folder_id(item) for item in inventory}
+        desired_ids = [_folder_id(item) for item in resolved]
+        expected_ids = [_folder_id(item) for item in expected_resolved]
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            desired={"folders": folders},
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    if len(desired_ids) != len(all_ids) or set(desired_ids) != all_ids:
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+            desired={"folders": folders},
+            error=APIError(
+                message="folders must contain every active and archived folder exactly once",
+                code="INCOMPLETE_FOLDER_ORDER",
+            ),
+        )
+    current_inventory = sorted(
+        enumerate(inventory),
+        key=lambda pair: (
+            pair[1].get("order")
+            if isinstance(pair[1].get("order"), int) else pair[0]
+        ),
+    )
+    current_ids = [_folder_id(item) for _, item in current_inventory]
+    current_names = [str(item.get("name")) for _, item in current_inventory]
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "folders": [
+            {"semantic": name, "resolved": folder_id}
+            for name, folder_id in zip(folders, desired_ids)
+        ],
+    }
+    if current_ids != expected_ids:
+        result = _conflict_result(
+            endpoint, dry_run, {"folders": current_names},
+            {"folders": folders}, ["folders"], [],
+        )
+        result.resolved_mappings = mappings
+        return result
+    request: dict[str, JSONValue] = (
+        {} if current_ids == desired_ids else {"order": desired_ids}
+    )
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, endpoint, dry_run=True,
+            current={"folders": current_names}, desired={"folders": folders},
+            request=request, changed_fields=list(request),
+            resolved_mappings=mappings,
+        )
+    if not request:
+        return MutationResult(
+            MutationStatus.OK, endpoint, dry_run=False,
+            current={"folders": current_names}, desired={"folders": folders},
+            readback={"folders": current_names}, resolved_mappings=mappings,
+            warnings=["Channel-folder order already matched"],
+        )
+    try:
+        response = configuration_mutation_request(endpoint, "PATCH", request)
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, False, exc)
+        result.current = {"folders": current_names}
+        result.desired = {"folders": folders}
+        result.request = request
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback_inventory = _folder_inventory()
+        readback_sorted = sorted(
+            enumerate(readback_inventory),
+            key=lambda pair: (
+                pair[1].get("order")
+                if isinstance(pair[1].get("order"), int) else pair[0]
+            ),
+        )
+        readback_ids = [_folder_id(item) for _, item in readback_sorted]
+        readback_names = [str(item.get("name")) for _, item in readback_sorted]
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=False,
+            current={"folders": current_names}, desired={"folders": folders},
+            request=request, response=response, changed_fields=["order"],
+            resolved_mappings=mappings, error=error,
+        )
+    confirmed = readback_ids == desired_ids
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        MutationStatus.OK if confirmed and not unsupported else MutationStatus.PARTIAL,
+        endpoint,
+        dry_run=False,
+        current={"folders": current_names},
+        desired={"folders": folders},
+        request=request,
+        response=response,
+        readback={"folders": readback_names},
+        changed_fields=["order"],
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=[] if confirmed else ["Channel-folder order readback did not match"],
+    )
+
+
 def _channel_inventory() -> list[dict[str, JSONValue]]:
     response = get_streams_configuration(
         include_all=True,
@@ -5315,6 +5969,296 @@ def update_channel_configuration(
         resolved_mappings=mappings,
         unsupported_fields=unsupported,
         warnings=warnings,
+    )
+
+
+def set_default_channels(
+    realm_url: str,
+    channels: list[str],
+    expected_channels: list[str] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/streams/{stream_id}"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    if len(set(channels)) != len(channels):
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            desired={"channels": channels},
+            error=APIError(
+                message="channels must not contain duplicates",
+                code="DUPLICATE_CHANNEL",
+            ),
+        )
+    if expected_channels is not None and len(set(expected_channels)) != len(
+        expected_channels
+    ):
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            desired={"channels": channels},
+            error=APIError(
+                message="expected_channels must not contain duplicates",
+                code="DUPLICATE_CHANNEL",
+            ),
+        )
+    feature_level = server.get("zulip_feature_level")
+    if not isinstance(feature_level, int) or feature_level < 200:
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            desired={"channels": channels},
+            error=APIError(
+                message="Exact default-channel convergence requires Zulip feature level 200",
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    try:
+        streams = _channel_inventory()
+        incomplete = [
+            str(item.get("name", "<unnamed>")) for item in streams
+            if not all(
+                isinstance(item.get(key), bool)
+                for key in (
+                    "is_default", "is_archived", "invite_only", "is_web_public",
+                )
+            )
+        ]
+        if incomplete:
+            return MutationResult(
+                MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+                desired={"channels": channels},
+                unsupported_fields=["complete_channel_inventory"],
+                error=APIError(
+                    message=(
+                        "Exact defaults require complete status and privacy fields; "
+                        "incomplete channels: " + ", ".join(sorted(incomplete))
+                    ),
+                    code="CHANNEL_VISIBILITY_INCOMPLETE",
+                ),
+            )
+        desired_items = []
+        for name in channels:
+            item = _find_channel(streams, name)
+            if item is None:
+                raise ValueError(f"Unknown channel name: {name}")
+            if item.get("is_archived") is True:
+                raise ValueError(f"Default channel must be active: {name}")
+            if _channel_privacy(item) != "public":
+                raise ValueError(f"Default channel must be public: {name}")
+            desired_items.append(item)
+        expected_items = []
+        for name in expected_channels or []:
+            item = _find_channel(streams, name)
+            if item is None:
+                raise ValueError(f"Unknown expected channel name: {name}")
+            expected_items.append(item)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            desired={"channels": channels},
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    invalid_defaults = [
+        str(item.get("name")) for item in streams
+        if item.get("is_default") is True
+        and (item.get("is_archived") is True or _channel_privacy(item) != "public")
+    ]
+    if invalid_defaults:
+        return MutationResult(
+            MutationStatus.CONFLICT, endpoint, dry_run=dry_run,
+            desired={"channels": channels},
+            error=APIError(
+                message="Default-channel inventory contains archived or non-public channels: "
+                + ", ".join(sorted(invalid_defaults)),
+                code="INVALID_DEFAULT_CHANNEL_INVENTORY",
+            ),
+        )
+    current_items = [
+        item for item in streams
+        if item.get("is_default") is True and item.get("is_archived") is not True
+    ]
+    current_names = {
+        str(item["name"]) for item in current_items if isinstance(item.get("name"), str)
+    }
+    desired_names = {
+        str(item["name"]) for item in desired_items if isinstance(item.get("name"), str)
+    }
+    expected_names = {
+        str(item["name"]) for item in expected_items if isinstance(item.get("name"), str)
+    }
+    additions = sorted(desired_names - current_names)
+    removals = sorted(current_names - desired_names)
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "channels": [
+            {"semantic": name, "resolved": item.get("stream_id")}
+            for name, item in zip(channels, desired_items)
+        ],
+    }
+    if expected_channels is not None:
+        mappings["expected_channels"] = [
+            {"semantic": name, "resolved": item.get("stream_id")}
+            for name, item in zip(expected_channels, expected_items)
+        ]
+        if current_names != expected_names:
+            result = _conflict_result(
+                endpoint,
+                dry_run,
+                {"channels": sorted(current_names)},
+                {"channels": sorted(desired_names)},
+                ["channels"],
+                [],
+            )
+            result.resolved_mappings = mappings
+            return result
+    if removals and expected_channels is None:
+        return MutationResult(
+            MutationStatus.CONFLICT,
+            endpoint,
+            dry_run=dry_run,
+            current={"channels": sorted(current_names)},
+            desired={"channels": sorted(desired_names)},
+            resolved_mappings=mappings,
+            error=APIError(
+                message="expected_channels is required when removing default channels",
+                code="EXPECTED_STATE_REQUIRED",
+            ),
+        )
+    by_name = {
+        str(item["name"]): item
+        for item in streams if isinstance(item.get("name"), str)
+    }
+    operations = [(name, True) for name in additions] + [
+        (name, False) for name in removals
+    ]
+    steps: list[dict[str, JSONValue]] = []
+    for name, value in operations:
+        stream_id = by_name[name].get("stream_id")
+        if not isinstance(stream_id, int) or isinstance(stream_id, bool):
+            return MutationResult(
+                MutationStatus.ERROR, endpoint, dry_run=dry_run,
+                current={"channels": sorted(current_names)},
+                desired={"channels": sorted(desired_names)},
+                resolved_mappings=mappings,
+                error=APIError(
+                    message=f"Channel {name!r} did not have a valid stream_id",
+                    code="SEMANTIC_RESOLUTION_ERROR",
+                ),
+            )
+        steps.append(_channel_step(
+            f"{'add' if value else 'remove'}:{name}",
+            "PATCH", f"/streams/{stream_id}",
+            {"is_default_stream": value}, "planned" if dry_run else "pending",
+        ))
+    request: dict[str, JSONValue] = {
+        "to_add": additions,
+        "to_remove": removals,
+    }
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN,
+            endpoint,
+            dry_run=True,
+            current={"channels": sorted(current_names)},
+            desired={"channels": sorted(desired_names)},
+            request=request,
+            changed_fields=sorted(additions + removals),
+            resolved_mappings=mappings,
+            steps=steps,
+        )
+    if not operations:
+        return MutationResult(
+            MutationStatus.OK,
+            endpoint,
+            dry_run=False,
+            current={"channels": sorted(current_names)},
+            desired={"channels": sorted(desired_names)},
+            readback={"channels": sorted(current_names)},
+            resolved_mappings=mappings,
+            warnings=["Default channels already matched the requested exact set"],
+        )
+    completed: list[str] = []
+    responses: dict[str, JSONValue] = {}
+    for index, (name, value) in enumerate(operations):
+        step = steps[index]
+        step_endpoint = step["endpoint"]
+        assert isinstance(step_endpoint, str)
+        try:
+            response = configuration_mutation_request(
+                step_endpoint, "PATCH", {"is_default_stream": value},
+            )
+        except ZulipAPIError as exc:
+            steps[index] = _channel_step(
+                str(step["name"]), "PATCH", step_endpoint,
+                {"is_default_stream": value}, "failed", error=exc.error,
+            )
+            return MutationResult(
+                MutationStatus.PARTIAL if completed else _mutation_status(exc),
+                endpoint,
+                dry_run=False,
+                current={"channels": sorted(current_names)},
+                desired={"channels": sorted(desired_names)},
+                request=request,
+                response=responses or None,
+                changed_fields=sorted(additions + removals),
+                resolved_mappings=mappings,
+                error=exc.error,
+                steps=steps,
+                completed_fields=completed,
+                remaining_fields=[item[0] for item in operations[index:]],
+                failed_step=str(step["name"]),
+            )
+        responses[name] = response
+        completed.append(name)
+        steps[index] = _channel_step(
+            str(step["name"]), "PATCH", step_endpoint,
+            {"is_default_stream": value}, "ok", response=response,
+        )
+    try:
+        readback_streams = _channel_inventory()
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=False,
+            current={"channels": sorted(current_names)},
+            desired={"channels": sorted(desired_names)}, request=request,
+            response=responses, changed_fields=sorted(additions + removals),
+            resolved_mappings=mappings, error=error, steps=steps,
+            completed_fields=completed, remaining_fields=sorted(desired_names),
+            failed_step="readback",
+        )
+    readback_complete = all(
+        isinstance(item.get("is_default"), bool)
+        and isinstance(item.get("is_archived"), bool)
+        for item in readback_streams
+    )
+    readback_names = {
+        str(item["name"]) for item in readback_streams
+        if item.get("is_default") is True
+        and item.get("is_archived") is not True
+        and isinstance(item.get("name"), str)
+    }
+    confirmed = readback_complete and readback_names == desired_names
+    return MutationResult(
+        MutationStatus.OK if confirmed else MutationStatus.PARTIAL,
+        endpoint,
+        dry_run=False,
+        current={"channels": sorted(current_names)},
+        desired={"channels": sorted(desired_names)},
+        request=request,
+        response=responses,
+        readback={"channels": sorted(readback_names)},
+        changed_fields=sorted(additions + removals),
+        resolved_mappings=mappings,
+        warnings=[] if confirmed else ["Default-channel readback did not match"],
+        steps=steps,
+        completed_fields=completed if confirmed else [],
+        remaining_fields=[] if confirmed else sorted(desired_names ^ readback_names),
     )
 
 

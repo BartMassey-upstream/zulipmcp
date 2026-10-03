@@ -173,6 +173,13 @@ folder membership, default-channel status, and realm settings that
 reference the channel. Default or referenced channels must be detached
 explicitly before archival.
 
+Channel-folder tools audit folder membership, create and update folders,
+archive or unarchive them without silently moving channels, place or
+remove channels, and converge the full folder order. Folder operations
+are feature-gated for Zulip versions that support them. Exact
+default-channel convergence applies additions before guarded removals
+and verifies the complete resulting set.
+
 `archive_channel` is a discoverability alias for setting the archived
 state to true. It does not permanently delete the channel, its
 messages, or its subscriber list. Use `set_channel_archived` with

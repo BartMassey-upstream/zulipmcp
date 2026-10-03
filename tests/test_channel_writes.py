@@ -955,6 +955,118 @@ def test_set_default_channel_rejects_private_channel(client: Mock) -> None:
     assert result["error"]["code"] == "INVALID_DEFAULT_CHANNEL"
 
 
+def test_set_default_channels_dry_run_adds_before_removing(client: Mock) -> None:
+    current = [
+        {
+            "stream_id": 12, "name": "old", "invite_only": False,
+            "is_web_public": False, "is_default": True, "is_archived": False,
+        },
+        {
+            "stream_id": 13, "name": "new", "invite_only": False,
+            "is_web_public": False, "is_default": False, "is_archived": False,
+        },
+    ]
+    client.call_endpoint.side_effect = [server(), principal(), streams(current)]
+
+    result = mcp_module.set_default_channels(
+        realm_url=REALM_URL,
+        channels=["new"],
+        expected_channels=["old"],
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "dry_run"
+    assert result["request"] == {"to_add": ["new"], "to_remove": ["old"]}
+    assert [step["endpoint"] for step in result["steps"]] == [
+        "/streams/13", "/streams/12",
+    ]
+    assert [step["request"]["is_default_stream"] for step in result["steps"]] == [
+        True, False,
+    ]
+
+
+def test_set_default_channels_requires_expected_state_for_removal(client: Mock) -> None:
+    current = [{
+        "stream_id": 12, "name": "old", "invite_only": False,
+        "is_web_public": False, "is_default": True, "is_archived": False,
+    }]
+    client.call_endpoint.side_effect = [server(), principal(), streams(current)]
+
+    result = mcp_module.set_default_channels(
+        realm_url=REALM_URL, channels=[], dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "conflict"
+    assert result["error"]["code"] == "EXPECTED_STATE_REQUIRED"
+
+
+def test_set_default_channels_applies_and_reads_back(client: Mock) -> None:
+    before = [
+        {
+            "stream_id": 12, "name": "old", "invite_only": False,
+            "is_web_public": False, "is_default": True, "is_archived": False,
+        },
+        {
+            "stream_id": 13, "name": "new", "invite_only": False,
+            "is_web_public": False, "is_default": False, "is_archived": False,
+        },
+    ]
+    after = [
+        {**before[0], "is_default": False},
+        {**before[1], "is_default": True},
+    ]
+    client.call_endpoint.side_effect = [
+        server(), principal(), streams(before),
+        {"result": "success", "msg": ""},
+        {"result": "success", "msg": ""},
+        streams(after),
+    ]
+
+    result = mcp_module.set_default_channels(
+        realm_url=REALM_URL,
+        channels=["new"],
+        expected_channels=["old"],
+    ).structured_content
+
+    assert result["status"] == "ok"
+    assert client.call_endpoint.call_args_list[3] == call(
+        url="/streams/13", method="PATCH",
+        request={"is_default_stream": True},
+    )
+    assert client.call_endpoint.call_args_list[4] == call(
+        url="/streams/12", method="PATCH",
+        request={"is_default_stream": False},
+    )
+
+
+def test_set_default_channels_reports_partial_batch_failure(client: Mock) -> None:
+    current = [
+        {
+            "stream_id": 12, "name": "old", "invite_only": False,
+            "is_web_public": False, "is_default": True, "is_archived": False,
+        },
+        {
+            "stream_id": 13, "name": "new", "invite_only": False,
+            "is_web_public": False, "is_default": False, "is_archived": False,
+        },
+    ]
+    client.call_endpoint.side_effect = [
+        server(), principal(), streams(current),
+        {"result": "success", "msg": ""},
+        {"result": "error", "msg": "denied", "code": "FORBIDDEN"},
+    ]
+
+    result = mcp_module.set_default_channels(
+        realm_url=REALM_URL,
+        channels=["new"],
+        expected_channels=["old"],
+    ).structured_content
+
+    assert result["status"] == "partial"
+    assert result["completed_fields"] == ["new"]
+    assert result["remaining_fields"] == ["old"]
+
+
 def test_subscribe_users_dry_run_only_includes_missing_users(client: Mock) -> None:
     channel = {
         "stream_id": 12,
