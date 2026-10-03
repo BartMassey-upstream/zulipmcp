@@ -1170,6 +1170,38 @@ def upload_organization_branding(
     )
 
 
+@mcp.tool(annotations=WRITE_TOOL_ANNOTATIONS)
+def upload_custom_emoji(
+    realm_url: str,
+    emoji_name: str,
+    file_path: str,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Upload a new custom emoji from a validated local raster image."""
+    return mutation_tool_result(
+        "Custom emoji upload",
+        zulip_core.upload_custom_emoji(
+            realm_url, emoji_name, file_path, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def deactivate_custom_emoji(
+    realm_url: str,
+    emoji_name: str,
+    expected_deactivated: bool,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Deactivate custom emoji without removing historical references."""
+    return mutation_tool_result(
+        "Custom emoji deactivation",
+        zulip_core.deactivate_custom_emoji(
+            realm_url, emoji_name, expected_deactivated, dry_run,
+        ),
+    )
+
+
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def create_bot(
     realm_url: str,

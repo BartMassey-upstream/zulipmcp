@@ -42,6 +42,7 @@ DESTRUCTIVE_TOOLS = {
     "archive_channel",
     "create_bot",
     "create_channel",
+    "deactivate_custom_emoji",
     "delete_custom_profile_field",
     "edit_message",
     "end_session",
@@ -86,6 +87,7 @@ CONFIGURATION_WRITE_TOOLS = {
     "create_linkifier",
     "delete_custom_profile_field",
     "create_user_group",
+    "deactivate_custom_emoji",
     "invite_users",
     "resend_email_invitation",
     "remove_allowed_domain",
@@ -111,6 +113,7 @@ CONFIGURATION_WRITE_TOOLS = {
     "update_organization_configuration",
     "update_user_group",
     "update_user_configuration",
+    "upload_custom_emoji",
     "upload_organization_branding",
 }
 

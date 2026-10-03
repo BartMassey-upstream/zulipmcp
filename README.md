@@ -117,6 +117,13 @@ also have narrowly scoped permanent-removal tools. These require an
 expected-current-state check and preview dependencies before writing.
 No blind realm-clone tool is provided.
 
+Custom emoji tools upload new PNG, JPEG, GIF, or WebP images from
+validated absolute local paths and deactivate existing emoji with an
+expected-state guard. Upload refuses name collisions instead of
+silently replacing an emoji. Deactivation keeps historical message and
+reaction references; reactivation is not exposed because Zulip has no
+documented API for it.
+
 User administration can update a human user's full name, semantic role,
 and named custom profile values. It can also deactivate and reactivate a
 user without deleting messages or files. Deactivation previews owned

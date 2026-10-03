@@ -1,4 +1,5 @@
 import os
+import io
 import re
 import time
 import tempfile
@@ -1955,12 +1956,12 @@ def _detect_image(content: bytes) -> tuple[str, str]:
     if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
         return "image/webp", ".webp"
     raise _LocalFileError(
-        "Branding file is not a supported PNG, JPEG, GIF, or WebP image",
+        "Image file is not a supported PNG, JPEG, GIF, or WebP image",
         "INVALID_IMAGE",
     )
 
 
-def _read_branding_file(
+def _read_image_file(
     file_path: str, max_file_size_mib: JSONValue = None,
 ) -> tuple[Path, bytes, str, str]:
     path = Path(file_path)
@@ -1979,7 +1980,7 @@ def _read_branding_file(
         and len(content) > max_file_size_mib * 1024 * 1024
     ):
         raise _LocalFileError(
-            f"Branding file exceeds the advertised {max_file_size_mib} MiB limit",
+            f"Image file exceeds the {max_file_size_mib} MiB limit",
             "FILE_TOO_LARGE",
         )
     return path, content, media_type, extension
@@ -2092,7 +2093,7 @@ def upload_organization_branding(
         )
     maximum = current.get("max_file_size_mib")
     try:
-        path, content, media_type, _ = _read_branding_file(file_path, maximum)
+        path, content, media_type, extension = _read_image_file(file_path, maximum)
     except (OSError, ValueError) as exc:
         return MutationResult(
             MutationStatus.ERROR, endpoint, dry_run=dry_run, current=current,
@@ -2123,7 +2124,8 @@ def upload_organization_branding(
             warnings=["Zulip transforms branding images; repeated uploads may differ"],
         )
     try:
-        with path.open("rb") as upload:
+        with io.BytesIO(content) as upload:
+            upload.name = f"filename{extension}"
             response = configuration_mutation_request(
                 endpoint, "POST", request=request, files=[upload],
             )
@@ -2162,6 +2164,279 @@ def upload_organization_branding(
         readback=selected if isinstance(selected, dict) else None,
         changed_fields=[asset],
         warnings=warnings + readback_section.warnings,
+    )
+
+
+def _emoji_name(value: str) -> str:
+    normalized = re.sub(r"[ _]+", "_", value.strip().casefold())
+    if not normalized or re.fullmatch(r"[a-z0-9-]+(?:_[a-z0-9-]+)*", normalized) is None:
+        raise ValueError(
+            "emoji_name must contain only letters, digits, spaces, underscores, or hyphens"
+        )
+    return normalized
+
+
+def _emoji_inventory() -> dict[str, dict[str, JSONValue]]:
+    emoji = get_emoji_configuration().get("emoji")
+    if not isinstance(emoji, dict):
+        raise ValueError("Custom emoji inventory was absent or null")
+    result: dict[str, dict[str, JSONValue]] = {}
+    for emoji_id, item in emoji.items():
+        if isinstance(item, dict):
+            copied = dict(item)
+            copied.setdefault("id", emoji_id)
+            result[str(emoji_id)] = copied
+    return result
+
+
+def _find_emoji(
+    emoji: dict[str, dict[str, JSONValue]], normalized_name: str,
+) -> dict[str, JSONValue] | None:
+    matches = []
+    for item in emoji.values():
+        name = item.get("name")
+        if isinstance(name, str):
+            try:
+                if _emoji_name(name) == normalized_name:
+                    matches.append(item)
+            except ValueError:
+                continue
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous custom emoji name: {normalized_name}")
+    return matches[0] if matches else None
+
+
+def upload_custom_emoji(
+    realm_url: str,
+    emoji_name: str,
+    file_path: str,
+    dry_run: bool = False,
+) -> MutationResult:
+    try:
+        normalized = _emoji_name(emoji_name)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, "/realm/emoji/{emoji_name}", dry_run=dry_run,
+            error=APIError(message=str(exc), code="INVALID_EMOJI_NAME"),
+        )
+    endpoint = f"/realm/emoji/{urllib.parse.quote(normalized, safe='')}"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    try:
+        current = _find_emoji(_emoji_inventory(), normalized)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(message=str(exc), code="INVENTORY_ERROR"),
+        )
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "emoji_name": {"semantic": emoji_name, "resolved": normalized},
+    }
+    if current is not None:
+        return MutationResult(
+            MutationStatus.CONFLICT,
+            endpoint,
+            dry_run=dry_run,
+            current=current,
+            desired={"name": normalized, "deactivated": False},
+            resolved_mappings=mappings,
+            error=APIError(
+                message="Custom emoji already exists; replacement and reactivation are not exposed",
+                code="EMOJI_ALREADY_EXISTS",
+            ),
+        )
+    try:
+        path, content, media_type, extension = _read_image_file(file_path, 5)
+    except (OSError, ValueError) as exc:
+        return MutationResult(
+            MutationStatus.ERROR,
+            endpoint,
+            dry_run=dry_run,
+            error=APIError(
+                message=str(exc),
+                code=exc.code if isinstance(exc, _LocalFileError) else "LOCAL_FILE_INVALID",
+            ),
+            resolved_mappings=mappings,
+        )
+    file_summary: dict[str, JSONValue] = {
+        "file_path": str(path),
+        "byte_count": len(content),
+        "media_type": media_type,
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+    desired: dict[str, JSONValue] = {
+        "name": normalized,
+        "deactivated": False,
+        "file": file_summary,
+    }
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN,
+            endpoint,
+            dry_run=True,
+            desired=desired,
+            request={"file": file_summary},
+            changed_fields=["created"],
+            resolved_mappings=mappings,
+        )
+    try:
+        with io.BytesIO(content) as upload:
+            upload.name = f"filename{extension}"
+            response = configuration_mutation_request(
+                endpoint, "POST", request={}, files=[upload],
+            )
+    except (OSError, ZulipAPIError) as exc:
+        result = (
+            _mutation_failure(endpoint, False, exc)
+            if isinstance(exc, ZulipAPIError)
+            else MutationResult(
+                MutationStatus.ERROR, endpoint, dry_run=False,
+                error=APIError(message=str(exc), code="FILE_READ_FAILED"),
+            )
+        )
+        result.desired = desired
+        result.request = {"file": file_summary}
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback = _find_emoji(_emoji_inventory(), normalized)
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=False,
+            desired=desired, request={"file": file_summary}, response=response,
+            changed_fields=["created"], resolved_mappings=mappings, error=error,
+        )
+    confirmed = readback is not None and readback.get("deactivated") is not True
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        MutationStatus.OK if confirmed and not unsupported else MutationStatus.PARTIAL,
+        endpoint,
+        dry_run=False,
+        desired=desired,
+        request={"file": file_summary},
+        response=response,
+        readback=readback,
+        changed_fields=["created"],
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=[] if confirmed else ["Custom emoji readback did not confirm an active emoji"],
+    )
+
+
+def deactivate_custom_emoji(
+    realm_url: str,
+    emoji_name: str,
+    expected_deactivated: bool,
+    dry_run: bool = False,
+) -> MutationResult:
+    try:
+        normalized = _emoji_name(emoji_name)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, "/realm/emoji/{emoji_name}", dry_run=dry_run,
+            error=APIError(message=str(exc), code="INVALID_EMOJI_NAME"),
+        )
+    endpoint = f"/realm/emoji/{urllib.parse.quote(normalized, safe='')}"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    try:
+        current = _find_emoji(_emoji_inventory(), normalized)
+        if current is None:
+            raise ValueError(f"Unknown custom emoji name: {emoji_name}")
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    current_deactivated = current.get("deactivated", False)
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "emoji_name": {"semantic": emoji_name, "resolved": normalized},
+    }
+    warnings = [
+        "Deactivation does not remove historical message or reaction references",
+        "This server API does not expose custom emoji reactivation",
+    ]
+    desired: dict[str, JSONValue] = {"deactivated": True}
+    if current_deactivated != expected_deactivated:
+        result = _conflict_result(
+            endpoint, dry_run, current, desired, ["deactivated"], warnings,
+        )
+        result.resolved_mappings = mappings
+        return result
+    if current_deactivated is True:
+        return MutationResult(
+            MutationStatus.DRY_RUN if dry_run else MutationStatus.OK,
+            endpoint,
+            dry_run=dry_run,
+            current=current,
+            desired=desired,
+            readback=current,
+            resolved_mappings=mappings,
+            warnings=warnings + ["Custom emoji is already deactivated"],
+        )
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN,
+            endpoint,
+            dry_run=True,
+            current=current,
+            desired=desired,
+            changed_fields=["deactivated"],
+            resolved_mappings=mappings,
+            warnings=warnings,
+        )
+    try:
+        response = configuration_mutation_request(
+            endpoint, "DELETE", request={},
+        )
+    except ZulipAPIError as exc:
+        result = _mutation_failure(endpoint, False, exc)
+        result.current = current
+        result.desired = desired
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    try:
+        readback = _find_emoji(_emoji_inventory(), normalized)
+    except (ZulipAPIError, ValueError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc), code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, endpoint, dry_run=False,
+            current=current, desired=desired, response=response,
+            changed_fields=["deactivated"], resolved_mappings=mappings,
+            warnings=warnings, error=error,
+        )
+    confirmed = readback is not None and readback.get("deactivated") is True
+    unsupported = _ignored_parameters(response)
+    return MutationResult(
+        MutationStatus.OK if confirmed and not unsupported else MutationStatus.PARTIAL,
+        endpoint,
+        dry_run=False,
+        current=current,
+        desired=desired,
+        response=response,
+        readback=readback,
+        changed_fields=["deactivated"],
+        resolved_mappings=mappings,
+        unsupported_fields=unsupported,
+        warnings=warnings + (
+            [] if confirmed else ["Custom emoji readback did not confirm deactivation"]
+        ),
     )
 
 
