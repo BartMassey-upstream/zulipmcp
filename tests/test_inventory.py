@@ -55,6 +55,7 @@ DESTRUCTIVE_TOOLS = {
     "set_channel_members",
     "set_default_channel",
     "set_user_group_members",
+    "set_user_active",
     "unsubscribe_users_from_channel",
     "update_allowed_domain",
     "update_bot_configuration",
@@ -64,6 +65,7 @@ DESTRUCTIVE_TOOLS = {
     "update_linkifier",
     "update_organization_configuration",
     "update_user_group",
+    "update_user_configuration",
     "upload_file",
     "upload_organization_branding",
 }
@@ -81,6 +83,7 @@ CONFIGURATION_WRITE_TOOLS = {
     "set_channel_members",
     "set_default_channel",
     "set_user_group_members",
+    "set_user_active",
     "subscribe_users_to_channel",
     "unsubscribe_users_from_channel",
     "update_allowed_domain",
@@ -91,6 +94,7 @@ CONFIGURATION_WRITE_TOOLS = {
     "update_linkifier",
     "update_organization_configuration",
     "update_user_group",
+    "update_user_configuration",
     "upload_organization_branding",
 }
 

@@ -483,6 +483,12 @@ USER_GROUP_UPDATE_FIELDS = frozenset({
     "description",
 }) | USER_GROUP_PERMISSION_FIELDS
 
+USER_UPDATE_FIELDS = frozenset({
+    "full_name",
+    "role",
+    "profile_values",
+})
+
 PROFILE_FIELD_CREATE_FIELDS = frozenset({
     "name",
     "hint",

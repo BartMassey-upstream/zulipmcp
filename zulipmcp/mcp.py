@@ -1224,6 +1224,40 @@ def set_bot_channel_subscriptions(
 
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def update_user_configuration(
+    realm_url: str,
+    user: str,
+    changes: dict[str, Any],
+    expected: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Update one human user's name, role, or named profile values."""
+    return mutation_tool_result(
+        "User configuration update",
+        zulip_core.update_user_configuration(
+            realm_url, user, changes, expected, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def set_user_active(
+    realm_url: str,
+    user: str,
+    active: bool,
+    expected_active: bool | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Deactivate or reactivate one user without deleting their content."""
+    return mutation_tool_result(
+        "User active state",
+        zulip_core.set_user_active(
+            realm_url, user, active, expected_active, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def update_organization_configuration(
     changes: dict[str, Any],
     expected: dict[str, Any] | None = None,

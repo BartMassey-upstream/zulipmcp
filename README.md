@@ -107,12 +107,19 @@ user, group, and channel IDs are not accepted as cross-realm
 references; use names or email addresses and inspect the returned ID
 mappings.
 
-Write tools cover organization settings, new-user defaults, channels,
-subscriptions, user groups and membership, custom profile fields,
-allowed domains, and linkifiers. They support `dry_run`, read current
-state first, avoid duplicate creates by semantic name, and read back
-successful mutations. Allowed-domain changes require an organization
-owner. No irreversible deletion or blind realm-clone tool is provided.
+Write tools cover organization settings, users, new-user defaults,
+channels, subscriptions, user groups and membership, custom profile
+fields, allowed domains, and linkifiers. They support `dry_run`, read
+current state first, avoid duplicate creates by semantic name, and read
+back successful mutations. Allowed-domain changes require an
+organization owner. No irreversible deletion or blind realm-clone tool
+is provided.
+
+User administration can update a human user's full name, semantic role,
+and named custom profile values. It can also deactivate and reactivate a
+user without deleting messages or files. Deactivation previews owned
+bots, rejects self-deactivation, and reports that owned bots will also
+be deactivated. Owner-role changes require an organization owner.
 
 Branding tools can audit, download, and upload the organization icon
 and light and dark logos. Downloads are written to new private local

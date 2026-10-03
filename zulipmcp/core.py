@@ -42,6 +42,7 @@ from .configuration import (
     UNLIMITED_REALM_FIELDS,
     USER_GROUP_PERMISSION_FIELDS,
     USER_GROUP_UPDATE_FIELDS,
+    USER_UPDATE_FIELDS,
     SectionResult,
     SectionStatus,
     ZulipAPIError,
@@ -2242,6 +2243,469 @@ def _bot_audit_item(reference: str) -> tuple[SectionResult, dict[str, JSONValue]
         return audit, _resolve_person(bots, reference, bot=True)
     except ValueError:
         return audit, None
+
+
+_USER_ROLES = {
+    "owner": 100,
+    "administrator": 200,
+    "moderator": 300,
+    "member": 400,
+    "guest": 600,
+}
+_USER_ROLE_NAMES = {value: name for name, value in _USER_ROLES.items()}
+
+
+def _human_inventory() -> list[dict[str, JSONValue]]:
+    members = get_users_configuration().get("members")
+    if not isinstance(members, list):
+        raise ValueError("User inventory was absent or null")
+    return [
+        member for member in members
+        if isinstance(member, dict) and member.get("is_bot") is not True
+    ]
+
+
+def _find_human(
+    members: list[dict[str, JSONValue]], reference: str,
+) -> dict[str, JSONValue]:
+    return _resolve_person(list(members), reference, bot=False)
+
+
+def _user_id(user: dict[str, JSONValue]) -> int:
+    user_id = user.get("user_id")
+    if not isinstance(user_id, int) or isinstance(user_id, bool):
+        raise ValueError("Target user did not have a valid ID")
+    return user_id
+
+
+def _profile_field_map() -> tuple[dict[str, int], dict[str, int]]:
+    fields = get_profile_fields_configuration().get("custom_fields")
+    if not isinstance(fields, list):
+        raise ValueError("Custom profile-field inventory was absent or null")
+    mapping: dict[str, int] = {}
+    field_types: dict[str, int] = {}
+    duplicates: set[str] = set()
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        name = field.get("name")
+        field_id = field.get("id")
+        if (
+            not isinstance(name, str)
+            or not isinstance(field_id, int)
+            or isinstance(field_id, bool)
+        ):
+            continue
+        if name in mapping and mapping[name] != field_id:
+            duplicates.add(name)
+        else:
+            mapping[name] = field_id
+            field_type = field.get("type")
+            if isinstance(field_type, int) and not isinstance(field_type, bool):
+                field_types[name] = field_type
+    for name in duplicates:
+        mapping.pop(name, None)
+        field_types.pop(name, None)
+    return mapping, field_types
+
+
+def _role_value(value: JSONValue) -> int:
+    if not isinstance(value, str):
+        raise ValueError("User roles must use semantic names, not numeric values")
+    normalized = value.strip().casefold()
+    if normalized == "admin":
+        normalized = "administrator"
+    try:
+        return _USER_ROLES[normalized]
+    except KeyError:
+        raise ValueError(
+            "role must be owner, administrator, moderator, member, or guest"
+        ) from None
+
+
+def _profile_values(
+    user: dict[str, JSONValue], field_ids: dict[str, int], names: set[str],
+) -> dict[str, JSONValue]:
+    raw = user.get("profile_data")
+    raw = raw if isinstance(raw, dict) else {}
+    values: dict[str, JSONValue] = {}
+    for name in names:
+        field_id = field_ids[name]
+        item = raw.get(str(field_id), raw.get(field_id))
+        values[name] = item.get("value") if isinstance(item, dict) else None
+    return values
+
+
+def _user_public_state(
+    user: dict[str, JSONValue],
+    profile_field_ids: dict[str, int] | None = None,
+    profile_names: set[str] | None = None,
+) -> dict[str, JSONValue]:
+    role = user.get("role")
+    state: dict[str, JSONValue] = {
+        "email": user.get("email"),
+        "full_name": user.get("full_name"),
+        "role": _USER_ROLE_NAMES.get(role, role),
+        "is_active": user.get("is_active"),
+    }
+    if profile_field_ids is not None and profile_names is not None:
+        state["profile_values"] = _profile_values(
+            user, profile_field_ids, profile_names,
+        )
+    return state
+
+
+def update_user_configuration(
+    realm_url: str,
+    user: str,
+    changes: dict[str, JSONValue],
+    expected: dict[str, JSONValue] | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/users/{user_id}"
+    server, principal, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None and principal is not None
+    expected = dict(expected or {})
+    invalid = (set(changes) | set(expected)) - USER_UPDATE_FIELDS
+    if invalid:
+        return _invalid_fields_result(endpoint, dry_run, invalid)
+    if not changes:
+        return _invalid_fields_result(
+            endpoint, dry_run, {"<no changes>"}, "EMPTY_CHANGES",
+        )
+    try:
+        members = _human_inventory()
+        target = _find_human(members, user)
+        target_id = _user_id(target)
+        profile_names: set[str] = set()
+        for source in (changes, expected):
+            if "profile_values" not in source:
+                continue
+            values = source["profile_values"]
+            if not isinstance(values, dict):
+                raise ValueError("profile_values must be an object keyed by field name")
+            if isinstance(values, dict):
+                profile_names.update(values)
+        field_ids, field_types = (
+            _profile_field_map() if profile_names else ({}, {})
+        )
+        unknown_fields = sorted(profile_names - set(field_ids))
+        if unknown_fields:
+            raise ValueError(
+                "Unknown or ambiguous custom profile fields: "
+                + ", ".join(unknown_fields)
+            )
+        users_fields = sorted(
+            name for name in profile_names if field_types.get(name) == 6
+        )
+        if users_fields:
+            raise ValueError(
+                "Users-type custom profile fields require semantic user-value "
+                "resolution and are not supported: " + ", ".join(users_fields)
+            )
+        current = _user_public_state(target, field_ids, profile_names)
+        desired = dict(changes)
+        resolved_expected = dict(expected)
+        request: dict[str, JSONValue] = {}
+        mappings: dict[str, JSONValue] = {
+            "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+            "user": {"semantic": user, "resolved": target_id},
+        }
+        for source in (changes, expected):
+            if "full_name" in source and (
+                not isinstance(source["full_name"], str)
+                or not source["full_name"].strip()
+            ):
+                raise ValueError("full_name must be a non-empty string")
+        if "role" in changes:
+            role_id = _role_value(changes["role"])
+            desired["role"] = _USER_ROLE_NAMES[role_id]
+            request["role"] = role_id
+            mappings["role"] = {
+                "semantic": changes["role"], "resolved": role_id,
+            }
+        if "role" in expected:
+            expected_role = _role_value(expected["role"])
+            resolved_expected["role"] = _USER_ROLE_NAMES[expected_role]
+        if "full_name" in changes:
+            request["full_name"] = changes["full_name"]
+        profile_changes = changes.get("profile_values")
+        if isinstance(profile_changes, dict):
+            request["profile_data"] = [
+                {"id": field_ids[name], "value": value}
+                for name, value in sorted(profile_changes.items())
+            ]
+            mappings["profile_values"] = {
+                name: {"semantic": name, "resolved": field_ids[name]}
+                for name in sorted(profile_changes)
+            }
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run, desired=changes,
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    current_role = target.get("role")
+    requested_role = request.get("role")
+    if (
+        principal.get("is_owner") is not True
+        and (current_role == _USER_ROLES["owner"] or requested_role == _USER_ROLES["owner"])
+    ):
+        return MutationResult(
+            MutationStatus.FORBIDDEN, f"/users/{target_id}", dry_run=dry_run,
+            current=current, desired=desired, resolved_mappings=mappings,
+            error=APIError(
+                message="Only an organization owner can add or remove the owner role",
+                code="OWNER_REQUIRED",
+            ),
+        )
+    mismatches = []
+    for field, value in resolved_expected.items():
+        if field == "profile_values":
+            current_values = current.get(field)
+            assert isinstance(value, dict)
+            if not isinstance(current_values, dict) or any(
+                current_values.get(name) != expected_value
+                for name, expected_value in value.items()
+            ):
+                mismatches.append(field)
+        elif current.get(field) != value:
+            mismatches.append(field)
+    if mismatches:
+        result = _conflict_result(
+            f"/users/{target_id}", dry_run, current, desired,
+            sorted(mismatches), [],
+        )
+        result.resolved_mappings = mappings
+        return result
+    changed: list[str] = []
+    wire_request: dict[str, JSONValue] = {}
+    for field in ("full_name", "role"):
+        if field in desired and current.get(field) != desired[field]:
+            changed.append(field)
+            wire_request[field] = request[field]
+    if isinstance(profile_changes, dict):
+        current_profiles = current.get("profile_values")
+        assert isinstance(current_profiles, dict)
+        profile_request = [
+            item for item in request["profile_data"]
+            if isinstance(item, dict)
+            and current_profiles.get(next(
+                name for name, field_id in field_ids.items()
+                if field_id == item["id"]
+            )) != item["value"]
+        ]
+        if profile_request:
+            changed.append("profile_values")
+            wire_request["profile_data"] = profile_request
+    resolved_endpoint = f"/users/{target_id}"
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, resolved_endpoint, dry_run=True,
+            current=current, desired=desired, request=wire_request,
+            changed_fields=changed, resolved_mappings=mappings,
+        )
+    if not changed:
+        return MutationResult(
+            MutationStatus.OK, resolved_endpoint, dry_run=False,
+            current=current, desired=desired, readback=current,
+            resolved_mappings=mappings,
+            warnings=["User already had the requested configuration"],
+        )
+    try:
+        response = configuration_mutation_request(
+            resolved_endpoint, "PATCH", wire_request,
+        )
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, False, exc)
+        result.current = current
+        result.desired = desired
+        result.request = wire_request
+        result.changed_fields = changed
+        result.resolved_mappings = mappings
+        return result
+    try:
+        readback_user = next(
+            item for item in _human_inventory() if item.get("user_id") == target_id
+        )
+        readback = _user_public_state(readback_user, field_ids, profile_names)
+    except (StopIteration, ValueError, ZulipAPIError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc) or "Updated user was absent from readback",
+            code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+            current=current, desired=desired, request=wire_request,
+            response=response,
+            changed_fields=changed, resolved_mappings=mappings, error=error,
+        )
+    readback_mismatches = []
+    for field, value in desired.items():
+        if field == "profile_values":
+            actual = readback.get(field)
+            assert isinstance(value, dict)
+            if not isinstance(actual, dict) or any(
+                actual.get(name) != expected_value
+                for name, expected_value in value.items()
+            ):
+                readback_mismatches.append(field)
+        elif readback.get(field) != value:
+            readback_mismatches.append(field)
+    return MutationResult(
+        MutationStatus.PARTIAL if readback_mismatches else MutationStatus.OK,
+        resolved_endpoint, dry_run=False, current=current, desired=desired,
+        request=wire_request, response=response, readback=readback,
+        changed_fields=changed, resolved_mappings=mappings,
+        warnings=(
+            ["User readback did not match: " + ", ".join(readback_mismatches)]
+            if readback_mismatches else []
+        ),
+    )
+
+
+def set_user_active(
+    realm_url: str,
+    user: str,
+    active: bool,
+    expected_active: bool | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/users/{user_id}/reactivate" if active else "/users/{user_id}"
+    server, principal, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None and principal is not None
+    try:
+        all_members = get_users_configuration().get("members")
+        if not isinstance(all_members, list):
+            raise ValueError("User inventory was absent or null")
+        humans = [
+            member for member in all_members
+            if isinstance(member, dict) and member.get("is_bot") is not True
+        ]
+        target = _find_human(humans, user)
+        target_id = _user_id(target)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            desired={"is_active": active},
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    resolved_endpoint = (
+        f"/users/{target_id}/reactivate" if active else f"/users/{target_id}"
+    )
+    current_active = target.get("is_active")
+    current = _user_public_state(target)
+    owned_bots = [
+        {
+            "email": member.get("email"),
+            "full_name": member.get("full_name"),
+            "is_active": member.get("is_active"),
+        }
+        for member in all_members
+        if isinstance(member, dict)
+        and member.get("is_bot") is True
+        and member.get("bot_owner_id") == target_id
+    ]
+    impact: dict[str, JSONValue] = {
+        "owned_bots": owned_bots,
+        "owned_bot_count": len(owned_bots),
+        "content_deletion_requested": False,
+        "membership_effects": "unavailable",
+        "content_effects": "No messages or files will be deleted",
+    }
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "user": {"semantic": user, "resolved": target_id},
+        "impact": impact,
+    }
+    if not active and principal.get("user_id") == target_id:
+        return MutationResult(
+            MutationStatus.CONFLICT, resolved_endpoint, dry_run=dry_run,
+            current=current, desired={"is_active": active},
+            resolved_mappings=mappings,
+            error=APIError(
+                message="The authenticated administrator cannot deactivate itself",
+                code="SELF_DEACTIVATION_FORBIDDEN",
+            ),
+        )
+    if expected_active is not None and current_active is not expected_active:
+        result = _conflict_result(
+            resolved_endpoint, dry_run, current, {"is_active": active},
+            ["is_active"], [],
+        )
+        result.resolved_mappings = mappings
+        return result
+    warnings = []
+    if not active and owned_bots:
+        warnings.append("Deactivating this user also deactivates their owned bots")
+    if current_active is active:
+        return MutationResult(
+            MutationStatus.DRY_RUN if dry_run else MutationStatus.OK,
+            resolved_endpoint, dry_run=dry_run, current=current,
+            desired={"is_active": active}, readback=current,
+            resolved_mappings=mappings,
+            warnings=warnings + ["User already had the requested active state"],
+        )
+    request: dict[str, JSONValue] = {}
+    method = "POST" if active else "DELETE"
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, resolved_endpoint, dry_run=True,
+            current=current, desired={"is_active": active}, request=request,
+            changed_fields=["is_active"], resolved_mappings=mappings,
+            warnings=warnings,
+        )
+    try:
+        response = configuration_mutation_request(
+            resolved_endpoint, method, request,
+        )
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, False, exc)
+        result.current = current
+        result.desired = {"is_active": active}
+        result.request = request
+        result.changed_fields = ["is_active"]
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    try:
+        members = get_users_configuration().get("members")
+        if not isinstance(members, list):
+            raise ValueError("User inventory was absent or null during readback")
+        readback_user = next(
+            member for member in members
+            if isinstance(member, dict) and member.get("user_id") == target_id
+        )
+        readback = _user_public_state(readback_user)
+    except (StopIteration, ValueError, ZulipAPIError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc) or "Updated user was absent from readback",
+            code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+            current=current, desired={"is_active": active}, request=request,
+            response=response,
+            changed_fields=["is_active"], resolved_mappings=mappings,
+            warnings=warnings, error=error,
+        )
+    confirmed = readback.get("is_active") is active
+    if not confirmed:
+        warnings.append("User readback did not match the requested active state")
+    return MutationResult(
+        MutationStatus.OK if confirmed else MutationStatus.PARTIAL,
+        resolved_endpoint, dry_run=False, current=current,
+        desired={"is_active": active}, request=request, response=response,
+        readback=readback, changed_fields=["is_active"],
+        resolved_mappings=mappings, warnings=warnings,
+    )
 
 
 def update_bot_configuration(
