@@ -3945,7 +3945,7 @@ def create_bot(
         channel_map, resolved_channels = _resolve_channels(streams, channel_names)
         avatar = None
         if avatar_path is not None:
-            avatar = _read_branding_file(avatar_path)
+            avatar = _read_image_file(avatar_path)
     except _LocalFileError as exc:
         return MutationResult(
             MutationStatus.ERROR, endpoint, dry_run=dry_run,
@@ -4047,9 +4047,10 @@ def create_bot(
         if avatar is None:
             response = configuration_mutation_request(endpoint, "POST", request)
         else:
-            avatar_file = avatar[0]
+            _, avatar_content, _, avatar_extension = avatar
             wire_request = {key: value for key, value in request.items() if key != "avatar"}
-            with avatar_file.open("rb") as upload:
+            with io.BytesIO(avatar_content) as upload:
+                upload.name = f"filename{avatar_extension}"
                 response = configuration_mutation_request(
                     endpoint, "POST", wire_request, files=[upload],
                 )

@@ -1,4 +1,5 @@
 import importlib
+from pathlib import Path
 from unittest.mock import Mock, call
 
 import pytest
@@ -8,6 +9,7 @@ from zulipmcp.configuration import SectionResult, SectionStatus
 
 mcp_module = importlib.import_module("zulipmcp.mcp")
 REALM_URL = "https://realm.example.test"
+PNG = b"\x89PNG\r\n\x1a\n" + b"synthetic image data"
 
 
 def owner() -> dict[str, object]:
@@ -176,6 +178,46 @@ def test_create_bot_redacts_api_key_and_reads_back(
     assert "api_key" not in result["response"]
     assert mutation.call_args.args[0:2] == ("/bots", "POST")
     assert mutation.call_args.args[2]["bot_type"] == 1
+
+
+def test_create_bot_avatar_sends_validated_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        core, "get_users_configuration", lambda: {"members": [owner()]},
+    )
+    created = bot_item([])
+    created.pop("default_events_register_stream")
+    created.pop("default_events_register_channel")
+    monkeypatch.setattr(core, "_bot_audit_item", lambda reference: (audit(created), created))
+    image = tmp_path / "avatar.png"
+    image.write_bytes(PNG)
+    original_reader = core._read_image_file
+
+    def replace_after_read(*args: object) -> tuple[Path, bytes, str, str]:
+        result = original_reader(*args)
+        image.write_bytes(b"not the validated image")
+        return result
+
+    uploaded = b""
+
+    def capture_upload(
+        endpoint: str, method: str, request: dict[str, object], files: list[object],
+    ) -> dict[str, object]:
+        nonlocal uploaded
+        uploaded = files[0].read()
+        return {"user_id": 2, "email": "helper-bot@example.test"}
+
+    monkeypatch.setattr(core, "_read_image_file", replace_after_read)
+    monkeypatch.setattr(core, "configuration_mutation_request", capture_upload)
+
+    result = mcp_module.create_bot(
+        REALM_URL, "helper", "Helper", "owner@example.test",
+        default_sending_channel="general", avatar_path=str(image),
+    ).structured_content
+
+    assert result["status"] == "ok"
+    assert uploaded == PNG
 
 
 def test_create_bot_rejects_deactivated_match(monkeypatch: pytest.MonkeyPatch) -> None:
