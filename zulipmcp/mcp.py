@@ -1230,6 +1230,23 @@ def set_bot_channel_subscriptions(
 
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def set_bot_active(
+    realm_url: str,
+    bot: str,
+    active: bool,
+    expected_active: bool | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Deactivate or reactivate one bot while preserving configuration."""
+    return mutation_tool_result(
+        "Bot active state",
+        zulip_core.set_bot_active(
+            realm_url, bot, active, expected_active, dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def update_user_configuration(
     realm_url: str,
     user: str,
@@ -1575,6 +1592,23 @@ def set_user_group_members(
             expected_members,
             expected_subgroups,
             dry_run,
+        ),
+    )
+
+
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+def set_user_group_active(
+    realm_url: str,
+    group: str,
+    active: bool,
+    expected_active: bool | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    """Deactivate or reactivate one named user group with impact checks."""
+    return mutation_tool_result(
+        "User-group active state",
+        zulip_core.set_user_group_active(
+            realm_url, group, active, expected_active, dry_run,
         ),
     )
 

@@ -2250,6 +2250,120 @@ def _bot_audit_item(reference: str) -> tuple[SectionResult, dict[str, JSONValue]
         return audit, None
 
 
+def set_bot_active(
+    realm_url: str,
+    bot: str,
+    active: bool,
+    expected_active: bool | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = "/users/{bot_id}/reactivate" if active else "/bots/{bot_id}"
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    audit, item = _bot_audit_item(bot)
+    if item is None:
+        return _semantic_error(endpoint, dry_run, f"Bot {bot!r} did not resolve uniquely")
+    bot_id = item.get("user_id")
+    if not isinstance(bot_id, int) or isinstance(bot_id, bool):
+        return _semantic_error(endpoint, dry_run, "Bot has no valid user ID")
+    current_active = item.get("is_active")
+    if not isinstance(current_active, bool):
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            current=item, desired={"is_active": active},
+            error=APIError(
+                message="Bot audit did not expose its active state",
+                code="UNSUPPORTED_FIELD",
+            ),
+        )
+    resolved_endpoint = (
+        f"/users/{bot_id}/reactivate" if active else f"/bots/{bot_id}"
+    )
+    impact: dict[str, JSONValue] = {
+        "owner": item.get("owner"),
+        "channel_subscriptions": item.get("channel_subscriptions"),
+        "subscription_status": item.get("subscription_status"),
+        "default_sending_channel": item.get("default_sending_channel"),
+        "default_events_register_channel": item.get(
+            "default_events_register_channel"
+        ),
+        "configuration_preserved": True,
+    }
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "bot": {"semantic": bot, "resolved": bot_id},
+        "impact": impact,
+    }
+    warnings = list(audit.warnings)
+    if audit.status == SectionStatus.PARTIAL:
+        warnings.append("Bot impact may omit channels hidden from the audit principal")
+    if expected_active is not None and current_active is not expected_active:
+        result = _conflict_result(
+            resolved_endpoint, dry_run, {"is_active": current_active},
+            {"is_active": active}, ["is_active"], warnings,
+        )
+        result.resolved_mappings = mappings
+        return result
+    if current_active is active:
+        return MutationResult(
+            MutationStatus.DRY_RUN if dry_run else MutationStatus.OK,
+            resolved_endpoint, dry_run=dry_run,
+            current={"is_active": current_active},
+            desired={"is_active": active},
+            readback={"is_active": current_active},
+            resolved_mappings=mappings,
+            warnings=warnings + ["Bot already had the requested active state"],
+        )
+    method = "POST" if active else "DELETE"
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, resolved_endpoint, dry_run=True,
+            current={"is_active": current_active},
+            desired={"is_active": active}, request={},
+            changed_fields=["is_active"], resolved_mappings=mappings,
+            warnings=warnings + [
+                "Bot reactivation uses Zulip's general user lifecycle endpoint"
+            ],
+        )
+    try:
+        response = configuration_mutation_request(resolved_endpoint, method, {})
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, False, exc)
+        result.current = {"is_active": current_active}
+        result.desired = {"is_active": active}
+        result.request = {}
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    readback_audit, readback_item = _bot_audit_item(bot)
+    if readback_item is None or not isinstance(readback_item.get("is_active"), bool):
+        return MutationResult(
+            MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+            current={"is_active": current_active},
+            desired={"is_active": active}, request={}, response=response,
+            changed_fields=["is_active"], resolved_mappings=mappings,
+            warnings=warnings + readback_audit.warnings,
+            error=readback_audit.error or APIError(
+                message="Bot was absent from lifecycle readback",
+                code="READBACK_ERROR",
+            ),
+        )
+    readback = {"is_active": readback_item["is_active"]}
+    confirmed = readback["is_active"] is active
+    if not confirmed:
+        warnings.append("Bot readback did not match the requested active state")
+    return MutationResult(
+        MutationStatus.OK if confirmed else MutationStatus.PARTIAL,
+        resolved_endpoint, dry_run=False,
+        current={"is_active": current_active},
+        desired={"is_active": active}, request={}, response=response,
+        readback=readback, changed_fields=["is_active"],
+        resolved_mappings=mappings, warnings=warnings + readback_audit.warnings,
+    )
+
+
 _USER_ROLES = {
     "owner": 100,
     "administrator": 200,
@@ -5422,6 +5536,231 @@ def _canonical_group_setting(value: JSONValue) -> JSONValue:
         "direct_members": sorted(members, key=repr),
         "direct_subgroups": sorted(subgroups, key=repr),
     }
+
+
+def _group_lifecycle_dependencies(
+    group_id: int,
+    groups: list[dict[str, JSONValue]],
+) -> tuple[list[dict[str, JSONValue]], list[str]]:
+    dependencies: list[dict[str, JSONValue]] = []
+    warnings: list[str] = []
+    for group in groups:
+        if group.get("id") == group_id:
+            continue
+        group_name = group.get("name")
+        subgroups = group.get("direct_subgroup_ids")
+        if isinstance(subgroups, list) and group_id in subgroups:
+            dependencies.append({
+                "kind": "user_group_subgroup",
+                "group": group_name,
+                "field": "direct_subgroup_ids",
+            })
+        for field in USER_GROUP_PERMISSION_FIELDS:
+            value = group.get(field)
+            if value == group_id or (
+                isinstance(value, dict)
+                and isinstance(value.get("direct_subgroups"), list)
+                and group_id in value["direct_subgroups"]
+            ):
+                dependencies.append({
+                    "kind": "user_group_permission",
+                    "group": group_name,
+                    "field": field,
+                })
+    try:
+        realm_settings, realm_warnings = _read_write_state(
+            set(GROUP_SETTING_REALM_FIELDS), defaults=False,
+        )
+        warnings.extend(realm_warnings)
+        for field, value in realm_settings.items():
+            if value == group_id or (
+                isinstance(value, dict)
+                and isinstance(value.get("direct_subgroups"), list)
+                and group_id in value["direct_subgroups"]
+            ):
+                dependencies.append({
+                    "kind": "organization_permission",
+                    "field": field,
+                })
+    except (ValueError, ZulipAPIError) as exc:
+        message = exc.error.message if isinstance(exc, ZulipAPIError) else str(exc)
+        warnings.append(
+            "Could not completely audit organization permission references: "
+            + message
+        )
+    try:
+        streams = get_streams_configuration(
+            include_all=True, include_default=True, exclude_archived=False,
+        ).get("streams")
+        if not isinstance(streams, list):
+            raise ValueError("Channel inventory was absent or null")
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            for field in CHANNEL_GROUP_FIELDS:
+                value = stream.get(field)
+                if value == group_id or (
+                    isinstance(value, dict)
+                    and isinstance(value.get("direct_subgroups"), list)
+                    and group_id in value["direct_subgroups"]
+                ):
+                    dependencies.append({
+                        "kind": "channel_permission",
+                        "channel": stream.get("name"),
+                        "channel_id": stream.get("stream_id"),
+                        "field": field,
+                    })
+    except (ValueError, ZulipAPIError) as exc:
+        message = exc.error.message if isinstance(exc, ZulipAPIError) else str(exc)
+        warnings.append(
+            "Could not completely audit channel permission references: "
+            + message
+        )
+    return dependencies, warnings
+
+
+def set_user_group_active(
+    realm_url: str,
+    group: str,
+    active: bool,
+    expected_active: bool | None = None,
+    dry_run: bool = False,
+) -> MutationResult:
+    endpoint = (
+        "/user_groups/{user_group_id}"
+        if active else "/user_groups/{user_group_id}/deactivate"
+    )
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
+    if failure is not None:
+        return failure
+    assert server is not None
+    feature_level = server.get("zulip_feature_level")
+    minimum = 386 if active else 290
+    if (
+        isinstance(feature_level, int)
+        and not isinstance(feature_level, bool)
+        and feature_level < minimum
+    ):
+        return MutationResult(
+            MutationStatus.UNSUPPORTED, endpoint, dry_run=dry_run,
+            desired={"is_active": active},
+            error=APIError(
+                message=(
+                    f"User-group {'reactivation' if active else 'deactivation'} "
+                    f"requires Zulip feature level {minimum}"
+                ),
+                code="UNSUPPORTED_FEATURE",
+            ),
+        )
+    try:
+        groups = _group_inventory()
+        target = _find_group(groups, group)
+        if target is None:
+            raise ValueError(f"Unknown user-group name: {group}")
+        group_id = _group_id(target)
+    except ZulipAPIError as exc:
+        return _mutation_failure(endpoint, dry_run, exc)
+    except ValueError as exc:
+        return MutationResult(
+            MutationStatus.ERROR, endpoint, dry_run=dry_run,
+            desired={"is_active": active},
+            error=APIError(message=str(exc), code="SEMANTIC_RESOLUTION_ERROR"),
+        )
+    current_active = target.get("deactivated") is not True
+    resolved_endpoint = (
+        f"/user_groups/{group_id}"
+        if active else f"/user_groups/{group_id}/deactivate"
+    )
+    dependencies, warnings = _group_lifecycle_dependencies(group_id, groups)
+    impact: dict[str, JSONValue] = {
+        "members": target.get("members"),
+        "direct_subgroup_ids": target.get("direct_subgroup_ids"),
+        "dependencies": dependencies,
+        "reversible": True,
+    }
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {"semantic": realm_url, "resolved": server.get("realm_url")},
+        "group": {"semantic": group, "resolved": group_id},
+        "impact": impact,
+    }
+    if expected_active is not None and current_active is not expected_active:
+        result = _conflict_result(
+            resolved_endpoint, dry_run, {"is_active": current_active},
+            {"is_active": active}, ["is_active"], warnings,
+        )
+        result.resolved_mappings = mappings
+        return result
+    if not active and dependencies:
+        return MutationResult(
+            MutationStatus.CONFLICT, resolved_endpoint, dry_run=dry_run,
+            current={"is_active": current_active},
+            desired={"is_active": active}, resolved_mappings=mappings,
+            warnings=warnings,
+            error=APIError(
+                message="User group is still referenced by other configuration",
+                code="USER_GROUP_IN_USE",
+            ),
+        )
+    if current_active is active:
+        return MutationResult(
+            MutationStatus.DRY_RUN if dry_run else MutationStatus.OK,
+            resolved_endpoint, dry_run=dry_run,
+            current={"is_active": current_active},
+            desired={"is_active": active},
+            readback={"is_active": current_active},
+            resolved_mappings=mappings,
+            warnings=warnings + ["User group already had the requested active state"],
+        )
+    request: dict[str, JSONValue] = {"deactivated": False} if active else {}
+    method = "PATCH" if active else "POST"
+    if dry_run:
+        return MutationResult(
+            MutationStatus.DRY_RUN, resolved_endpoint, dry_run=True,
+            current={"is_active": current_active},
+            desired={"is_active": active}, request=request,
+            changed_fields=["is_active"], resolved_mappings=mappings,
+            warnings=warnings,
+        )
+    try:
+        response = configuration_mutation_request(
+            resolved_endpoint, method, request,
+        )
+    except ZulipAPIError as exc:
+        result = _mutation_failure(resolved_endpoint, False, exc)
+        result.current = {"is_active": current_active}
+        result.desired = {"is_active": active}
+        result.request = request
+        result.resolved_mappings = mappings
+        result.warnings = warnings
+        return result
+    try:
+        readback_group = next(
+            item for item in _group_inventory() if item.get("id") == group_id
+        )
+        readback = {"is_active": readback_group.get("deactivated") is not True}
+    except (StopIteration, ValueError, ZulipAPIError) as exc:
+        error = exc.error if isinstance(exc, ZulipAPIError) else APIError(
+            message=str(exc) or "User group was absent from readback",
+            code="READBACK_ERROR",
+        )
+        return MutationResult(
+            MutationStatus.PARTIAL, resolved_endpoint, dry_run=False,
+            current={"is_active": current_active},
+            desired={"is_active": active}, request=request, response=response,
+            changed_fields=["is_active"], resolved_mappings=mappings,
+            warnings=warnings, error=error,
+        )
+    confirmed = readback["is_active"] is active
+    if not confirmed:
+        warnings.append("User-group readback did not match requested active state")
+    return MutationResult(
+        MutationStatus.OK if confirmed else MutationStatus.PARTIAL,
+        resolved_endpoint, dry_run=False,
+        current={"is_active": current_active},
+        desired={"is_active": active}, request=request, response=response,
+        readback=readback, changed_fields=["is_active"],
+        resolved_mappings=mappings, warnings=warnings,
+    )
 
 
 def create_user_group(

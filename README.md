@@ -146,6 +146,16 @@ subscription changes fail closed unless the authenticated principal
 has complete channel visibility, and additions are applied before
 removals.
 
+Bot lifecycle uses `set_bot_active` to deactivate or reactivate a named
+bot while preserving its owner, configuration, and subscriptions. The
+operation previews that state and verifies the resulting active state.
+It never retrieves or regenerates the bot's API key.
+
+User groups have matching reversible lifecycle support. Deactivation
+previews membership and configuration dependencies, rejects groups that
+are still referenced, and reads the group back after a successful
+change.
+
 Channel lifecycle tools expose archival truthfully as a reversible
 state change: `set_channel_archived` hides or restores a channel while
 retaining its messages. Before archival, the tool audits visible
