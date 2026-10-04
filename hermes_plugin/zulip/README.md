@@ -1,9 +1,9 @@
 # Hermes Zulip Gateway Plugin
 
 This plugin connects Zulip directly to the Hermes messaging gateway. Each
-stream/topic is an independent Hermes session. A user message starts a fresh
-turn in that session, so the model never blocks in `listen()` and the
-per-turn iteration budget resets normally.
+stream/topic and direct-message conversation is an independent Hermes
+session. A user message starts a fresh turn in that session, so the model
+never blocks in `listen()` and the per-turn iteration budget resets normally.
 
 The adapter owns message intake, topic routing, normal response delivery,
 typing, and approvals. ZulipMCP remains the explicit tool layer for history,
@@ -13,6 +13,7 @@ links, users, reactions, files, and cross-conversation sends.
 
 - A mention activates a topic for the lifetime of the gateway process.
 - Follow-ups in an active topic do not need another mention.
+- Authorized direct messages do not require a mention.
 - After a gateway restart, one mention reactivates the topic and resumes its
   stored Hermes session.
 - The first activation includes up to 20 earlier messages from that topic.
@@ -27,7 +28,10 @@ links, users, reactions, files, and cross-conversation sends.
 ## Install from a checkout
 
 The curl installer places Hermes at `~/.hermes/hermes-agent`. Install
-ZulipMCP into that environment, then link the platform plugin:
+ZulipMCP into that environment, then link the platform plugin. The paths
+below are examples; substitute the actual checkout, uv executable, Hermes
+virtual environment, and plugin directory for your installation. The Hermes
+plugin is checkout-only and is not included in the ZulipMCP wheel.
 
 ```bash
 git clone https://github.com/windborne/zulipmcp.git ~/zulipmcp
@@ -52,7 +56,9 @@ ZULIP_ALLOWED_USERS=12345,you@example.com
 
 The adapter fails closed unless `ZULIP_ALLOWED_USERS` is set or
 `ZULIP_ALLOW_ALL_USERS=true` is explicitly enabled.
-`ZULIP_ALLOWED_STREAMS` can further restrict the bot to named streams.
+The user allowlist applies to both stream messages and direct messages.
+`ZULIP_ALLOWED_STREAMS` can further restrict the bot to named streams; it
+does not apply to direct messages.
 
 ## ZulipMCP tools
 

@@ -15,7 +15,12 @@ Run AI agents in Zulip as @mentionable bots — or wire into any [MCP](https://m
    uv add zulipmcp --git https://github.com/windborne/zulipmcp.git
    ```
 
-2. Add a `.zuliprc` file to your project root with your Zulip bot credentials. See [Add a bot or integration](https://zulip.com/help/add-a-bot-or-integration) for instructions on making a bot. The bot type must be "generic."
+2. Add a `.zuliprc` file to your project root with your Zulip bot
+   credentials. See [Add a bot or integration](https://zulip.com/help/add-a-bot-or-integration)
+   for instructions on making a bot. The bot type must be "generic."
+   Organization administration requires credentials for a human
+   administrator or owner instead; keep those in a separate,
+   realm-specific MCP server configuration.
 
 3. Add the MCP server to your `.mcp.json`:
 
@@ -35,6 +40,7 @@ Run AI agents in Zulip as @mentionable bots — or wire into any [MCP](https://m
 ## Requirements
 
 - Python >=3.10, managed with [uv](https://docs.astral.sh/uv/)
+- FastMCP >=3.2.4 and <4; the lockfile currently selects 3.4.7
 - A `.zuliprc` file for Zulip API auth (see [Quickstart](#quickstart))
 - For listener mode: the selected backend CLI installed and authenticated (`claude` by default, `codex` with `--backend codex`, or `opencode` with `--backend opencode`)
 
@@ -48,9 +54,10 @@ distinguish empty, forbidden, unsupported, partial, and failed reads.
 
 Configuration writes and user-content writes have independent
 gates. Both start disabled. Call `enable_configuration_writes`
-before changing organization settings or structure, and call
-`enable_user_content_writes` before changing messages, topics,
-reactions, or uploads. Enabling one does not enable the other.
+before changing organization settings or structure. Call
+`enable_user_content_writes` before sending, editing, moving, reporting,
+or deleting messages, changing topics or reactions, or uploading files.
+Enabling one does not enable the other.
 For organization setup, leave user-content writes disabled while
 enabling configuration writes.
 
@@ -100,12 +107,14 @@ configuration gate; listening in an existing subscription does not.
 }
 ```
 
-Run a separate MCP server for each realm. Every configuration write
-also requires the destination realm URL as an argument and verifies
-it against `GET /server_settings` before changing anything. Numeric
-user, group, and channel IDs are not accepted as cross-realm
-references; use names or email addresses and inspect the returned ID
-mappings.
+Run a separate MCP server for each realm. Object-scoped administration
+tools require the destination realm URL and verify it against
+`GET /server_settings` before changing anything. The older organization
+and new-user-default setting tools are pinned by the realm-specific
+server process; adding their explicit URL argument is tracked in
+[`BACKLOG.md`](BACKLOG.md). Numeric user, group, and channel IDs are not
+accepted as cross-realm references; use the semantic names or account
+emails requested by each tool and inspect the returned ID mappings.
 
 Write tools cover organization settings, users, new-user defaults,
 channels, subscriptions, user groups and membership, custom profile
@@ -145,7 +154,9 @@ without passing image bytes through the model. Uploads accept only
 recognized raster image content and enforce the server's advertised
 size limit. Zulip transforms uploaded branding and does not publish a
 source-file hash, so uploads are not content-idempotent; use
-`expected_source` to guard against stale state.
+`expected_source` to guard against stale state. Zulip publishes no API for
+resetting these assets to server defaults; download the current asset
+before a temporary replacement when restoration will be needed.
 
 Bot administration tools can create or converge generic bots, update
 their safe configuration, and set exact channel subscriptions using
@@ -165,9 +176,11 @@ previews membership and configuration dependencies, rejects groups that
 are still referenced, and reads the group back after a successful
 change.
 
-Channel lifecycle tools expose archival truthfully as a reversible
-state change: `set_channel_archived` hides or restores a channel while
-retaining its messages. Before archival, the tool audits visible
+Channel lifecycle tools expose archival truthfully as a retained state
+change: `set_channel_archived` hides a channel while retaining its
+messages and can restore it on servers that support unarchiving. Archival
+requires Zulip feature level 315 and unarchiving requires feature level
+388. Before archival, the tool audits visible
 membership, topic and message-presence metadata, channel policy,
 folder membership, default-channel status, and realm settings that
 reference the channel. Default or referenced channels must be detached
@@ -194,11 +207,13 @@ private channel when that would compromise recovery.
 Moderation tools can report one verified message or permanently delete
 one message. Both pin the destination realm, compare current sender and
 content metadata, show a dry-run impact preview, and require an exact
-per-message confirmation phrase. Deletion also verifies that the
-message is no longer accessible. There is no bulk-delete tool or claim
-that deletion is reversible. Zulip does not expose a dedicated report
-queue or report-resolution API, so those workflow steps remain an
-explicit capability gap.
+per-message confirmation phrase. Both require the user-content write gate.
+Reporting also requires an active private channel configured as the
+organization's moderation destination. Deletion verifies that the message
+is no longer accessible. There is no bulk-delete tool or claim that
+deletion is reversible. Zulip does not expose a dedicated report queue or
+report-resolution API, so those workflow steps remain an explicit
+capability gap.
 
 Data-export tools audit export jobs, queue public or full exports, and
 permanently delete completed hosted archives. Creation and deletion use
@@ -243,6 +258,13 @@ reversibility, write gates, confirmation requirements, side effects,
 and intentional or server-side gaps, so clients can reject an
 unsupported plan before attempting its first mutation.
 
+Other cataloged limits include resetting branding to server defaults and
+organization deactivation, reactivation, or deletion. Deactivation is
+intentionally not exposed as an ordinary tool, reactivation requires
+server administration, and Zulip has no standalone organization-deletion
+REST endpoint. Future work and deliberately deferred designs are tracked
+in [`BACKLOG.md`](BACKLOG.md).
+
 Use this workflow for configuration changes:
 
 1. Call `get_organization_configuration` for the source and target.
@@ -256,8 +278,9 @@ Use this workflow for configuration changes:
 
 | Entry Point | Description |
 |---|---|
+| `uv run python -m zulipmcp` | MCP server via the package entry point; supports `--transport`, `--host`, and `--port` |
 | `uv run python -m zulipmcp.mcp` | MCP server for Claude Code, Codex, and other MCP clients |
-| `uv run python -m zulipmcp.mcp --transport sse` | MCP server over SSE (for remote/web clients) |
+| `uv run python -m zulipmcp --transport sse` | MCP server over SSE; defaults to localhost, with configurable host and port |
 | `uv run python -m zulipmcp.launch_agent` | Launch one MCP-backed coding session without a listener |
 | `uv run python -m zulipmcp.listener` | Listener: watches for @mentions, spawns agent sessions |
 
@@ -285,11 +308,12 @@ zulipmcp.configure(
 ## Hermes Gateway
 
 Hermes uses the native [`hermes_plugin/zulip`](hermes_plugin/zulip) gateway
-adapter instead of the subprocess listener. Each stream/topic maps to its own
-persistent Hermes session, while zulipmcp remains available as the explicit
-Zulip API tool layer.
+adapter instead of the subprocess listener. Each stream/topic and
+direct-message conversation maps to its own persistent Hermes session, while
+zulipmcp remains available as the explicit Zulip API tool layer.
 
 - Mention the bot once to activate a topic; follow-ups do not need a mention.
+- Authorized direct messages do not require a mention.
 - Each user message is a fresh Hermes turn with a fresh iteration budget.
 - Typing, normal response delivery, status reactions, approval reactions,
   and `:stop_sign:` interruption are handled by the adapter.

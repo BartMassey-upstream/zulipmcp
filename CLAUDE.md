@@ -12,6 +12,8 @@
 
 - **`core.py`** — Zulip API wrappers. No MCP dependency. Returns Python objects.
 - **`mcp.py`** — MCP tool layer + `SessionState`. Thin wrappers over `core.py`. Hooks system lives here.
+- **`configuration.py`** — Typed result models, field allowlists, and secret-safe serialization.
+- **`capabilities.py`** — Machine-readable administration support and feature-level catalog.
 - **`agent_backends.py`** — Claude/Codex/OpenCode command builders for the listener. No Zulip API dependency.
 - **`hermes_plugin/zulip/`** — Native Hermes gateway transport. It does not use MCP session state.
 
@@ -28,6 +30,10 @@ Separation is load-bearing: `core.py` must stay MCP-agnostic so it works as a st
 - **Interrupt-file reads must go through `_consume_interrupt_file()`.** It claims via atomic rename before reading, so a writer replacing the file mid-consume can't have its content deleted unread — and it decodes with `errors="replace"` so a bad-bytes file can't wedge every future poll. Don't inline a read+delete elsewhere.
 - **Private stream security is asymmetric on purpose.** Unset `BOT_ALLOWED_PRIVATE_STREAMS` = no access (default-deny). Unset `BOT_ALLOWED_WRITE_STREAMS` = all writes allowed (backwards-compat). Don't "fix" the asymmetry.
 - **`configure()` must be called before `run_server()`.** `run_server()` may auto-init a session that reads hook state.
+- **Write gates are independent and process-local.** Configuration and user-content writes both start disabled. Dry runs and proven no-ops may remain available while their gate is closed; enforce the appropriate gate immediately before the external mutation.
+- **Most administration writes are explicitly realm-pinned.** Preserve semantic realm-local references and destination checks. The older organization and new-user-default setting tools are process-pinned exceptions tracked in `BACKLOG.md`.
+- **Moderation destinations must be private channels.** Reject public and web-public channels during semantic preflight instead of relying on Zulip's generic `BAD_REQUEST`.
+- **FastMCP is constrained to 3.x.** Version 4 removes `fastmcp.tools.tool`; keep the `<4` constraint until the migration and client acceptance work in `BACKLOG.md` is complete.
 - **Codex MCP config is not `.mcp.json` native.** The listener translates `.mcp.json` into Codex `-c mcp_servers...` overrides. Keep secrets in env/header fields; env refs in command/args/cwd/url must fail closed to avoid argv leaks.
 - **OpenCode MCP config is not `.mcp.json` native.** The listener translates `.mcp.json` into inline JSON via `OPENCODE_CONFIG_CONTENT`. Header values are embedded directly (no env-var indirection like Codex). Env refs in command/args/url are rejected.
 - **`core.py` send paths (`send_message`/`send_direct_message`/`edit_message`) rewrite markdown via `normalize_zulip_markdown()`.** Blank lines are injected before tables and bold/link combos Zulip breaks on are rewritten. Fenced/indented code is exempt from both fixes; inline code spans are exempt only for the bold/link rewrite. The Hermes gateway adapter sends via the raw client and is NOT normalized. `ZULIPMCP_MARKDOWN_AUTOFIX=0` disables all of it.
