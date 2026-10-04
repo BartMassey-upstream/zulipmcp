@@ -11,6 +11,9 @@ from zulipmcp.configuration import REDACTED
 mcp_module = importlib.import_module("zulipmcp.mcp")
 
 
+REALM_URL = "https://realm.example.test"
+
+
 @pytest.fixture(autouse=True)
 def reset_write_authorization() -> None:
     core.set_configuration_writes_enabled(False)
@@ -24,6 +27,9 @@ def reset_write_authorization() -> None:
 def client(monkeypatch: pytest.MonkeyPatch) -> Mock:
     client = Mock(api_key="private-key")
     monkeypatch.setattr(core, "get_client", lambda: client)
+    monkeypatch.setattr(
+        core, "get_server_settings", lambda: {"realm_url": REALM_URL},
+    )
     core.set_configuration_writes_enabled(True)
     return client
 
@@ -69,6 +75,7 @@ def test_writes_are_disabled_until_confirmed(client: Mock) -> None:
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         {"description": "new"}, expected={"description": "old"},
     )
 
@@ -92,6 +99,28 @@ def test_enable_configuration_writes() -> None:
         "configuration_writes_enabled": True,
         "user_content_writes_enabled": False,
     }
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "changes"),
+    [
+        ("update_organization_configuration", {"description": "new"}),
+        ("update_default_user_settings", {"enable_sounds": False}),
+    ],
+)
+def test_setting_writes_reject_mismatched_realm(
+    client: Mock, tool_name: str, changes: dict[str, object],
+) -> None:
+    tool = getattr(mcp_module, tool_name)
+    result = tool(
+        "https://other.example.test",
+        changes=changes,
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "conflict"
+    assert result["error"]["code"] == "DESTINATION_REALM_MISMATCH"
+    client.call_endpoint.assert_not_called()
 
 
 def test_enable_configuration_writes_is_idempotent() -> None:
@@ -150,6 +179,7 @@ def test_disabled_writes_allow_dry_run(client: Mock) -> None:
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         {"description": "new"},
         expected={"description": "old"},
         dry_run=True,
@@ -170,6 +200,7 @@ def test_disabled_writes_allow_no_op(client: Mock) -> None:
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         {"description": "current"}, expected={"description": "current"},
     ).structured_content
 
@@ -199,6 +230,7 @@ def test_realm_dry_run_reads_current_and_resolves_optimistic_group_update(
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={
             "description": "new",
             "can_create_public_channel_group": desired_group,
@@ -229,6 +261,10 @@ def test_realm_dry_run_reads_current_and_resolves_optimistic_group_update(
                 "resolved": {"direct_members": [], "direct_subgroups": [5]},
             },
         },
+        "realm_url": {
+            "semantic": REALM_URL,
+            "resolved": REALM_URL,
+        },
     }
     assert [item.kwargs["method"] for item in client.call_endpoint.call_args_list] == [
         "GET", "POST", "DELETE", "GET", "GET",
@@ -243,6 +279,7 @@ def test_expected_value_conflict_makes_no_patch(
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"description": "desired"},
         expected={"description": "stale"},
     ).structured_content
@@ -259,6 +296,7 @@ def test_unknown_and_unsupported_fields_are_rejected_locally(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     unknown = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"not_a_realm_setting": True},
     ).structured_content
     assert unknown["status"] == "error"
@@ -267,6 +305,7 @@ def test_unknown_and_unsupported_fields_are_rejected_locally(
 
     client.call_endpoint.side_effect = [principal(), realm_snapshot(), deleted()]
     unsupported = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"media_preview_size": 100},
     ).structured_content
     assert unsupported["status"] == "error"
@@ -280,6 +319,7 @@ def test_owner_only_and_last_authentication_method_checks(
     client.call_endpoint.return_value = principal(owner=False, admin=True)
 
     owner_only = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"invite_required": True},
     ).structured_content
 
@@ -289,6 +329,7 @@ def test_owner_only_and_last_authentication_method_checks(
     client.reset_mock()
     client.call_endpoint.return_value = principal()
     lockout = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"authentication_methods": {"Email": False, "LDAP": False}},
     ).structured_content
 
@@ -303,6 +344,7 @@ def test_owner_only_and_last_authentication_method_checks(
         deleted(),
     ]
     fake_fallback = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={
             "authentication_methods": {
                 "Email": False,
@@ -321,6 +363,7 @@ def test_owner_only_and_last_authentication_method_checks(
         client.call_endpoint.side_effect = None
         client.call_endpoint.return_value = principal(owner=False, admin=True)
         denied = mcp_module.update_organization_configuration(
+        REALM_URL,
             changes={field: "staff"}, dry_run=True,
         ).structured_content
         assert denied["status"] == "forbidden"
@@ -338,6 +381,7 @@ def test_authentication_change_requires_exact_expected_state(
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"authentication_methods": {"Email": True, "LDAP": False}},
         dry_run=True,
     ).structured_content
@@ -361,6 +405,7 @@ def test_authentication_change_warns_external_health_is_unverified(
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"authentication_methods": {"Email": True, "LDAP": False}},
         expected={"authentication_methods": current},
         dry_run=True,
@@ -390,6 +435,7 @@ def test_authentication_change_normalizes_modern_audit_shape(
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"authentication_methods": expected},
         expected={"authentication_methods": current},
         dry_run=True,
@@ -414,6 +460,7 @@ def test_authentication_change_rejects_unavailable_method(
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={
             "authentication_methods": {"Email": True, "GitHub": True},
         },
@@ -438,6 +485,7 @@ def test_successful_realm_write_has_authoritative_readback(
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"description": "new"},
         expected={"description": "old"},
     ).structured_content
@@ -469,6 +517,7 @@ def test_ignored_parameters_are_partial_not_success(
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"description": "new"},
     ).structured_content
 
@@ -488,6 +537,7 @@ def test_nullable_duration_dry_run_uses_json_encoded_unlimited(
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={field: None},
         expected={field: 30},
         dry_run=True,
@@ -508,6 +558,7 @@ def test_nullable_duration_changes_from_unlimited_to_finite(
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={field: 600},
         expected={field: None},
         dry_run=True,
@@ -527,6 +578,7 @@ def test_nullable_duration_live_request_matches_dry_run_encoding(
         principal(), realm_snapshot(**old), deleted(),
     ]
     dry_run = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes=new,
         expected=old,
         dry_run=True,
@@ -549,6 +601,7 @@ def test_nullable_duration_live_request_matches_dry_run_encoding(
 
     client.call_endpoint.side_effect = call_endpoint
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes=new,
         expected=old,
     ).structured_content
@@ -576,6 +629,7 @@ def test_semantic_channel_resolution_rejects_raw_ids(
     ]
 
     resolved = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"signup_announcements_stream_id": "announcements"},
         dry_run=True,
     ).structured_content
@@ -586,6 +640,10 @@ def test_semantic_channel_resolution_rejects_raw_ids(
         "signup_announcements_stream_id": {
             "desired": {"semantic": "announcements", "resolved": 13},
         },
+        "realm_url": {
+            "semantic": REALM_URL,
+            "resolved": REALM_URL,
+        },
     }
 
     client.reset_mock()
@@ -594,6 +652,7 @@ def test_semantic_channel_resolution_rejects_raw_ids(
         {"result": "success", "msg": "", "streams": []},
     ]
     rejected = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"signup_announcements_stream_id": 13},
         dry_run=True,
     ).structured_content
@@ -618,6 +677,7 @@ def test_moderation_destination_requires_private_channel(client: Mock) -> None:
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"moderation_request_channel_id": "public moderation"},
         expected={"moderation_request_channel_id": None},
         dry_run=True,
@@ -647,6 +707,7 @@ def test_moderation_destination_resolves_private_channel(client: Mock) -> None:
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"moderation_request_channel_id": "private moderation"},
         expected={"moderation_request_channel_id": None},
         dry_run=True,
@@ -666,6 +727,7 @@ def test_channel_reference_clear_uses_minus_one_and_is_idempotent(
         {"result": "success", "msg": "", "streams": []},
     ]
     clear = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"signup_announcements_stream_id": None},
         dry_run=True,
     ).structured_content
@@ -684,6 +746,7 @@ def test_channel_reference_clear_uses_minus_one_and_is_idempotent(
         {"result": "success", "msg": "", "streams": []},
     ]
     no_op = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"signup_announcements_stream_id": None},
         expected={"signup_announcements_stream_id": None},
         dry_run=True,
@@ -722,6 +785,7 @@ def test_anonymous_group_membership_order_is_canonicalized(
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"can_create_public_channel_group": {
             "direct_members": ["a@example.test", "b@example.test"],
             "direct_subgroups": ["alpha", "beta"],
@@ -742,6 +806,7 @@ def test_invalid_unlimited_value_returns_structured_error(
     ]
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"message_retention_days": {"invalid": True}},
         dry_run=True,
     ).structured_content
@@ -754,6 +819,7 @@ def test_null_writes_are_rejected_instead_of_silently_dropped(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     realm_result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"description": None}, dry_run=True,
     ).structured_content
     assert realm_result["status"] == "error"
@@ -761,6 +827,7 @@ def test_null_writes_are_rejected_instead_of_silently_dropped(
 
     client.reset_mock()
     default_result = mcp_module.update_default_user_settings(
+        REALM_URL,
         changes={"enable_sounds": None}, dry_run=True,
     ).structured_content
     assert default_result["status"] == "error"
@@ -777,6 +844,7 @@ def test_default_settings_dry_run_and_successful_readback(
         deleted(),
     ]
     dry_run = mcp_module.update_default_user_settings(
+        REALM_URL,
         changes={"enable_sounds": False},
         expected={"enable_sounds": True},
         dry_run=True,
@@ -794,6 +862,7 @@ def test_default_settings_dry_run_and_successful_readback(
         deleted(),
     ]
     applied = mcp_module.update_default_user_settings(
+        REALM_URL,
         changes={"enable_sounds": False},
         expected={"enable_sounds": True},
     ).structured_content
@@ -812,6 +881,7 @@ def test_write_results_redact_secret_shaped_values(
     client.call_endpoint.return_value = principal()
 
     result = mcp_module.update_organization_configuration(
+        REALM_URL,
         changes={"authentication_methods": {
             "Email": True,
             "api_key": "never-return-this",

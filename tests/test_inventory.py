@@ -256,6 +256,18 @@ def test_write_gate_actions_have_no_parameters() -> None:
         }
 
 
+def test_setting_write_tools_require_explicit_realm_url() -> None:
+    tools = {
+        tool.name: tool for tool in asyncio.run(mcp_module.mcp.list_tools())
+    }
+
+    for name in {
+        "update_organization_configuration",
+        "update_default_user_settings",
+    }:
+        assert "realm_url" in tools[name].parameters["required"]
+
+
 def test_list_streams_returns_full_typed_channels(client: Mock) -> None:
     client.call_endpoint.side_effect = [
         {

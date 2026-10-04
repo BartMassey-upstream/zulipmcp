@@ -1875,6 +1875,7 @@ def _resolve_realm_values(
 
 
 def update_organization_configuration(
+    realm_url: str,
     changes: dict[str, JSONValue],
     expected: dict[str, JSONValue] | None = None,
     dry_run: bool = False,
@@ -1904,9 +1905,10 @@ def update_organization_configuration(
             ),
         )
 
-    principal, failure = _write_principal(endpoint, dry_run)
+    server, principal, failure = _admin_destination(endpoint, realm_url, dry_run)
     if failure is not None:
         return failure
+    assert server is not None
     assert principal is not None
     owner_only = set(changes) & OWNER_ONLY_REALM_FIELDS
     if owner_only and principal.get("is_owner") is not True:
@@ -2011,6 +2013,13 @@ def update_organization_configuration(
         resolved_changes, resolved_expected, mappings = _resolve_realm_values(
             changes, expected,
         )
+        mappings = {
+            "realm_url": {
+                "semantic": realm_url,
+                "resolved": server.get("realm_url", server.get("realm_uri")),
+            },
+            **mappings,
+        }
     except ZulipAPIError as exc:
         result = _mutation_failure(endpoint, dry_run, exc)
         result.current = current
@@ -2142,6 +2151,7 @@ def update_organization_configuration(
 
 
 def update_default_user_settings(
+    realm_url: str,
     changes: dict[str, JSONValue],
     expected: dict[str, JSONValue] | None = None,
     dry_run: bool = False,
@@ -2166,9 +2176,16 @@ def update_default_user_settings(
                 code="NULL_WRITE_UNSUPPORTED",
             ),
         )
-    _, failure = _write_principal(endpoint, dry_run)
+    server, _, failure = _admin_destination(endpoint, realm_url, dry_run)
     if failure is not None:
         return failure
+    assert server is not None
+    mappings: dict[str, JSONValue] = {
+        "realm_url": {
+            "semantic": realm_url,
+            "resolved": server.get("realm_url", server.get("realm_uri")),
+        },
+    }
     try:
         current, warnings = _read_write_state(requested_fields, defaults=True)
     except ZulipAPIError as exc:
@@ -2185,9 +2202,11 @@ def update_default_user_settings(
         field for field, value in expected.items() if current.get(field) != value
     )
     if mismatches:
-        return _conflict_result(
+        result = _conflict_result(
             endpoint, dry_run, current, changes, mismatches, warnings,
         )
+        result.resolved_mappings = mappings
+        return result
     changed = sorted(field for field, value in changes.items() if current[field] != value)
     request = {field: changes[field] for field in changed}
     if dry_run:
@@ -2199,6 +2218,7 @@ def update_default_user_settings(
             desired=changes,
             request=request,
             changed_fields=changed,
+            resolved_mappings=mappings,
             warnings=warnings,
         )
     if not changed:
@@ -2209,6 +2229,7 @@ def update_default_user_settings(
             current=current,
             desired=changes,
             readback=current,
+            resolved_mappings=mappings,
             warnings=warnings + ["All requested fields already had the desired values"],
         )
     try:
@@ -2221,6 +2242,7 @@ def update_default_user_settings(
         result.desired = changes
         result.request = request
         result.changed_fields = changed
+        result.resolved_mappings = mappings
         result.warnings = warnings
         return result
     ignored = response.get("ignored_parameters_unsupported")
@@ -2237,6 +2259,7 @@ def update_default_user_settings(
             request=request,
             response=response,
             changed_fields=changed,
+            resolved_mappings=mappings,
             unsupported_fields=unsupported,
             warnings=warnings,
             error=exc.error,
@@ -2265,6 +2288,7 @@ def update_default_user_settings(
         response=response,
         readback=readback,
         changed_fields=changed,
+        resolved_mappings=mappings,
         unsupported_fields=unsupported,
         warnings=warnings,
     )

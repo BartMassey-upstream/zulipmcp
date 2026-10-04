@@ -20,15 +20,6 @@ Verify stdio and SSE startup, Codex and Claude approval behavior, all tool
 schemas and structured results, the Hermes integration, and compatibility
 with older MCP clients before removing the `<4` dependency constraint.
 
-### Complete explicit realm pinning
-
-Most administration mutations accept `realm_url` and compare it with the
-authenticated server before writing. The older
-`update_organization_configuration` and `update_default_user_settings`
-tools are pinned only by their realm-specific server process. Add the same
-explicit destination argument without weakening semantic resolution,
-dry-run behavior, or optimistic checks.
-
 ### Secure reusable invitation creation
 
 Reusable signup URLs are bearer credentials. Add creation only after there

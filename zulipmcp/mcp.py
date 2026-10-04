@@ -1463,6 +1463,7 @@ def delete_data_export(
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def update_organization_configuration(
+    realm_url: str,
     changes: dict[str, Any],
     expected: dict[str, Any] | None = None,
     dry_run: bool = False,
@@ -1470,12 +1471,15 @@ def update_organization_configuration(
     """Update allowlisted organization settings with checks and readback."""
     return mutation_tool_result(
         "Organization update",
-        zulip_core.update_organization_configuration(changes, expected, dry_run),
+        zulip_core.update_organization_configuration(
+            realm_url, changes, expected, dry_run,
+        ),
     )
 
 
 @mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def update_default_user_settings(
+    realm_url: str,
     changes: dict[str, Any],
     expected: dict[str, Any] | None = None,
     dry_run: bool = False,
@@ -1483,7 +1487,9 @@ def update_default_user_settings(
     """Update defaults for future users with checks and readback."""
     return mutation_tool_result(
         "Default user settings update",
-        zulip_core.update_default_user_settings(changes, expected, dry_run),
+        zulip_core.update_default_user_settings(
+            realm_url, changes, expected, dry_run,
+        ),
     )
 
 

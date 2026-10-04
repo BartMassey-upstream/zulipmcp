@@ -107,14 +107,11 @@ configuration gate; listening in an existing subscription does not.
 }
 ```
 
-Run a separate MCP server for each realm. Object-scoped administration
-tools require the destination realm URL and verify it against
-`GET /server_settings` before changing anything. The older organization
-and new-user-default setting tools are pinned by the realm-specific
-server process; adding their explicit URL argument is tracked in
-[`BACKLOG.md`](BACKLOG.md). Numeric user, group, and channel IDs are not
-accepted as cross-realm references; use the semantic names or account
-emails requested by each tool and inspect the returned ID mappings.
+Run a separate MCP server for each realm. Administration write tools require
+the destination realm URL and verify it against `GET /server_settings`
+before changing anything. Numeric user, group, and channel IDs are not
+accepted as cross-realm references; use the semantic names or account emails
+requested by each tool and inspect the returned ID mappings.
 
 Write tools cover organization settings, users, new-user defaults,
 channels, subscriptions, user groups and membership, custom profile

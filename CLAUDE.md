@@ -31,7 +31,7 @@ Separation is load-bearing: `core.py` must stay MCP-agnostic so it works as a st
 - **Private stream security is asymmetric on purpose.** Unset `BOT_ALLOWED_PRIVATE_STREAMS` = no access (default-deny). Unset `BOT_ALLOWED_WRITE_STREAMS` = all writes allowed (backwards-compat). Don't "fix" the asymmetry.
 - **`configure()` must be called before `run_server()`.** `run_server()` may auto-init a session that reads hook state.
 - **Write gates are independent and process-local.** Configuration and user-content writes both start disabled. Dry runs and proven no-ops may remain available while their gate is closed; enforce the appropriate gate immediately before the external mutation.
-- **Most administration writes are explicitly realm-pinned.** Preserve semantic realm-local references and destination checks. The older organization and new-user-default setting tools are process-pinned exceptions tracked in `BACKLOG.md`.
+- **Administration writes are explicitly realm-pinned.** Preserve semantic realm-local references and destination checks for every write tool.
 - **Moderation destinations must be private channels.** Reject public and web-public channels during semantic preflight instead of relying on Zulip's generic `BAD_REQUEST`.
 - **FastMCP is constrained to 3.x.** Version 4 removes `fastmcp.tools.tool`; keep the `<4` constraint until the migration and client acceptance work in `BACKLOG.md` is complete.
 - **Codex MCP config is not `.mcp.json` native.** The listener translates `.mcp.json` into Codex `-c mcp_servers...` overrides. Keep secrets in env/header fields; env refs in command/args/cwd/url must fail closed to avoid argv leaks.
