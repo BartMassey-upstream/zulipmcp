@@ -1674,7 +1674,31 @@ def _channel_name_map() -> dict[str, int]:
     }
 
 
+def _authentication_method_states(
+    value: JSONValue,
+) -> dict[str, bool] | None:
+    if not isinstance(value, dict):
+        return None
+    states: dict[str, bool] = {}
+    for method, setting in value.items():
+        if isinstance(setting, bool):
+            states[method] = setting
+            continue
+        if not isinstance(setting, dict):
+            return None
+        enabled = setting.get("enabled")
+        available = setting.get("available")
+        if not isinstance(enabled, bool) or not isinstance(available, bool):
+            return None
+        if available:
+            states[method] = enabled
+    return states
+
+
 def _canonical_realm_value(field: str, value: JSONValue) -> JSONValue:
+    if field == "authentication_methods":
+        normalized = _authentication_method_states(value)
+        return normalized if normalized is not None else value
     if field in UNLIMITED_REALM_FIELDS:
         if value is None or value == -1 or value in ("forever", "unlimited"):
             return "unlimited"
@@ -1847,8 +1871,10 @@ def update_organization_configuration(
         result.warnings = warnings
         return result
     if isinstance(authentication, dict):
-        current_authentication = current.get("authentication_methods")
-        if not isinstance(current_authentication, dict):
+        current_authentication = _authentication_method_states(
+            current.get("authentication_methods")
+        )
+        if not current_authentication:
             return MutationResult(
                 status=MutationStatus.UNSUPPORTED,
                 endpoint=endpoint,

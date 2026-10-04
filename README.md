@@ -212,6 +212,9 @@ Authentication-method changes require an exact expected-current-state
 map in addition to preserving at least one method supported by the
 server. This prevents stale configuration from silently disabling a
 method, but cannot prove that an external identity provider is healthy.
+The expected map may be copied directly from the authentication audit;
+modern `{available, enabled}` entries and legacy Boolean entries are
+normalized before comparison. Only available methods may be enabled.
 
 `create_channel` accepts the public `is_default` option and translates
 it to Zulip's `is_default_stream` request field. The older

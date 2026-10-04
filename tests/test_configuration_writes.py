@@ -374,6 +374,57 @@ def test_authentication_change_warns_external_health_is_unverified(
     )
 
 
+def test_authentication_change_normalizes_modern_audit_shape(
+    client: Mock,
+) -> None:
+    current = {
+        "Email": {"available": True, "enabled": True},
+        "LDAP": {"available": True, "enabled": False},
+        "GitHub": {"available": False, "enabled": False},
+    }
+    expected = {"Email": True, "LDAP": False}
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(authentication_methods=current),
+        deleted(),
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={"authentication_methods": expected},
+        expected={"authentication_methods": current},
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "dry_run"
+    assert result["request"] == {}
+    assert any("identity provider" in warning for warning in result["warnings"])
+
+
+def test_authentication_change_rejects_unavailable_method(
+    client: Mock,
+) -> None:
+    current = {
+        "Email": {"available": True, "enabled": True},
+        "GitHub": {"available": False, "enabled": False},
+    }
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(authentication_methods=current),
+        deleted(),
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={
+            "authentication_methods": {"Email": True, "GitHub": True},
+        },
+        expected={"authentication_methods": current},
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "LAST_AUTHENTICATION_METHOD"
+
+
 def test_successful_realm_write_has_authoritative_readback(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
