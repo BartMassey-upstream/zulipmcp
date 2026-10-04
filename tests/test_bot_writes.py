@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import importlib
 from pathlib import Path
 from unittest.mock import Mock, call
@@ -5,7 +6,11 @@ from unittest.mock import Mock, call
 import pytest
 
 from zulipmcp import core
-from zulipmcp.configuration import SectionResult, SectionStatus
+from zulipmcp.configuration import (
+    ConfigurationQueueSnapshot,
+    SectionResult,
+    SectionStatus,
+)
 
 mcp_module = importlib.import_module("zulipmcp.mcp")
 REALM_URL = "https://realm.example.test"
@@ -162,11 +167,13 @@ def test_create_bot_redacts_api_key_and_reads_back(
     created.pop("default_events_register_stream")
     created.pop("default_events_register_channel")
     mutation = Mock(return_value={
-        "user_id": 2, "email": "helper-bot@example.test",
-        "api_key": "never-return-this",
+        "user_id": 2, "api_key": "never-return-this",
     })
     monkeypatch.setattr(core, "configuration_mutation_request", mutation)
     monkeypatch.setattr(core, "_bot_audit_item", lambda reference: (audit(created), created))
+    monkeypatch.setattr(
+        core, "_bot_audit_item_by_id", lambda user_id: (audit(created), created),
+    )
 
     result = mcp_module.create_bot(
         REALM_URL, "helper", "Helper", "owner@example.test",
@@ -176,8 +183,51 @@ def test_create_bot_redacts_api_key_and_reads_back(
     assert result["status"] == "ok"
     assert "never-return-this" not in str(result)
     assert "api_key" not in result["response"]
+    assert result["readback"]["short_name"] == "helper"
     assert mutation.call_args.args[0:2] == ("/bots", "POST")
     assert mutation.call_args.args[2]["bot_type"] == 1
+
+
+def test_bot_audit_joins_modern_realm_bot_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = bot_item([])
+    user.pop("default_sending_stream")
+    user.pop("default_sending_channel")
+    user.pop("default_events_register_stream")
+    user.pop("default_events_register_channel")
+    user.pop("default_all_public_streams")
+    monkeypatch.setattr(core, "get_current_user", lambda: {
+        "user_id": 1, "is_owner": True, "is_admin": True,
+    })
+    monkeypatch.setattr(
+        core, "get_users_configuration", lambda: {"members": [owner(), user]},
+    )
+
+    @contextmanager
+    def snapshot(
+        fetch_event_types: tuple[str, ...] | None = None,
+    ):
+        assert fetch_event_types == ("realm_bot",)
+        yield ConfigurationQueueSnapshot(data={"realm_bots": [{
+            "user_id": 2,
+            "default_sending_stream": "general",
+            "default_events_register_stream": None,
+            "default_all_public_streams": False,
+            "services": [{"token": "never-project-this"}],
+        }]})
+
+    monkeypatch.setattr(core, "configuration_queue_snapshot", snapshot)
+    monkeypatch.setattr(core, "_add_bot_subscriptions", lambda *args: None)
+
+    result = core.get_bots_audit().to_dict()
+
+    item = result["data"]["bots"][0]
+    assert item["default_sending_stream"] == "general"
+    assert item["default_events_register_stream"] is None
+    assert item["default_all_public_streams"] is False
+    assert "services" not in item
+    assert "never-project-this" not in str(result)
 
 
 def test_create_bot_avatar_sends_validated_bytes(

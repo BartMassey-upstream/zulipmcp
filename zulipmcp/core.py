@@ -823,13 +823,17 @@ def get_streams_audit(
 
 
 @contextmanager
-def configuration_queue_snapshot() -> Iterator[ConfigurationQueueSnapshot]:
+def configuration_queue_snapshot(
+    fetch_event_types: tuple[str, ...] | None = None,
+) -> Iterator[ConfigurationQueueSnapshot]:
     response = configuration_request(
         "/register",
         method="POST",
         request={
             "event_types": [],
-            "fetch_event_types": list(CONFIGURATION_FETCH_EVENT_TYPES),
+            "fetch_event_types": list(
+                fetch_event_types or CONFIGURATION_FETCH_EVENT_TYPES
+            ),
         },
     )
     queue_id = response.get("queue_id")
@@ -1086,6 +1090,8 @@ def _add_bot_subscriptions(
             stream_id = bot.get(source)
             if isinstance(stream_id, int) and stream_id in stream_names:
                 bot[target] = stream_names[stream_id]
+            elif isinstance(stream_id, str):
+                bot[target] = stream_id
 
     bot_by_id = {
         bot["user_id"]: bot
@@ -1171,6 +1177,63 @@ def _add_bot_subscriptions(
                 })
 
 
+def _add_bot_configuration(section: SectionResult) -> None:
+    if not isinstance(section.data, dict):
+        return
+    bots = section.data.get("bots")
+    if not isinstance(bots, list) or not any(
+        isinstance(bot, dict) and all(
+            field not in bot for field in (
+                "default_sending_stream",
+                "default_events_register_stream",
+                "default_all_public_streams",
+            )
+        )
+        for bot in bots
+    ):
+        return
+    try:
+        with configuration_queue_snapshot(("realm_bot",)) as snapshot:
+            configured = snapshot.data.get("realm_bots")
+        section.warnings.extend(snapshot.warnings)
+    except ZulipAPIError as exc:
+        section.status = SectionStatus.PARTIAL
+        section.warnings.append(
+            f"Could not audit bot configuration: {exc.error.message}"
+        )
+        return
+    if not isinstance(configured, list):
+        section.status = SectionStatus.PARTIAL
+        section.warnings.append(
+            "Could not audit bot configuration: realm_bots was absent or null"
+        )
+        return
+    configurations = {
+        item["user_id"]: item
+        for item in configured
+        if isinstance(item, dict)
+        and isinstance(item.get("user_id"), int)
+        and not isinstance(item.get("user_id"), bool)
+    }
+    for bot in bots:
+        if not isinstance(bot, dict):
+            continue
+        configuration = configurations.get(bot.get("user_id"))
+        if not isinstance(configuration, dict):
+            section.status = SectionStatus.PARTIAL
+            section.warnings.append(
+                f"Bot configuration was unavailable for user {bot.get('user_id')}"
+            )
+            continue
+        for field in (
+            "default_sending_stream",
+            "default_events_register_stream",
+            "default_all_public_streams",
+        ):
+            if field in configuration:
+                bot[field] = configuration[field]
+
+
 def get_bots_audit(include_deactivated: bool = False) -> SectionResult:
     principal = read_section(get_current_user, CURRENT_USER_FIELDS)
     principal_data = principal.data
@@ -1189,6 +1252,7 @@ def get_bots_audit(include_deactivated: bool = False) -> SectionResult:
         lambda: project_bot_inventory(users_response, include_deactivated),
         collection_field="bots",
     )
+    _add_bot_configuration(result)
     _add_bot_subscriptions(result, realm_wide_visibility, users_response)
     if principal.error is not None:
         result.status = SectionStatus.PARTIAL
@@ -2820,6 +2884,22 @@ def _bot_audit_item(reference: str) -> tuple[SectionResult, dict[str, JSONValue]
         return audit, _resolve_person(bots, reference, bot=True)
     except ValueError:
         return audit, None
+
+
+def _bot_audit_item_by_id(
+    user_id: int,
+) -> tuple[SectionResult, dict[str, JSONValue] | None]:
+    audit = get_bots_audit(include_deactivated=True)
+    if not isinstance(audit.data, dict):
+        return audit, None
+    bots = audit.data.get("bots")
+    if not isinstance(bots, list):
+        return audit, None
+    matches = [
+        bot for bot in bots
+        if isinstance(bot, dict) and bot.get("user_id") == user_id
+    ]
+    return audit, matches[0] if len(matches) == 1 else None
 
 
 def set_bot_active(
@@ -4710,6 +4790,13 @@ def create_bot(
             warnings=["Bot was created but the response omitted its user ID"],
         )
     warnings: list[str] = []
+    if not isinstance(bot_email, str):
+        _, discovered = _bot_audit_item_by_id(bot_id)
+        discovered_email = (
+            discovered.get("email") if isinstance(discovered, dict) else None
+        )
+        if isinstance(discovered_email, str):
+            bot_email = discovered_email
     if isinstance(principal, dict) and principal.get("user_id") != owner_item.get("user_id"):
         try:
             configuration_mutation_request(
@@ -4744,7 +4831,9 @@ def create_bot(
         else:
             warnings.append("Bot was created but authoritative readback failed")
     else:
-        warnings.append("Bot was created but its email was unavailable for readback")
+        warnings.append(
+            "Bot was created but its email was unavailable after inventory discovery"
+        )
     return MutationResult(
         MutationStatus.PARTIAL if warnings else MutationStatus.OK,
         endpoint, dry_run=False, desired=desired, request=request, response=response,
