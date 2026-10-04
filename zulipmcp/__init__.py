@@ -1,4 +1,4 @@
-from .mcp import configure, mcp
+from typing import Any
 
 from .core import (
     normalize_zulip_markdown,
@@ -45,3 +45,20 @@ from .core import (
     is_dismiss_reaction,
     check_dismissed,
 )
+
+
+def configure(**kwargs: Any) -> None:
+    """Configure MCP hooks without importing the server at package startup."""
+    from .mcp import configure as configure_mcp
+
+    configure_mcp(**kwargs)
+
+
+def __getattr__(name: str) -> Any:
+    """Load the MCP server object only when the package API requests it."""
+    if name == "mcp":
+        from .mcp import mcp as mcp_server
+
+        globals()[name] = mcp_server
+        return mcp_server
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
