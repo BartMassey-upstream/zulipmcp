@@ -601,6 +601,61 @@ def test_semantic_channel_resolution_rejects_raw_ids(
     assert rejected["error"]["code"] == "SEMANTIC_RESOLUTION_ERROR"
 
 
+def test_moderation_destination_requires_private_channel(client: Mock) -> None:
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(moderation_request_channel_id=-1),
+        deleted(),
+        {
+            "result": "success",
+            "msg": "",
+            "streams": [{
+                "stream_id": 13,
+                "name": "public moderation",
+                "invite_only": False,
+            }],
+        },
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={"moderation_request_channel_id": "public moderation"},
+        expected={"moderation_request_channel_id": None},
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "SEMANTIC_RESOLUTION_ERROR"
+    assert result["error"]["message"] == (
+        "moderation_request_channel_id must reference a private channel"
+    )
+
+
+def test_moderation_destination_resolves_private_channel(client: Mock) -> None:
+    client.call_endpoint.side_effect = [
+        principal(),
+        realm_snapshot(moderation_request_channel_id=-1),
+        deleted(),
+        {
+            "result": "success",
+            "msg": "",
+            "streams": [{
+                "stream_id": 13,
+                "name": "private moderation",
+                "invite_only": True,
+            }],
+        },
+    ]
+
+    result = mcp_module.update_organization_configuration(
+        changes={"moderation_request_channel_id": "private moderation"},
+        expected={"moderation_request_channel_id": None},
+        dry_run=True,
+    ).structured_content
+
+    assert result["status"] == "dry_run"
+    assert result["request"] == {"moderation_request_channel_id": 13}
+
+
 def test_channel_reference_clear_uses_minus_one_and_is_idempotent(
     client: Mock, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1723,12 +1723,13 @@ def _semantic_name_maps() -> tuple[dict[str, int], dict[str, int]]:
     return group_ids, user_ids
 
 
-def _channel_name_map() -> dict[str, int]:
+def _channel_reference_inventory(
+) -> tuple[dict[str, int], dict[int, dict[str, JSONValue]]]:
     response = get_streams_configuration()
     streams = response.get("streams")
     if not isinstance(streams, list):
         raise ValueError("Channel inventory is required for semantic resolution")
-    return {
+    named_ids = {
         stream["name"]: stream["stream_id"]
         for stream in streams
         if isinstance(stream, dict)
@@ -1736,6 +1737,14 @@ def _channel_name_map() -> dict[str, int]:
         and isinstance(stream.get("stream_id"), int)
         and not isinstance(stream.get("stream_id"), bool)
     }
+    by_id = {
+        stream["stream_id"]: stream
+        for stream in streams
+        if isinstance(stream, dict)
+        and isinstance(stream.get("stream_id"), int)
+        and not isinstance(stream.get("stream_id"), bool)
+    }
+    return named_ids, by_id
 
 
 def _authentication_method_states(
@@ -1821,12 +1830,20 @@ def _resolve_realm_values(
 
     channel_fields = (set(changes) | set(expected)) & CHANNEL_REFERENCE_REALM_FIELDS
     if channel_fields:
-        channel_ids = _channel_name_map()
+        channel_ids, channels_by_id = _channel_reference_inventory()
         for field in sorted(channel_fields):
             field_mapping = {}
             if field in changes:
                 value = changes[field]
                 resolved = -1 if value is None else _named_id(value, channel_ids, "channel")
+                if (
+                    field == "moderation_request_channel_id"
+                    and resolved != -1
+                    and channels_by_id[resolved].get("invite_only") is not True
+                ):
+                    raise ValueError(
+                        "moderation_request_channel_id must reference a private channel"
+                    )
                 resolved_changes[field] = resolved
                 field_mapping["desired"] = {
                     "semantic": value,
