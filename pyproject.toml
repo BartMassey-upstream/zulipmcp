@@ -24,7 +24,7 @@ classifiers = [
 ]
 dependencies = [
     "diskcache",
-    "fastmcp",
+    "fastmcp>=3.2.4,<4",
     "zulip",
 ]
 
@@ -35,6 +35,9 @@ Issues = "https://github.com/windborne/zulipmcp/issues"
 
 [tool.setuptools.packages.find]
 include = ["zulipmcp*"]
+
+[tool.setuptools.package-data]
+zulipmcp = ["default_system_prompt.md", "py.typed"]
 
 [dependency-groups]
 dev = [

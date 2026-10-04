@@ -1724,7 +1724,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "diskcache" },
-    { name = "fastmcp" },
+    { name = "fastmcp", specifier = ">=3.2.4,<4" },
     { name = "zulip" },
 ]
 
